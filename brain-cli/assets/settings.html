@@ -1,0 +1,1223 @@
+<!doctype html>
+<html lang="ru" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<title>Brain for AI — настройки</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-edge: #e2e5ea;
+  --ink: #14181f;
+  --ink-dim: #5c6472;
+  --accent: #0f7b5f;
+  --accent-soft: #e3f4ee;
+  --warn: #9a5b00;
+  --warn-soft: #fdf1dc;
+  --shadow: 0 1px 2px rgba(16, 22, 32, .06), 0 8px 24px rgba(16, 22, 32, .05);
+  --radius: 12px;
+}
+html[data-theme="dark"], html[data-theme="auto"] {
+  --bg: #f6f7f9; --panel: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  html[data-theme="auto"] {
+    --bg: #10131a; --panel: #171b24; --panel-edge: #262c38;
+    --ink: #e8ecf3; --ink-dim: #9aa4b4;
+    --accent: #4ade9f; --accent-soft: #14301f;
+    --warn: #f0b45f; --warn-soft: #3a2d14;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35);
+  }
+}
+html[data-theme="dark"] {
+  --bg: #10131a; --panel: #171b24; --panel-edge: #262c38;
+  --ink: #e8ecf3; --ink-dim: #9aa4b4;
+  --accent: #4ade9f; --accent-soft: #14301f;
+  --warn: #f0b45f; --warn-soft: #3a2d14;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .35);
+}
+
+* { box-sizing: border-box; }
+.captable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.captable th, .captable td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--panel-edge); }
+.captable td.warn { color: var(--warn); }
+.table-scroll { overflow-x: auto; }
+.arch-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.arch-form input, .arch-form select { font: inherit; color: inherit; background: var(--bg);
+  border: 1px solid var(--panel-edge); border-radius: 8px; padding: 6px 10px; }
+.arch-form input { flex: 1 1 260px; }
+.arch-form button, .arch-more { border: 1px solid var(--panel-edge); border-radius: 8px;
+  padding: 6px 12px; background: var(--panel); }
+.arch-backfill { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--panel-edge); }
+.arch-backfill .arch-form input[type="number"] { flex: 0 0 90px; }
+.arch-hit { display: block; width: 100%; text-align: left; border: 1px solid var(--panel-edge);
+  border-radius: 8px; padding: 8px 10px; margin: 6px 0; background: var(--panel); }
+.arch-hit .meta, .arch-read .meta { color: var(--ink-dim); font-size: 12px; }
+.arch-read pre { white-space: pre-wrap; word-break: break-word; background: var(--bg);
+  border: 1px solid var(--panel-edge); border-radius: 8px; padding: 10px; max-height: 420px;
+  overflow: auto; font-size: 13px; }
+.diag { display: grid; grid-template-columns: 220px 1fr; gap: 6px 14px; margin: 0; font-size: 14px; }
+.diag dt { color: var(--ink-dim); }
+.diag dd { margin: 0; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 96px; }
+
+header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+.sub { color: var(--ink-dim); font-size: 13px; }
+.spacer { flex: 1 1 auto; }
+
+button { font: inherit; color: inherit; cursor: pointer; }
+.ghost {
+  background: transparent; border: 1px solid var(--panel-edge);
+  border-radius: 8px; padding: 5px 11px; font-size: 13px; color: var(--ink-dim);
+  transition: border-color .15s, color .15s;
+}
+.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+section {
+  background: var(--panel); border: 1px solid var(--panel-edge);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 18px 20px; margin-top: 18px;
+}
+h2 { font-size: 15px; margin: 0 0 4px; letter-spacing: .01em; }
+.hint { color: var(--ink-dim); font-size: 13px; margin: 0 0 14px; }
+
+/* --- profiles --- */
+.profiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); }
+.profile {
+  text-align: left; background: transparent; border: 1.5px solid var(--panel-edge);
+  border-radius: var(--radius); padding: 13px 14px; transition: border-color .15s, background .15s;
+}
+.profile:hover { border-color: var(--accent); }
+.profile[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.profile .top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.profile .name { font-weight: 620; font-size: 15px; }
+.cost {
+  margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 650; font-size: 13px;
+  background: var(--accent-soft); color: var(--accent); border-radius: 999px; padding: 2px 9px;
+}
+.profile dl { margin: 0; display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; font-size: 12.5px; }
+.profile dt { color: var(--ink-dim); }
+.profile dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --- price strip --- */
+.price {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  border: 1.5px dashed var(--accent); background: var(--accent-soft);
+  border-radius: var(--radius); padding: 14px 18px; margin-top: 18px;
+}
+.price .big { font-size: 30px; font-weight: 680; color: var(--accent); font-variant-numeric: tabular-nums; line-height: 1; }
+.price .what { font-size: 13px; color: var(--ink-dim); max-width: 560px; }
+.price .what b { color: var(--ink); font-weight: 600; }
+
+/* --- knobs --- */
+.knob { padding: 14px 0; border-top: 1px solid var(--panel-edge); }
+.knob:first-of-type { border-top: none; padding-top: 4px; }
+.knob .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.knob .label { font-weight: 600; }
+.knob .why { color: var(--ink-dim); font-size: 12.5px; margin: 3px 0 9px; max-width: 640px; }
+.knob .row { display: flex; align-items: center; gap: 12px; }
+input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); min-width: 120px; }
+input[type="number"] {
+  width: 104px; font: inherit; font-variant-numeric: tabular-nums; text-align: right;
+  padding: 5px 8px; border-radius: 8px; border: 1px solid var(--panel-edge);
+  background: var(--bg); color: var(--ink);
+}
+input[type="number"]:focus-visible, .profile:focus-visible, .ghost:focus-visible,
+.mode:focus-visible, .primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tag {
+  font-size: 11.5px; border-radius: 999px; padding: 1px 8px;
+  background: var(--warn-soft); color: var(--warn);
+}
+.tag.bad { background: var(--warn-soft); color: var(--warn); }
+.tag.quiet { background: var(--panel-edge); color: var(--ink-dim); }
+
+/* --- modes --- */
+.modes { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.mode {
+  text-align: left; background: transparent; border: 1.5px solid var(--panel-edge);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.mode:hover { border-color: var(--accent); }
+.mode[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.mode .name { font-weight: 620; display: block; margin-bottom: 4px; }
+.mode .why { color: var(--ink-dim); font-size: 12.5px; }
+
+/* --- what the work is aiming at --- */
+.goal-line { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 2px 0 10px; }
+.goal-text { font-weight: 620; }
+.goal-src { color: var(--ink-dim); font-size: 12.5px; }
+.blocker-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding: 7px 0; border-top: 1px solid var(--panel-edge);
+}
+.blocker-kind {
+  font-size: 11.5px; border-radius: 999px; padding: 1px 8px;
+  background: var(--warn-soft); color: var(--warn); flex: 0 0 auto;
+}
+.blocker-title { flex: 1 1 240px; min-width: 0; }
+.blocker-age { color: var(--ink-dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+/* --- who is using the memory --- */
+.agent-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 0; border-top: 1px solid var(--panel-edge);
+}
+.agent-row:first-child { border-top: none; }
+.agent-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--ink-dim);
+}
+/* Only a live agent pulses; a still dot for anything else keeps the motion
+   meaningful instead of decorative. */
+.agent-работает .agent-dot { background: var(--accent); animation: pulse 2s ease-in-out infinite; }
+.agent-недавно .agent-dot { background: var(--warn); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .agent-работает .agent-dot { animation: none; }
+}
+.agent-name { font-weight: 620; }
+.agent-state { color: var(--ink-dim); font-size: 13px; }
+.agent-numbers {
+  margin-left: auto; color: var(--ink-dim); font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- database --- */
+.stats { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); }
+.stat { border: 1px solid var(--panel-edge); border-radius: 10px; padding: 10px 12px; }
+.stat .n { font-size: 19px; font-weight: 640; font-variant-numeric: tabular-nums; }
+.stat .k { color: var(--ink-dim); font-size: 12.5px; }
+
+/* --- save bar --- */
+.bar {
+  position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel);
+  border-top: 1px solid var(--panel-edge); padding: 12px 20px;
+}
+.bar .inner { max-width: 980px; margin: 0 auto; display: flex; align-items: center; gap: 14px; }
+.primary {
+  background: var(--accent); color: #06231a; border: none; border-radius: 9px;
+  padding: 9px 20px; font-weight: 640;
+}
+.primary[disabled] { opacity: .45; cursor: default; }
+html[data-theme="dark"] .primary { color: #06231a; }
+.note { font-size: 13px; color: var(--ink-dim); }
+.note.ok { color: var(--accent); }
+.note.bad { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Brain for AI — настройки</h1>
+    <span class="sub" id="space"></span>
+    <span class="spacer"></span>
+    <a class="ghost" href="/graph" style="text-decoration:none">Открыть граф памяти</a>
+    <a class="ghost" href="/map" style="text-decoration:none">Карта проектов</a>
+    <button class="ghost" id="theme" type="button">Тема</button>
+  </header>
+  <p class="hint">
+    Всё, что здесь меняется, применяется к каждой следующей команде <code>brain</code>.
+    Рядом с каждым выбором показано, во что он обойдётся — до того, как вы его примете.
+  </p>
+
+  <section>
+    <h2>Профиль качества</h2>
+    <p class="hint">Готовая точка на кривой «цена / точность». Число справа — во сколько раз запрос дороже сбалансированного.</p>
+    <div class="profiles" id="profiles"></div>
+  </section>
+
+  <div class="price">
+    <div class="big" id="cost">×1.0</div>
+    <div class="what" id="cost-what"></div>
+  </div>
+
+  <section>
+    <h2>Подробно</h2>
+    <p class="hint">Каждое число можно задать вручную. Изменённые перестают следовать профилю — до тех пор, пока вы их не вернёте.</p>
+    <div id="knobs"></div>
+    <button class="ghost" id="reset" type="button" style="margin-top:12px">Вернуть все числа к профилю</button>
+  </section>
+
+  <section>
+    <h2>Модель эмбеддингов <span class="tag" id="mode-state" hidden></span></h2>
+    <p class="hint">Семантический поиск требует загруженной модели. Режим решает, когда именно она занимает память.</p>
+    <div class="modes" id="modes"></div>
+  </section>
+
+  <section>
+    <h2>Над чем идёт работа <span class="tag" id="work-confidence" hidden></span></h2>
+    <p class="hint" id="work-note">Цель берётся из ваших слов, а если её не задавали — выводится из записей.</p>
+    <div id="work-goal"></div>
+    <div id="work-blockers"></div>
+  </section>
+
+  <section>
+    <h2>Кто пользуется памятью <span class="tag" id="live-count" hidden></span></h2>
+    <p class="hint" id="live-note">По журналу обращений агентов. Пути и содержимое запросов здесь не показываются.</p>
+    <div id="live"></div>
+  </section>
+
+  <section>
+    <h2>Подключения и захват <span class="tag" id="capture-state" hidden></span></h2>
+    <p class="hint">Три разных факта, и они не подменяют друг друга: <b>настроено</b> — в конфиге клиента есть запись Brain;
+      <b>событие замечено</b> — хук клиента писал в журнал; <b>содержимое импортировано</b> — текст переписок попал в память.
+      Только чтение: эта секция ничего не меняет в конфигах.</p>
+    <div id="capture"></div>
+    <ul class="hint" id="capture-limits"></ul>
+  </section>
+
+  <section>
+    <h2>Архив переписок <span class="tag" id="archive-state" hidden></span></h2>
+    <p class="hint">Отдельная приватная база (<code>$BRAIN_HOME/archive/sessions.sqlite</code>) с видимым текстом
+      ваших сообщений и ответов агентов из Claude Code, Codex и Hermes. Рассуждения, инструкции, вызовы инструментов
+      и их вывод не сохраняются. Это не пространство памяти, и записи не привязаны к проектам или задачам.
+      Только чтение: включение, пауза и таймер — командами <code>brain archive enable|disable|timer</code>.</p>
+    <div id="archive-summary"></div>
+    <div id="archive-table"></div>
+    <ul class="hint" id="archive-notes"></ul>
+    <form class="arch-form" id="archive-form" autocomplete="off">
+      <input id="archive-q" type="search" maxlength="1000" placeholder="Слова из переписки…" aria-label="Поиск по архиву">
+      <select id="archive-client" aria-label="Клиент">
+        <option value="">все клиенты</option><option value="claude">claude</option>
+        <option value="codex">codex</option><option value="hermes">hermes</option>
+      </select>
+      <button type="submit">Найти</button>
+    </form>
+    <p class="hint" id="archive-search-note"></p>
+    <div id="archive-results"></div>
+    <div class="arch-read" id="archive-read"></div>
+    <div class="arch-backfill">
+      <h3>Импорт старых переписок</h3>
+      <p class="hint">Старые переписки старше окна сбора не читаются, пока вы явно их не допустите.
+        Импорт берёт за прогон несколько самых новых из них и не заменяет обычный сборщик.
+        Полный захват истории не заявляется.</p>
+      <p id="backfill-state" class="hint">Состояние импорта ещё не получено.</p>
+      <form class="arch-form" id="backfill-form" autocomplete="off">
+        <label for="backfill-quota" class="hint">Файлов за прогон:</label>
+        <input id="backfill-quota" type="number" min="1" max="20" value="2" aria-label="Файлов за прогон" title="От 1 до 20">
+        <button type="submit">Пусть импорт начнётся</button>
+        <button type="button" id="backfill-stop">Остановить импорт</button>
+      </form>
+      <p class="hint" id="backfill-note"></p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Работа агентов <span class="tag" id="work-state" hidden></span></h2>
+    <p class="hint">Координатор задач этого компьютера (<code>$BRAIN_HOME/coordination/coord.sqlite</code>): кто из агентов
+      какую задачу взял, на какой установке и до какого времени действует аренда. Только чтение: брать, продлевать,
+      передавать и закрывать задачи — командами <code>brain work …</code> или MCP-инструментами <code>work_*</code>.
+      Аренды соблюдают только агенты, которые их запрашивают; правки файлов не блокируются. Названия и заметки — текст агентов, не проверенный.</p>
+    <form class="arch-form" id="work-form" autocomplete="off">
+      <input id="work-project" type="search" maxlength="100" placeholder="Проект (пусто — все)" aria-label="Проект">
+      <select id="work-filter" aria-label="Состояние">
+        <option value="">все состояния</option><option value="queued">в очереди</option><option value="active">в работе</option>
+        <option value="paused">на паузе</option><option value="completed">готово</option><option value="failed">не удалось</option>
+      </select>
+      <button type="submit">Показать</button>
+    </form>
+    <p class="hint" id="work-summary"></p>
+    <div class="table-scroll" id="work-table"></div>
+    <p><button type="button" class="arch-more" id="work-prev">← Раньше</button> <button type="button" class="arch-more" id="work-next">Дальше →</button></p>
+    <div class="table-scroll" id="work-claims"></div>
+  </section>
+
+  <section>
+    <h2>Диагностика и применение</h2>
+    <div id="diagnostics"></div>
+  </section>
+
+  <section>
+    <h2>Состояние базы</h2>
+    <p class="hint" id="db-note">Обновляется автоматически.</p>
+    <div class="stats" id="stats"></div>
+  </section>
+
+</div>
+
+<div class="bar"><div class="inner">
+  <button class="primary" id="save" type="button" disabled>Сохранить</button>
+  <span class="note" id="status">Изменений нет</span>
+</div></div>
+
+<script>
+"use strict";
+// The window key never appears in this page. The launcher opens the page with
+// it in the URL fragment (never sent to the server, never in a Referer); it is
+// moved into this origin's sessionStorage and the fragment is erased at once.
+const TOKEN = (() => {
+  const SLOT = "brain-ui-token";
+  const match = /^#k=([0-9a-f]{64})$/.exec(location.hash);
+  if (match) history.replaceState(null, "", location.pathname + location.search);
+  try {
+    if (match) sessionStorage.setItem(SLOT, match[1]);
+    return sessionStorage.getItem(SLOT) || "";
+  } catch (_) {
+    return match ? match[1] : "";
+  }
+})();
+
+const KNOBS = [
+  { key: "candidates_per_signal", label: "Кандидатов на сигнал", step: 10, kind: "int",
+    why: "Сколько записей каждый сигнал — словесный поиск, векторы, точные совпадения — отдаёт до слияния. Больше кандидатов повышает полноту и удлиняет поиск." },
+  { key: "graph_hops", label: "Глубина обхода графа", step: 1, kind: "int",
+    why: "На сколько шагов по связям уходить от найденного узла. Ноль — не уходить вовсе." },
+  { key: "budget_tokens", label: "Бюджет ответа, токенов", step: 50, kind: "int",
+    why: "Потолок на объём выдачи. Прямо определяет, сколько контекста достанется агенту и сколько он за него заплатит." },
+  { key: "min_cosine", label: "Порог косинуса", step: 0.01, kind: "float",
+    why: "Ниже какого сходства векторное совпадение не засчитывается. Понижение впускает более слабые попадания." },
+  { key: "min_bm25", label: "Порог BM25", step: 0.01, kind: "float",
+    why: "То же самое для словесных совпадений." },
+];
+
+const PROFILE_NAMES = { fast: "Быстро", balanced: "Сбалансированно", precise: "Точно", max: "Максимум" };
+const MODES = [
+  { key: "always", name: "Всегда в памяти", why: "Модель держится загруженной, ответ не ждёт её старта. Цена — постоянно занятая оперативная память." },
+  { key: "on-demand", name: "По запросу", why: "Модель поднимается на пакет обработки и выгружается. Цена — задержка на загрузку в начале пакета." },
+  { key: "off", name: "Выключена", why: "Только словесный поиск и точные совпадения. Память свободна, семантического поиска нет." },
+];
+
+let state = null;   // last document from the server
+let draft = null;   // what the user has chosen but not yet saved
+
+const $ = (id) => document.getElementById(id);
+const ru = (n) => Number(n).toLocaleString("ru-RU");
+
+async function api(path, options) {
+  const response = await fetch(path, Object.assign({
+    headers: { "X-Brain-Token": TOKEN, "Content-Type": "application/json" },
+    cache: "no-store",
+  }, options || {}));
+  const document_ = await response.json().catch(() => ({ status: "error", message: "ответ не разобран" }));
+  if (!response.ok) { throw new Error(document_.message || ("HTTP " + response.status)); }
+  return document_;
+}
+
+/* Mirrors settings::relative_cost so the price moves with the slider instead of
+   waiting for a round trip; the server's number wins after every save. */
+function estimateCost(effective) {
+  const base = state.baseline;
+  return effective.candidates_per_signal / base.candidates_per_signal * 0.6
+       + effective.budget_tokens / base.budget_tokens * 0.4;
+}
+
+function profileDefaults(name) {
+  return state.profiles.find((p) => p.name === name) || state.profiles[0];
+}
+
+function effective() {
+  const base = profileDefaults(draft.profile);
+  const out = {};
+  for (const knob of KNOBS) {
+    const override = draft.overrides[knob.key];
+    out[knob.key] = (override === null || override === undefined) ? base[knob.key] : override;
+  }
+  return out;
+}
+
+function dirty() {
+  if (draft.profile !== state.profile) { return true; }
+  if (draft.embedding_mode !== state.embedding_mode) { return true; }
+  for (const knob of KNOBS) {
+    const before = state.overrides[knob.key];
+    const after = draft.overrides[knob.key];
+    if ((before === undefined ? null : before) !== (after === undefined ? null : after)) { return true; }
+  }
+  return false;
+}
+
+function renderProfiles() {
+  $("profiles").replaceChildren(...state.profiles.map((profile) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "profile";
+    button.setAttribute("aria-pressed", String(profile.name === draft.profile));
+    const rows = KNOBS.map((knob) => {
+      const value = knob.kind === "float" ? profile[knob.key].toFixed(2) : ru(profile[knob.key]);
+      return `<dt>${knob.label}</dt><dd>${value}</dd>`;
+    }).join("");
+    button.innerHTML =
+      `<div class="top"><span class="name">${PROFILE_NAMES[profile.name] || profile.name}</span>` +
+      `<span class="cost">×${profile.relative_cost.toFixed(2)}</span></div><dl>${rows}</dl>`;
+    button.addEventListener("click", () => {
+      draft.profile = profile.name;
+      for (const knob of KNOBS) { draft.overrides[knob.key] = null; }
+      render();
+    });
+    return button;
+  }));
+}
+
+function renderKnobs() {
+  const base = profileDefaults(draft.profile);
+  const live = effective();
+  $("knobs").replaceChildren(...KNOBS.map((knob) => {
+    const [low, high] = state.limits[knob.key];
+    const overridden = draft.overrides[knob.key] !== null && draft.overrides[knob.key] !== undefined;
+
+    const box = document.createElement("div");
+    box.className = "knob";
+    const head = document.createElement("div");
+    head.className = "head";
+    head.innerHTML = `<span class="label">${knob.label}</span>` +
+      (overridden ? `<span class="tag">вручную, профиль даёт ${knob.kind === "float" ? base[knob.key].toFixed(2) : ru(base[knob.key])}</span>`
+                  : `<span class="tag quiet">из профиля</span>`);
+    const why = document.createElement("p");
+    why.className = "why";
+    why.textContent = knob.why;
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = low; slider.max = high; slider.step = knob.step;
+    slider.value = live[knob.key];
+    slider.setAttribute("aria-label", knob.label);
+
+    const number = document.createElement("input");
+    number.type = "number";
+    number.min = low; number.max = high; number.step = knob.step;
+    number.value = knob.kind === "float" ? Number(live[knob.key]).toFixed(2) : live[knob.key];
+    number.setAttribute("aria-label", knob.label);
+    number.dataset.exactKnob = knob.key;
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "ghost";
+    back.textContent = "к профилю";
+    back.disabled = !overridden;
+    back.addEventListener("click", () => { draft.overrides[knob.key] = null; render(); });
+
+    const commit = (raw) => {
+      if (String(raw).trim() === "") { render(); return; }
+      let value = Number(raw);
+      if (!Number.isFinite(value)) { return; }
+      value = Math.min(high, Math.max(low, value));
+      draft.overrides[knob.key] = knob.kind === "int" ? Math.round(value) : Math.round(value * 100) / 100;
+      render();
+    };
+    slider.addEventListener("input", () => {
+      number.value = slider.value;
+      draft.overrides[knob.key] = knob.kind === "int" ? Math.round(Number(slider.value)) : Number(slider.value);
+      renderPrice();
+      renderSaveBar();
+    });
+    slider.addEventListener("change", () => commit(slider.value));
+    number.addEventListener("change", () => commit(number.value));
+    number.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { number.blur(); }
+    });
+
+    row.append(slider, number, back);
+    box.append(head, why, row);
+    if (knob.key === "graph_hops" && live[knob.key] > state.limits.graph_hops_diminishing) {
+      const warn = document.createElement("p");
+      warn.className = "why";
+      warn.innerHTML = `<span class="tag">осторожно</span> глубже ${state.limits.graph_hops_diminishing} шагов
+        шум обычно растёт быстрее пользы: в выдачу попадают связанные, но не относящиеся к вопросу узлы.`;
+      box.append(warn);
+    }
+    return box;
+  }));
+}
+
+function renderPrice() {
+  const live = effective();
+  const cost = estimateCost(live);
+  $("cost").textContent = "×" + cost.toFixed(2);
+  const hops = live.graph_hops;
+  $("cost-what").innerHTML =
+    `Во столько раз этот запрос дороже сбалансированного. Оценка считается по числу кандидатов
+     (<b>${ru(live.candidates_per_signal)}</b> против ${ru(state.baseline.candidates_per_signal)})
+     и бюджету ответа (<b>${ru(live.budget_tokens)}</b> против ${ru(state.baseline.budget_tokens)} токенов).
+     Обход графа в оценку не входит и показан отдельно: <b>${hops}</b> ${hops === 1 ? "шаг" : (hops >= 2 && hops <= 4 ? "шага" : "шагов")}.`;
+}
+
+function renderModes() {
+  $("modes").replaceChildren(...MODES.map((mode) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mode";
+    button.setAttribute("aria-pressed", String(mode.key === draft.embedding_mode));
+    button.innerHTML = `<span class="name">${mode.name}</span><span class="why">${mode.why}</span>`;
+    button.addEventListener("click", () => { draft.embedding_mode = mode.key; render(); });
+    return button;
+  }));
+  const badge = $("mode-state");
+  badge.hidden = state.embedding_runtime_implemented;
+  badge.textContent = "выбор сохраняется, но постоянный обработчик ещё не реализован";
+}
+
+function renderDatabase() {
+  const database = state.database;
+  const note = $("db-note");
+  if (!database.available) {
+    note.textContent = "Состояние недоступно: " + database.error;
+    $("stats").replaceChildren();
+    return;
+  }
+  note.textContent = "Пространство памяти «" + state.space + "». Обновляется автоматически.";
+  const cells = [
+    ["Узлов активно", database.active_nodes], ["Узлов всего", database.nodes],
+    ["Связей активно", database.active_edges], ["Связей всего", database.edges],
+    ["Эмбеддингов", database.embeddings], ["Узлов без вектора", database.without_embeddings],
+    ["Слой hot", database.salience_layers.hot], ["Слой warm", database.salience_layers.warm],
+    ["Слой cold", database.salience_layers.cold],
+  ];
+  $("stats").replaceChildren(...cells.map(([key, value]) => {
+    const box = document.createElement("div");
+    box.className = "stat";
+    box.innerHTML = `<div class="n">${ru(value)}</div><div class="k">${key}</div>`;
+    return box;
+  }));
+}
+
+const YES_NO = (value) => value === true ? "да" : value === false ? "нет" : "неизвестно";
+
+function cell(text, cls) {
+  const element = document.createElement("td");
+  element.textContent = text;
+  if (cls) { element.className = cls; }
+  return element;
+}
+
+const LIMITS_RU = {
+  "Configuration markers do not prove a successful client handshake.": "Запись в конфиге не доказывает, что клиент действительно подключился.",
+  "Activity is a bounded journal tail, not a complete conversation archive.": "Активность — это хвост журнала событий, а не полный архив переписок.",
+  "Missing, invalid or oversized configuration is reported as unknown.": "Отсутствующий, повреждённый или слишком большой конфиг показан как «неизвестно».",
+  "No database, model, network or external process is opened by this command.": "Проверка не открывает базу, модель, сеть и не запускает внешних программ.",
+  "Hermes operational-graph import is not Hermes conversation capture.": "Импорт рабочего графа Hermes — это не захват его переписок.",
+};
+
+function renderCapture() {
+  const capture = state.capture;
+  const holder = $("capture");
+  if (!capture) { holder.textContent = "Окно старой версии не сообщает о подключениях."; return; }
+  const tag = $("capture-state");
+  tag.hidden = false;
+  tag.textContent = capture.status === "degraded" ? "есть повреждённые записи журнала" : "захват неполный";
+  tag.className = "tag " + (capture.status === "degraded" ? "bad" : "");
+  const table = document.createElement("table");
+  table.className = "captable";
+  const head = document.createElement("tr");
+  ["Клиент", "MCP настроен", "Хук настроен", "Последнее событие", "Переписки импортируются"].forEach((title) => {
+    const th = document.createElement("th"); th.textContent = title; head.append(th);
+  });
+  table.append(head);
+  for (const client of capture.clients || []) {
+    const row = document.createElement("tr");
+    const seen = client.last_observed_event;
+    const seenText = seen && seen.idle_seconds !== undefined
+      ? sinceText(seen.idle_seconds) + (seen.last_event ? " (" + seen.last_event + ")" : "")
+      : "не замечено в хвосте журнала";
+    row.append(
+      cell(client.client),
+      cell(client.client === "hermes" ? "не проверяется" : YES_NO(client.mcp_config_entry_present)),
+      cell(client.client === "hermes" ? "не проверяется" : YES_NO(client.hook_config_marker_present)),
+      cell(seenText),
+      cell(CAPTURE_RU[client.transcript_capture] || client.transcript_capture, "warn"),
+    );
+    table.append(row);
+  }
+  holder.replaceChildren(table);
+  const extra = document.createElement("p");
+  extra.className = "hint";
+  extra.textContent = "Переписки собираются в отдельный приватный архив (секция ниже), ограниченными порциями и только " +
+    "видимый текст. Подсказка при старте сессии отключена намеренно " +
+    "(" + (capture.automatic_session_brief === "disabled_by_design" ? "недоверенная память не внедряется" : capture.automatic_session_brief) + ").";
+  holder.append(extra);
+  $("capture-limits").replaceChildren(...(capture.limitations || []).map((text) => {
+    const item = document.createElement("li"); item.textContent = LIMITS_RU[text] || text; return item;
+  }));
+}
+
+const CAPTURE_RU = {
+  "not_implemented": "нет — не реализовано",
+  "archive_not_configured": "нет — архив не настроен",
+  "archive_collector_enabled": "да — сборщик включён (ограниченно)",
+  "archive_collector_paused": "нет — сборщик на паузе",
+  "archive_config_invalid": "неизвестно — конфиг сборщика повреждён",
+};
+const STATE_RU = { caught_up: "догнан", pending: "в очереди", partial_tail: "ждёт конца строки",
+  error: "ошибка", not_started: "не начат" };
+const STOP_RU = { source_budget: "лимит источников", byte_budget: "лимит байт", record_budget: "лимит записей",
+  time_budget: "лимит времени" };
+let archiveStatus = null;
+
+function textLine(text, cls) {
+  const line = document.createElement("p");
+  line.className = cls || "hint";
+  line.textContent = text;
+  return line;
+}
+
+function statesText(states) {
+  const parts = Object.entries(states || {}).map(([key, n]) => (STATE_RU[key] || key) + " " + ru(n));
+  return parts.length ? parts.join(", ") : "—";
+}
+
+function mib(bytes) { return (Number(bytes || 0) / 1048576).toFixed(1) + " МиБ"; }
+
+function renderArchive() {
+  const doc = archiveStatus;
+  const tag = $("archive-state");
+  const summary = $("archive-summary");
+  if (!doc) { summary.replaceChildren(textLine("Состояние архива ещё не получено.")); return; }
+  tag.hidden = false;
+  const configured = doc.configured || {};
+  const config = configured.collector_config || {};
+  const timer = configured.timer || {};
+  const lines = [];
+  if (doc.status === "not_configured") {
+    tag.textContent = "не настроен"; tag.className = "tag quiet";
+    lines.push(textLine("Архива ещё нет: ничего не собрано и не импортировано."));
+  } else if (doc.status !== "ok") {
+    tag.textContent = "ошибка"; tag.className = "tag bad";
+    lines.push(textLine("Архив не открыт: " + (doc.error || doc.error_kind || "неизвестная ошибка"), "hint"));
+  } else {
+    tag.textContent = config.enabled ? "сборщик включён" : "сборщик на паузе";
+    tag.className = "tag" + (config.enabled ? "" : " quiet");
+  }
+  lines.push(textLine("Настроено: сборщик " + (config.present ? (config.enabled ? "включён" : "на паузе") : "не настроен") +
+    (config.error ? " (конфиг повреждён: " + config.error + ")" : "") +
+    (config.present ? "; окно сбора — файлы, изменённые за " + config.since_days + " дн., плюс уже отслеживаемые" : "") +
+    "; таймер systemd: файлы " + (timer.unit_files_installed ? "установлены" : "не установлены") +
+    ", автозапуск " + (timer.enabled_at_boot ? "включён" : "выключен") + "."));
+  const run = doc.observed && doc.observed.last_run;
+  if (run) {
+    lines.push(textLine("Последний прогон: " + run.finished_at + ", " + run.elapsed_seconds + " с, источников посещено " +
+      ru(run.visited || 0) + (run.stopped_by ? ", остановлен: " + (STOP_RU[run.stopped_by] || run.stopped_by) : ", без упора в лимиты") +
+      ". Всего прогонов в журнале: " + ru(doc.observed.runs_recorded) + "."));
+  } else if (doc.status === "ok") {
+    lines.push(textLine("Сборщик ещё не запускался: записи импортированы вручную."));
+  }
+  summary.replaceChildren(...lines);
+  const table = document.createElement("table");
+  table.className = "captable";
+  const head = document.createElement("tr");
+  ["Клиент", "Обнаружено файлов", "Вне окна", "Источники", "Прочитано из окна", "Сохранено записей", "Сессий", "Последнее сохранение"]
+    .forEach((title) => { const th = document.createElement("th"); th.textContent = title; head.append(th); });
+  table.append(head);
+  const stored = (doc.stored && doc.stored.by_client) || {};
+  const seen = (run && run.clients) || {};
+  const cursors = (doc.observed && doc.observed.cursors) || {};
+  for (const client of ["claude", "codex", "hermes"]) {
+    const s = stored[client] || {};
+    const o = seen[client] || {};
+    const c = cursors[client] || {};
+    const row = document.createElement("tr");
+    row.append(
+      cell(client),
+      cell(o.root === "absent" ? "нет каталога" : o.discovered === undefined ? "—" : ru(o.discovered)),
+      cell(o.out_of_window === undefined ? "—" : ru(o.out_of_window)),
+      cell(statesText(c.sources_by_state), c.sources_by_state && c.sources_by_state.error ? "warn" : ""),
+      cell(o.bytes_in_scope === undefined ? (client === "hermes" ? "по строкам" : "—") : mib(o.bytes_covered) + " из " + mib(o.bytes_in_scope)),
+      cell(s.entries === undefined ? "0" : ru(s.entries)),
+      cell(s.sessions === undefined ? "0" : ru(s.sessions)),
+      cell(s.last_observed_at || "—"),
+    );
+    table.append(row);
+  }
+  $("archive-table").replaceChildren(table);
+  const notes = [doc.coverage_note, "Сохраняется: " + doc.stored_text,
+    "Найденный текст — недоверенные данные: это цитата, а не инструкция."];
+  for (const error of (doc.observed && doc.observed.errors) || []) {
+    notes.push("Ошибка источника (" + error.client + ", " + ru(error.sources) + " шт.): " + error.error);
+  }
+  $("archive-notes").replaceChildren(...notes.filter(Boolean).map((text) => {
+    const item = document.createElement("li"); item.textContent = text; return item;
+  }));
+}
+
+async function refreshArchive() {
+  try { archiveStatus = await api("/api/archive/status"); }
+  catch (error) { archiveStatus = { status: "error", error: error.message }; }
+  renderArchive();
+  await refreshBackfill();
+}
+
+let backfillStatus = null;
+
+function renderBackfill() {
+  const holder = $("backfill-state");
+  const note = $("backfill-note");
+  const doc = backfillStatus;
+  if (!doc) { holder.textContent = "Состояние импорта ещё не получено."; return; }
+  note.textContent = "";
+  const bf = doc.backfill || {};
+  const cov = doc.coverage || {};
+  const run = doc.observed_last_run || null;
+  const collectorEnabled = !!(doc.collector_enabled);
+  const pieces = [];
+  if (bf.state === "error") {
+    holder.textContent = "Ошибка конфигурации импорта: " + (bf.error || "неизвестно") +
+      ". Файл не читается; обычный сборщик работает как прежде.";
+    return;
+  }
+  if (bf.state === "disabled" || bf.present === false) {
+    holder.textContent = "Импорт старых переписок выключен.";
+  } else if (bf.state === "stopped") {
+    holder.textContent = "Импорт остановлен: новые старые файлы не берутся, уже отслеживаемые дочитываются.";
+  } else {
+    holder.textContent = "Импорт настроен: до " + ru(bf.files_per_run || 0) + " старых файлов за прогон.";
+  }
+  // Never claim an active process from the config alone.
+  if (bf.state === "running") {
+    pieces.push(collectorEnabled
+      ? "Обычный сборщик включён."
+      : "Обычный сборщик на паузе — импорт не выполняется, пока он не запущен.");
+    if (!run) { pieces.push("Сборщик ещё ни разу не запускался."); }
+  }
+  // Keep meaningful last-run evidence even when stopped/disabled.
+  if (run) {
+    pieces.push("Последний прогон: " + run.finished_at + (run.stopped_by ? " (остановка: " + run.stopped_by + ")" : "") + ".");
+  }
+  // Coverage is shown whatever the switch says, as long as a run recorded it.
+  const stored = cov.stored_visible_sources_by_client || {};
+  const storedTotal = Object.keys(stored).reduce((sum, key) => sum + Number(stored[key] || 0), 0);
+  if (Object.keys(stored).length) {
+    pieces.push("В архиве видны переписки из " + ru(storedTotal) + " источников (включая обычное окно)");
+  }
+  if (cov.remaining_out_of_window != null) {
+    pieces.push("Не импортировано старых файлов: " + ru(cov.remaining_out_of_window));
+  } else {
+    pieces.push("Сколько ещё не импортировано — по последнему прогону неизвестно");
+  }
+  if (cov.watermark_mtime != null && cov.contiguous === true) {
+    pieces.push("Непрерывно импортировано до момента " + cov.watermark_mtime);
+  } else {
+    pieces.push("Непрерывного покрытия истории нет");
+  }
+  if (cov.discovery_truncated) { pieces.push("список файлов был обрезан — покрытие ниже, чем кажется"); }
+  if (cov.missing_sources) { pieces.push("пропало источников: " + ru(cov.missing_sources)); }
+  pieces.push("Полный захват истории не заявляется");
+  note.textContent = pieces.join(". ") + ".";
+}
+
+async function refreshBackfill() {
+  try { backfillStatus = await api("/api/archive/backfill"); }
+  catch (error) { backfillStatus = { status: "error", error: error.message, backfill: {} }; }
+  renderBackfill();
+}
+
+async function backfillAction(action) {
+  const note = $("backfill-note");
+  const payload = { action };
+  if (action === "start") {
+    payload.files_per_run = Number($("backfill-quota").value);
+    if (!Number.isInteger(payload.files_per_run) || payload.files_per_run < 1 || payload.files_per_run > 20) {
+      note.textContent = "Число файлов за прогон должно быть целым от 1 до 20.";
+      return;
+    }
+  }
+  note.textContent = action === "start" ? "Запускаю добор…" : "Останавливаю добор…";
+  try {
+    await api("/api/archive/backfill", { method: "POST", body: JSON.stringify(payload) });
+    await refreshBackfill();
+  } catch (error) {
+    note.textContent = "Не удалось: " + error.message;
+  }
+}
+
+async function archiveSearch(event) {
+  event.preventDefault();
+  const q = $("archive-q").value.trim();
+  const note = $("archive-search-note");
+  $("archive-read").replaceChildren();
+  if (!q) { note.textContent = "Введите слова для поиска."; return; }
+  const params = new URLSearchParams({ q, limit: "10" });
+  if ($("archive-client").value) { params.set("client", $("archive-client").value); }
+  note.textContent = "Ищу…";
+  try {
+    const answer = await api("/api/archive/search?" + params.toString());
+    const hits = answer.results || [];
+    note.textContent = hits.length
+      ? "Найдено " + hits.length + (answer.truncated_by_budget ? " (обрезано бюджетом " + answer.budget_tokens + " токенов)" : "") +
+        ". Отрывки до 300 символов; нажмите, чтобы открыть запись."
+      : "Ничего не найдено.";
+    $("archive-results").replaceChildren(...hits.map((hit) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "arch-hit";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = "#" + hit.id + " · " + hit.client + " · " + hit.role + " · " + (hit.timestamp || "без времени") +
+        " · сессия " + String(hit.session_id || "—").slice(0, 40) + (hit.cwd ? " · " + hit.cwd : "");
+      const body = document.createElement("div");
+      body.textContent = hit.excerpt;
+      button.append(meta, body);
+      button.addEventListener("click", () => archiveRead(hit.id, 0));
+      return button;
+    }));
+  } catch (error) {
+    note.textContent = "Поиск не выполнен: " + error.message;
+    $("archive-results").replaceChildren();
+  }
+}
+
+async function archiveRead(id, offset) {
+  const holder = $("archive-read");
+  try {
+    const params = new URLSearchParams({ id: String(id), offset: String(offset), context: "2" });
+    const entry = await api("/api/archive/read?" + params.toString());
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = "Запись #" + entry.id + " · " + entry.client + " · " + entry.role + " (" + entry.role_note + ")" +
+      " · время в источнике: " + (entry.timestamp || "нет") + " · замечено архивом: " + entry.observed_at +
+      (entry.capture_lag_seconds === null ? "" : " · задержка захвата " + entry.capture_lag_seconds + " с") +
+      " · сессия " + (entry.session_id || "—") + (entry.cwd ? " · каталог (записан клиентом): " + entry.cwd : "") +
+      " · байты " + entry.content_offset + "–" + (entry.content_offset + new TextEncoder().encode(entry.content).length) +
+      " из " + entry.content_bytes + " · недоверенный текст";
+    const pre = document.createElement("pre");
+    pre.textContent = entry.content;
+    const parts = [meta, pre];
+    if (entry.next_offset !== null && entry.next_offset !== undefined) {
+      const more = document.createElement("button");
+      more.type = "button"; more.className = "arch-more"; more.textContent = "Дальше";
+      more.addEventListener("click", () => archiveRead(entry.id, entry.next_offset));
+      parts.push(more);
+    }
+    const around = entry.neighbours || {};
+    for (const [label, list] of [["Раньше в этой сессии", around.before || []], ["Позже в этой сессии", around.after || []]]) {
+      if (!list.length) { continue; }
+      parts.push(textLine(label + ":", "meta"));
+      for (const item of list) {
+        const button = document.createElement("button");
+        button.type = "button"; button.className = "arch-hit";
+        button.textContent = "#" + item.id + " · " + item.role + " · " + item.preview;
+        button.addEventListener("click", () => archiveRead(item.id, 0));
+        parts.push(button);
+      }
+    }
+    holder.replaceChildren(...parts);
+  } catch (error) {
+    holder.replaceChildren(textLine("Запись не прочитана: " + error.message));
+  }
+}
+
+function renderDiagnostics() {
+  const activity = (state.capture && state.capture.activity) || {};
+  const lines = [
+    ["Версия маршрутов окна", String(state.api_revision || "старая")],
+    ["Файл настроек", state.settings_warnings && state.settings_warnings.length
+      ? "восстановлен частично: " + state.settings_warnings.join("; ") : "читается без ошибок"],
+    ["Журнал событий", activity.available === false ? (activity.reason || "пуст")
+      : "прочитано " + ru(activity.events_read || 0) + ", повреждённых " + ru(activity.invalid_records || 0) +
+        ", из будущего " + ru(activity.future_records || 0) + (activity.tail_truncated ? " (только хвост)" : "")],
+    ["Когда применяется", "Числа поиска читает каждая следующая команда brain и каждый поисковый запрос MCP-сервера — перезапуск не нужен. " +
+      "Режим модели эмбеддингов уже запущенный brain serve может подхватить только после своего перезапуска."],
+    ["Полная проверка", "в терминале: brain doctor (только чтение)"],
+  ];
+  const list = document.createElement("dl");
+  list.className = "diag";
+  for (const [key, value] of lines) {
+    const dt = document.createElement("dt"); dt.textContent = key;
+    const dd = document.createElement("dd"); dd.textContent = value;
+    list.append(dt, dd);
+  }
+  $("diagnostics").replaceChildren(list);
+}
+
+// Turns a silence into the phrase a person would use for it.
+function sinceText(seconds) {
+  if (seconds < 10) { return "прямо сейчас"; }
+  if (seconds < 60) { return seconds + " с назад"; }
+  if (seconds < 3600) { return Math.round(seconds / 60) + " мин назад"; }
+  if (seconds < 86400) { return Math.round(seconds / 3600) + " ч назад"; }
+  return Math.round(seconds / 86400) + " дн назад";
+}
+
+function renderWork() {
+  const work = state.work;
+  const confidence = $("work-confidence");
+  const note = $("work-note");
+  const goalBox = $("work-goal");
+  const blockerBox = $("work-blockers");
+  if (!work || !work.available || !work.goals) {
+    confidence.hidden = true;
+    note.textContent = "Пока нечего показать: память пуста.";
+    goalBox.replaceChildren();
+    blockerBox.replaceChildren();
+    return;
+  }
+
+  const goals = work.goals;
+  confidence.hidden = false;
+  confidence.textContent = goals.confidence;
+  confidence.className = goals.stated ? "tag quiet" : "tag";
+  note.textContent = goals.hint;
+
+  const line = document.createElement("div");
+  line.className = "goal-line";
+  if (goals.stated) {
+    line.innerHTML = `<span class="goal-text"></span><span class="goal-src"></span>`;
+    line.querySelector(".goal-text").textContent = goals.stated.text;
+    line.querySelector(".goal-src").textContent = goals.stated.source;
+  } else if (goals.inferred && goals.inferred.length) {
+    // Inferred subjects are shown as what the records keep returning to, not as
+    // a goal in the person's own words — the difference is the honest part.
+    line.innerHTML = `<span class="goal-src">записи возвращаются к:</span>`;
+    const list = document.createElement("span");
+    list.className = "goal-text";
+    list.textContent = goals.inferred.slice(0, 5).map((g) => g.subject).join(" · ");
+    line.append(list);
+  } else {
+    line.innerHTML = `<span class="goal-src">цель не задана и не выводится</span>`;
+  }
+  goalBox.replaceChildren(line);
+
+  const blockers = (work.blockers && work.blockers.blockers) || [];
+  blockerBox.replaceChildren(...blockers.map((item) => {
+    const row = document.createElement("div");
+    row.className = "blocker-row";
+    const kind = document.createElement("span");
+    kind.className = "blocker-kind";
+    kind.textContent = item.kind;
+    const title = document.createElement("span");
+    title.className = "blocker-title";
+    title.textContent = item.title;
+    const age = document.createElement("span");
+    age.className = "blocker-age";
+    age.textContent = item.age_days === 0 ? "сегодня" : item.age_days + " дн назад";
+    row.append(kind, title, age);
+    return row;
+  }));
+}
+
+function renderActivity() {
+  const activity = state.activity;
+  const note = $("live-note");
+  const count = $("live-count");
+  const list = $("live");
+  if (!activity || !activity.available) {
+    count.hidden = true;
+    note.textContent = (activity && activity.reason) || "Журнал обращений пока пуст.";
+    list.replaceChildren();
+    return;
+  }
+  const working = activity.working_now;
+  count.hidden = false;
+  count.textContent = working > 0 ? working + " в работе" : "тихо";
+  note.textContent = "Просмотрено обращений: " + ru(activity.events_read)
+    + ". Пути и содержимое запросов здесь не показываются.";
+
+  list.replaceChildren(...activity.agents.map((agent) => {
+    const row = document.createElement("div");
+    row.className = "agent-row agent-" + agent.state;
+    const dot = document.createElement("span");
+    dot.className = "agent-dot";
+    const name = document.createElement("span");
+    name.className = "agent-name";
+    name.textContent = agent.agent;
+    const state_ = document.createElement("span");
+    state_.className = "agent-state";
+    state_.textContent = agent.state + " · " + sinceText(agent.idle_seconds);
+    const numbers = document.createElement("span");
+    numbers.className = "agent-numbers";
+    numbers.textContent = ru(agent.events) + " событий · " + ru(agent.tool_calls) + " вызовов";
+    row.append(dot, name, state_, numbers);
+    return row;
+  }));
+}
+
+function renderSaveBar() {
+  const changed = dirty();
+  $("save").disabled = !changed;
+  if (changed) { setStatus("Есть несохранённые изменения", ""); }
+}
+
+function exactNumberIsBeingEdited() {
+  const active = document.activeElement;
+  return Boolean(active && active.matches("#knobs input[type=number][data-exact-knob]"));
+}
+
+function setStatus(text, kind) {
+  const note = $("status");
+  note.textContent = text;
+  note.className = "note" + (kind ? " " + kind : "");
+}
+
+function render() {
+  $("space").textContent = "пространство «" + state.space + "»";
+  renderProfiles();
+  renderKnobs();
+  renderPrice();
+  renderModes();
+  renderDatabase();
+  renderActivity();
+  renderWork();
+  renderCapture();
+  renderDiagnostics();
+  renderSaveBar();
+  if (!dirty()) {
+    if (state.settings_warnings && state.settings_warnings.length) {
+      setStatus("Настройки восстановлены частично: " + state.settings_warnings.join("; "), "bad");
+    } else {
+      setStatus("Изменений нет", "");
+    }
+  }
+}
+
+function adopt(document_, keepDraft) {
+  state = document_;
+  if (!keepDraft || !draft) {
+    draft = {
+      profile: state.profile,
+      embedding_mode: state.embedding_mode,
+      overrides: Object.fromEntries(KNOBS.map((knob) => {
+        const value = state.overrides[knob.key];
+        return [knob.key, value === undefined ? null : value];
+      })),
+    };
+  }
+}
+
+async function save() {
+  $("save").disabled = true;
+  setStatus("Сохраняю…", "");
+  try {
+    const answer = await api("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        profile: draft.profile,
+        embedding_mode: draft.embedding_mode,
+        overrides: draft.overrides,
+      }),
+    });
+    const recoveryWarnings = answer.settings_warnings || [];
+    adopt(answer, false);
+    render();
+    if (recoveryWarnings.length) {
+      setStatus("Сохранено после частичного восстановления: " + recoveryWarnings.join("; "), "bad");
+    } else {
+      setStatus("Сохранено — применится к каждой следующей команде brain", "ok");
+    }
+  } catch (error) {
+    setStatus("Не сохранено: " + error.message, "bad");
+    renderSaveBar();
+  }
+}
+
+async function refresh() {
+  try {
+    const answer = await api("/api/state");
+    const wasDirty = draft !== null && dirty();
+    const preserveExactInput = exactNumberIsBeingEdited();
+    state = answer;
+    // A number input may contain an intentional intermediate value such as
+    // "", "-", or "0." that cannot be committed to the numeric draft yet.
+    // Rebuilding the controls here used to erase it and move focus to BODY on
+    // every five-second status poll.
+    if (!wasDirty && !preserveExactInput) {
+      adopt(answer, false);
+      render();
+    } else {
+      renderDatabase();
+      renderActivity();
+      renderWork();
+      renderCapture();
+      renderDiagnostics();
+    }
+  } catch (error) {
+    $("db-note").textContent = "Состояние недоступно: " + error.message;
+  }
+}
+
+function initTheme() {
+  const stored = localStorage.getItem("brain-ui-theme") || "auto";
+  document.documentElement.dataset.theme = stored;
+  $("theme").addEventListener("click", () => {
+    const order = ["auto", "light", "dark"];
+    const next = order[(order.indexOf(document.documentElement.dataset.theme) + 1) % order.length];
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("brain-ui-theme", next);
+    $("theme").textContent = { auto: "Тема", light: "Светлая", dark: "Тёмная" }[next];
+  });
+}
+
+$("save").addEventListener("click", save);
+$("reset").addEventListener("click", () => {
+  for (const knob of KNOBS) { draft.overrides[knob.key] = null; }
+  render();
+});
+initTheme();
+$("archive-form").addEventListener("submit", archiveSearch);
+$("backfill-form").addEventListener("submit", (event) => { event.preventDefault(); backfillAction("start"); });
+$("backfill-stop").addEventListener("click", () => backfillAction("stop"));
+refreshArchive();
+setInterval(refreshArchive, 15000);
+
+const WORK_STATES = { queued: "в очереди", active: "в работе", paused: "на паузе", completed: "готово", failed: "не удалось" };
+let workOffset = 0;
+function workTable(headers, rows) {
+  const table = document.createElement("table");
+  table.className = "captable";
+  const head = document.createElement("tr");
+  headers.forEach((title) => { const th = document.createElement("th"); th.textContent = title; head.append(th); });
+  table.append(head);
+  rows.forEach((cells) => {
+    const row = document.createElement("tr");
+    cells.forEach((value) => { const td = document.createElement("td"); td.textContent = value; row.append(td); });
+    table.append(row);
+  });
+  return table;
+}
+function leaseLeft(seconds) {
+  if (seconds == null) { return "—"; }
+  return seconds >= 3600 ? Math.floor(seconds / 3600) + " ч " + Math.floor(seconds % 3600 / 60) + " мин"
+       : Math.floor(seconds / 60) + " мин " + (seconds % 60) + " с";
+}
+async function refreshWork(event) {
+  if (event) { event.preventDefault(); workOffset = 0; }
+  const params = new URLSearchParams({ offset: String(workOffset), limit: "25" });
+  if ($("work-project").value.trim()) { params.set("project", $("work-project").value.trim()); }
+  if ($("work-filter").value) { params.set("state", $("work-filter").value); }
+  let doc;
+  try { doc = await api("/api/work/board?" + params.toString()); }
+  catch (error) { $("work-summary").textContent = "Координатор недоступен: " + error.message; return; }
+  const tag = $("work-state");
+  tag.hidden = false;
+  if (doc.status === "not_configured") {
+    tag.textContent = "не настроен";
+    $("work-summary").textContent = "Задач ещё нет. Первая команда brain work add создаст базу координатора.";
+    $("work-table").replaceChildren(); $("work-claims").replaceChildren();
+    $("work-prev").disabled = true; $("work-next").disabled = true;
+    return;
+  }
+  const c = doc.counts || {};
+  tag.textContent = ru(c.active || 0) + " в работе";
+  $("work-summary").textContent = "Пространство " + doc.space + ": в очереди " + ru(c.queued || 0) + ", в работе " + ru(c.active || 0)
+    + ", на паузе " + ru(c.paused || 0) + ", готово " + ru(c.completed || 0) + ", не удалось " + ru(c.failed || 0)
+    + ". " + (doc.tasks.length ? "Показаны " + (doc.offset + 1) + "–" + (doc.offset + doc.tasks.length) : "Показано 0 задач")
+    + ". Подробности: brain work show ID.";
+  $("work-table").replaceChildren(workTable(["#", "Проект", "Задача", "Состояние", "Владелец", "Аренда ещё", "Зависимости"],
+    doc.tasks.map((t) => [String(t.id), t.project, t.title, WORK_STATES[t.state] || t.state,
+      t.owner ? t.owner.agent + " @ " + t.owner.machine : "—", t.owner ? leaseLeft(t.owner.expires_in_secs) : "—",
+      t.dependencies.total ? (t.dependencies.total - t.dependencies.open) + "/" + t.dependencies.total + " готово" : "—"])));
+  const paths = (doc.claims || []).filter((claim) => claim.kind === "path");
+  $("work-claims").replaceChildren(paths.length ? workTable(["Путь (заявка)", "Проект", "Владелец", "Аренда ещё"],
+    paths.map((p) => [p.resource, p.project, p.agent + " @ " + p.machine, leaseLeft(p.expires_in_secs)])) : "");
+  $("work-prev").disabled = workOffset === 0;
+  $("work-next").disabled = !doc.has_more;
+}
+$("work-form").addEventListener("submit", refreshWork);
+$("work-prev").addEventListener("click", () => { workOffset = Math.max(0, workOffset - 25); refreshWork(); });
+$("work-next").addEventListener("click", () => { workOffset += 25; refreshWork(); });
+refreshWork();
+setInterval(refreshWork, 15000);
+api("/api/state").then((answer) => { adopt(answer, false); render(); })
+  .catch((error) => setStatus("Не удалось получить состояние: " + error.message, "bad"));
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+[workspace]
+members = ["brain-core", "brain-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# sqlite-vec 0.1.9 не собирается под musl: BSD-типы вне glibc.
+# См. vendor/sqlite-vec/PATCH-NOTES.md. Снять, когда фикс выйдет в апстриме.
+[patch.crates-io]
+sqlite-vec = { path = "vendor/sqlite-vec" }

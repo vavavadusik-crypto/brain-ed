@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<title>Brain for AI — карта проектов</title>
+<style>
+:root { color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #fff; --edge: #e2e5ea; --ink: #14181f; --dim: #5c6472;
+  --accent: #0f7b5f; --soft: #e3f4ee; --warn: #9a5b00; --warnsoft: #fdf1dc;
+  --past: #6b7280; --current: #0f7b5f; --planned: #2563eb; --conflict: #b42318; --brain: #b07f86; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #10131a; --panel: #171b24; --edge: #262c38; --ink: #e8ecf3; --dim: #9aa4b4;
+    --accent: #4ade9f; --soft: #14301f; --warn: #f0b45f; --warnsoft: #3a2d14;
+    --past: #9aa4b4; --current: #4ade9f; --planned: #7aa7ff; --conflict: #ff7a6b; --brain: #c79aa1; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); display: flex; flex-direction: column;
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif; }
+header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--edge);
+  background: var(--panel); flex-wrap: wrap; }
+h1 { font-size: 17px; margin: 0; }
+h2 { font-size: 14px; margin: 12px 0 6px; }
+.sub, .dim { color: var(--dim); font-size: 12px; }
+.spacer { flex: 1; }
+a.btn, button { font: inherit; font-size: 13px; color: var(--ink); background: transparent; border: 1px solid var(--edge);
+  border-radius: 7px; padding: 4px 10px; cursor: pointer; text-decoration: none; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button[aria-pressed="true"] { border-color: var(--accent); background: var(--soft); color: var(--accent); }
+input { font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--edge); border-radius: 7px;
+  background: var(--bg); color: var(--ink); width: 150px; }
+main { flex: 1; display: grid; grid-template-columns: 280px 1fr 380px; min-height: 0; }
+aside { background: var(--panel); padding: 12px; overflow: auto; min-height: 0; }
+aside.left { border-right: 1px solid var(--edge); } aside.right { border-left: 1px solid var(--edge); }
+section.center { position: relative; min-height: 0; }
+canvas { width: 100%; height: 100%; display: block; outline: none; }
+.banner { padding: 10px 12px; border-radius: 8px; background: var(--warnsoft); color: var(--warn); margin-bottom: 10px; }
+.item { border: 1px solid var(--edge); border-radius: 8px; padding: 6px 8px; margin-bottom: 6px; cursor: pointer; }
+.item.sel { border-color: var(--accent); background: var(--soft); }
+.item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--edge); margin-right: 4px; }
+.past { color: var(--past); } .current { color: var(--current); } .planned { color: var(--planned); }
+.conflict { color: var(--conflict); border-color: var(--conflict); }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; background: var(--bg); padding: 8px; border-radius: 7px; max-height: 320px; overflow: auto; }
+a.ref { color: var(--accent); cursor: pointer; text-decoration: underline; }
+.hint { position: absolute; left: 12px; bottom: 12px; right: 12px; color: var(--dim); font-size: 12px; pointer-events: none; }
+/* Hover text and the legend stack in normal flow, so a wrapped hover title
+   pushes the legend down instead of covering it; an empty hover takes no room.
+   The whole stack lets pointer events through to the canvas. */
+.overlay { position: absolute; left: 12px; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px;
+  pointer-events: none; overflow-wrap: anywhere; }
+.hover { color: var(--ink); font-size: 12px; }
+.hover:empty { display: none; }
+.legend { color: var(--dim); font-size: 12px; }
+ul.regions { list-style: none; padding: 0; margin: 0; }
+ul.regions li { margin-bottom: 4px; }
+ul.regions button { width: 100%; text-align: left; }
+.state-data { color: var(--accent); } .state-empty, .state-elsewhere { color: var(--dim); }
+.legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 4px 0 8px; background: currentColor; vertical-align: baseline; }
+/* On a phone the legend keeps its phase dots and subset line; the long notes
+   live in the region list and detail panel instead of over the canvas. */
+@media (max-width: 520px) { .legend > .dim { display: none; } }
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-auto-rows: auto minmax(360px, 60vh) auto; }
+  aside.left, aside.right { border: 0; border-bottom: 1px solid var(--edge); max-height: 40vh; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Карта проектов</h1>
+  <span class="sub">проекты → задачи и сессии → решения, ошибки, исходы. Только чтение.</span>
+  <span class="spacer"></span>
+  <span class="sub" role="group" aria-label="Вид карты">
+    <button id="mode-2d" type="button" aria-pressed="true" title="Плоская схема: проекты на кольце, задачи фаном">2D</button>
+    <button id="mode-3d" type="button" aria-pressed="false" title="Объёмный мозг: два полушария, восемь областей, проекты внутри, задачи ветвями">3D-мозг</button>
+  </span>
+  <label class="sub">space <input id="space" maxlength="64"></label>
+  <button id="open" type="button">Открыть</button>
+  <a class="btn" href="/graph">Граф памяти</a>
+  <a class="btn" href="/">Настройки</a>
+</header>
+<main>
+  <aside class="left">
+    <div id="status"></div>
+    <h2>Проекты</h2>
+    <div id="projects"></div>
+    <button id="more-projects" type="button" hidden>Ещё проекты</button>
+    <section id="regions-panel" hidden aria-labelledby="regions-title">
+      <h2 id="regions-title">Области мозга</h2>
+      <p class="dim">Деление памяти по смыслу, не анатомия. Числа — только из загруженных проектов этой карты.</p>
+      <ul id="regions" class="regions"></ul>
+    </section>
+  </aside>
+  <section class="center">
+    <canvas id="scene" tabindex="0" role="img" aria-label="Карта проектов и задач"></canvas>
+    <div class="overlay">
+      <div id="hover" class="hover" aria-hidden="true"></div>
+      <div id="legend3d" class="legend" hidden></div>
+    </div>
+    <div id="scene-hint" class="hint"></div>
+  </section>
+  <aside class="right">
+    <div id="detail"><p class="dim">Выберите проект слева или на карте.</p></div>
+  </aside>
+</main>
+<script src="/map/map3d.js"></script>
+<script>
+"use strict";
+// The window key never appears in this page. The launcher opens the page with
+// it in the URL fragment (never sent to the server, never in a Referer); it is
+// moved into this origin's sessionStorage and the fragment is erased at once.
+const TOKEN = (() => {
+  const SLOT = "brain-ui-token";
+  const match = /^#k=([0-9a-f]{64})$/.exec(location.hash);
+  if (match) history.replaceState(null, "", location.pathname + location.search);
+  try {
+    if (match) sessionStorage.setItem(SLOT, match[1]);
+    return sessionStorage.getItem(SLOT) || "";
+  } catch (_) {
+    return match ? match[1] : "";
+  }
+})();
+const PHASE = { past: "прошлое", current: "сейчас", planned: "в плане" };
+let generation = 0;
+let mode = "2d";
+const view = { space: "", projects: [], offset: 0, selected: null, tasks: [], links: [] };
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+const $ = (id) => document.getElementById(id);
+
+/* Every answer is tagged with the generation it was asked in; an answer for
+   an older space or an expired key is dropped, never drawn. */
+async function api(path, params, method) {
+  const asked = generation;
+  const query = new URLSearchParams(Object.assign({ space: view.space }, params || {}));
+  const response = await fetch(path + "?" + query.toString(),
+    { method: method || "GET", headers: { "x-brain-token": TOKEN }, cache: "no-store" });
+  if (response.status === 401 || response.status === 403) { expired(); throw new Error("stale"); }
+  const body = await response.json();
+  if (asked !== generation) throw new Error("stale");
+  return { ok: response.ok, body };
+}
+
+function expired() {
+  generation += 1;
+  resetPanels();
+  const status = $("status");
+  clear(status);
+  const box = el("div", "Ключ окна устарел (окно перезапущено). Данные этой страницы очищены.", "banner");
+  const again = el("button", "Переподключиться"); again.type = "button";
+  again.onclick = () => location.reload();
+  box.appendChild(el("br")); box.appendChild(again);
+  status.appendChild(box);
+}
+
+/* Switching space, losing the key or reloading clears every panel and the
+   whole scene, so nothing from one space can linger over another. */
+function resetPanels() {
+  view.projects = []; view.offset = 0; view.selected = null; view.tasks = []; view.links = [];
+  clear($("regions"));
+  clear($("projects")); clear($("detail")); clear($("hover")); $("more-projects").hidden = true;
+  if (view3d) view3d.clear();
+  draw();
+}
+
+async function openSpace() {
+  const space = $("space").value.trim() || "default";
+  generation += 1;
+  view.space = space;
+  resetPanels();
+  try { await loadStatus(); await loadProjects(); } catch (e) { if (e.message !== "stale") showError(e); }
+}
+
+function showError(e) { $("status").appendChild(el("div", "Ошибка: " + e.message, "banner")); }
+
+async function loadStatus() {
+  const { body } = await api("/api/map/status");
+  const box = $("status"); clear(box);
+  if (body.map === "not_configured") {
+    box.appendChild(el("div", "Карта работы не создана. Чтение её не создаёт. Проекты ниже — только из координатора.", "banner"));
+    const create = el("button", "Создать карту", "primary"); create.type = "button";
+    create.onclick = () => userAction("/api/map/init", "Создать пустую карту работы в $BRAIN_HOME/map?");
+    box.appendChild(create);
+  } else if (body.status === "ok") {
+    box.appendChild(el("div", "Карта: событий " + body.events + ", связей " + body.links + ", курсоров " + body.ingest_cursors, "dim"));
+    const ingest = el("button", "Загрузить события координатора"); ingest.type = "button";
+    ingest.onclick = () => userAction("/api/map/ingest", "Прочитать следующие события координатора этого space в карту? Записи будут помечены как непроверенные.");
+    box.appendChild(ingest);
+  } else {
+    box.appendChild(el("div", "Карта недоступна: " + (body.message || body.error_kind), "banner"));
+  }
+}
+
+/* Creating the map and reading coordinator events are explicit user actions,
+   sent as a POST with this window's key; the browser adds the Origin. */
+async function userAction(path, question) {
+  if (!window.confirm(question)) return;
+  try {
+    const { ok, body } = await api(path, {}, "POST");
+    if (!ok) showError(new Error(body.message || body.error_kind));
+    await loadStatus(); await loadProjects(true);
+  } catch (e) { if (e.message !== "stale") showError(e); }
+}
+
+async function loadProjects(reset) {
+  if (reset) { view.projects = []; view.offset = 0; clear($("projects")); }
+  const { body } = await api("/api/map/projects", { offset: view.offset, limit: 50 });
+  if (body.status !== "ok") { $("projects").appendChild(el("p", body.message || "нет данных", "dim")); return; }
+  for (const p of body.projects) {
+    view.projects.push(p);
+    const item = el("div", null, "item");
+    item.appendChild(el("div", p.name === "-" ? "без проекта" : p.name));
+    const line = el("div", null, "dim");
+    for (const phase of ["past", "current", "planned"]) line.appendChild(el("span", PHASE[phase] + " " + p[phase] + "  ", phase));
+    if (p.links) line.appendChild(el("span", "связей " + p.links + " "));
+    if (p.conflicts) line.appendChild(el("span", "споров " + p.conflicts, "tag conflict"));
+    item.appendChild(line);
+    activate(item, () => selectProject(p.name));
+    p.node = item;
+    $("projects").appendChild(item);
+  }
+  if (!body.projects.length && !view.projects.length) $("projects").appendChild(el("p", "Проектов пока нет.", "dim"));
+  view.offset += body.projects.length;
+  $("more-projects").hidden = !body.has_more;
+  if (view3d) view3d.setRegionMeta({ fetchedAt: Date.now(), hasMore: !!body.has_more });
+  renderRegions();
+  if (body.tasks_capped || body.links_capped) $("projects").appendChild(el("p", "Показаны первые 1000 задач/связей; счётчики неполные.", "dim"));
+  syncScene();
+  draw();
+}
+
+async function selectProject(name) {
+  view.selected = name; view.tasks = []; view.links = [];
+  for (const p of view.projects) if (p.node) p.node.classList.toggle("sel", p.name === name);
+  if (view3d) view3d.selectProject(name);
+  const detail = $("detail"); clear(detail);
+  detail.appendChild(el("h2", name === "-" ? "без проекта" : "Проект " + name));
+  detail.appendChild(el("div", "Фазы по состоянию задач в координаторе: «в плане» — это поставленные, но не начатые задачи, а не прогноз.", "dim"));
+  const tasks = el("div"); const links = el("div"); const timeline = el("div"); const packet = el("div");
+  detail.append(el("h2", "Задачи"), tasks, el("h2", "Связи проекта"), links, timeline, el("h2", "Контекст для агента"), packet);
+  view.timelineBox = timeline;
+  await loadTasks(name, tasks, 0, links, null);
+  const show = el("button", "Показать пакет (weak)"); show.type = "button";
+  show.onclick = () => loadPacket(name, packet);
+  packet.appendChild(show);
+}
+
+async function loadTasks(name, box, offset, linksBox, cursor) {
+  const params = { project: name, offset, limit: 25 };
+  if (cursor) params.cursor = cursor;
+  const { body } = await api("/api/map/project", params);
+  if (body.status !== "ok") { box.appendChild(el("p", body.message || "нет данных", "dim")); return; }
+  if (linksBox) {
+    if (body.links.map === "not_configured") linksBox.appendChild(el("p", "Карта не создана: связей нет, потому что их негде хранить.", "dim"));
+    else if (!body.links.rows.length && !cursor) linksBox.appendChild(el("p", "Связей нет.", "dim"));
+    for (const l of body.links.rows) linksBox.appendChild(linkItem(l));
+    if (body.links.next_cursor) {
+      const more = el("button", "Ещё связи"); more.type = "button";
+      more.onclick = () => { more.remove(); loadTasks(name, el("div"), offset, linksBox, body.links.next_cursor); };
+      linksBox.appendChild(more);
+    }
+  }
+  if (cursor) return;
+  for (const t of body.tasks) {
+    view.tasks.push(t);
+    const item = el("div", null, "item");
+    item.appendChild(el("span", PHASE[t.phase] + " · " + t.state, "tag " + t.phase));
+    item.appendChild(el("span", "#" + t.id + " " + t.title));
+    item.appendChild(el("div", "заголовок написан агентом (не проверено)", "dim"));
+    activate(item, () => loadTimeline(t.id, 0, true));
+    box.appendChild(item);
+  }
+  if (!body.tasks.length && offset === 0) box.appendChild(el("p", "Задач в координаторе нет.", "dim"));
+  if (body.has_more) {
+    const more = el("button", "Ещё задачи"); more.type = "button";
+    more.onclick = () => { more.remove(); loadTasks(name, box, offset + body.tasks.length, null, null); };
+    box.appendChild(more);
+  }
+  syncScene();
+  draw();
+}
+
+function linkItem(l) {
+  const item = el("div", null, "item");
+  item.appendChild(el("span", l.relation, "tag"));
+  item.appendChild(refNode(l.object));
+  const meta = el("div", null, "dim");
+  meta.appendChild(el("span", "статус " + l.status + " · основание " + l.best_basis + " · уверенность " + (l.confidence_milli / 1000).toFixed(2) + " "));
+  if (l.contested) meta.appendChild(el("span", "спор источников", "tag conflict"));
+  if (l.resolution !== "none") meta.appendChild(el("span", "решено пользователем", "tag"));
+  meta.appendChild(el("span", " · источников " + l.actors.length + " · событий " + l.current_events.length + "/" + l.all_events));
+  item.appendChild(meta);
+  return item;
+}
+
+/* Refs are links into readers this window already has; archive refs are
+   shown, not read: only the host may map an install to an archive. */
+function refNode(ref) {
+  const m = /^memory:([^/]+)\/(.+)$/.exec(ref);
+  if (!m) {
+    const span = el("span", ref + " ");
+    if (ref.startsWith("archive")) span.appendChild(el("span", "(архив: читается через archive_read хоста)", "dim"));
+    return span;
+  }
+  const a = el("a", ref, "ref");
+  a.onclick = (e) => { e.stopPropagation(); readMemory(m[1], m[2]); };
+  return a;
+}
+
+async function readMemory(space, id) {
+  const box = view.timelineBox; if (!box) return;
+  try {
+    const { ok, body } = await api("/api/explore/node", { space, id });
+    const pane = el("div", null, "item");
+    pane.appendChild(el("div", "Запись памяти " + id + (ok ? "" : ": не найдена"), "dim"));
+    if (ok) pane.appendChild(el("pre", JSON.stringify(body.node || body, null, 1).slice(0, 2000)));
+    box.prepend(pane);
+  } catch (e) { if (e.message !== "stale") showError(e); }
+}
+
+async function loadTimeline(task, after, fresh) {
+  const box = view.timelineBox; if (fresh) { clear(box); box.appendChild(el("h2", "История задачи #" + task)); }
+  const { body } = await api("/api/map/timeline", { task, after, limit: 50 });
+  if (body.status === "not_configured") { box.appendChild(el("p", "Карта не создана: истории нет.", "dim")); return; }
+  if (body.status !== "ok") { box.appendChild(el("p", body.message || "нет данных", "dim")); return; }
+  if (!body.entries.length && !after) box.appendChild(el("p", "Событий не загружено.", "dim"));
+  for (const e of body.entries) {
+    const item = el("div", null, "item");
+    const label = e.outcome ? (e.outcome.startsWith("unknown") ? "неизвестно" : (e.kind === "outcome_observed" ? "отмечено как наблюдение (" + e.basis + ")" : "заявлено")) : "";
+    item.appendChild(el("span", e.coord_kind || e.kind, "tag"));
+    if (label) item.appendChild(el("span", label + ": " + e.outcome, "tag"));
+    item.appendChild(el("span", e.agent + " · " + e.basis));
+    const ev = el("div", null, "dim");
+    if (!e.evidence) ev.appendChild(el("span", "доказательства: нет поля"));
+    else if (!e.evidence.length) ev.appendChild(el("span", "доказательства: пусто"));
+    else for (const r of e.evidence) ev.appendChild(refNode(r));
+    item.appendChild(ev);
+    box.appendChild(item);
+  }
+  if (body.next_after) {
+    const more = el("button", "Ещё события"); more.type = "button";
+    more.onclick = () => { more.remove(); loadTimeline(task, body.next_after, false); };
+    box.appendChild(more);
+  }
+}
+
+async function loadPacket(name, box) {
+  const { body } = await api("/api/map/packet", { project: name, tier: "weak" });
+  clear(box);
+  if (body.status !== "ok") { box.appendChild(el("p", body.message || body.error_kind, "dim")); return; }
+  box.appendChild(el("div", "Пакет " + body.packet_bytes + " байт (бюджет считается только по самому пакету).", "dim"));
+  box.appendChild(el("pre", body.packet_json));
+}
+
+/* A keyboard path that works without any graphics: every list row is a real
+   focusable button, so Tab + Enter selects a project or opens a task. */
+function activate(item, run) {
+  item.tabIndex = 0;
+  item.setAttribute("role", "button");
+  item.onclick = run;
+  item.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); run(); }
+  };
+}
+
+/* ---------- 2D scene: projects on a ring, tasks fanned by phase ---------- */
+const canvas = $("scene");
+let hits = [];
+function color(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+/* Depth is genuine only in the 3D view; here the ring is deliberately flat, so
+   this is a schema, not a projection — the mode label says which is which. */
+function draw2d() {
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * ratio; canvas.height = h * ratio;
+  const ctx = canvas.getContext("2d"); ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h); hits = [];
+  const cx = w / 2, cy = h / 2, ring = Math.min(w, h) * 0.38;
+  const shown = view.projects.slice(0, 60);
+  ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "center";
+  shown.forEach((p, i) => {
+    const angle = (i / Math.max(shown.length, 1)) * Math.PI * 2 - Math.PI / 2;
+    const selected = p.name === view.selected;
+    const x = selected ? cx : cx + Math.cos(angle) * ring, y = selected ? cy : cy + Math.sin(angle) * ring;
+    const r = 8 + Math.min(20, Math.sqrt(p.past + p.current + p.planned + p.links) * 3);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = p.conflicts ? color("--conflict") : (p.current ? color("--current") : (p.planned ? color("--planned") : color("--past")));
+    ctx.globalAlpha = selected ? 1 : 0.75; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.fillStyle = color("--ink"); ctx.fillText(p.name === "-" ? "без проекта" : p.name.slice(0, 28), x, y + r + 14);
+    hits.push({ x, y, r, project: p.name });
+  });
+  if (view.selected) {
+    view.tasks.slice(0, 80).forEach((t, i) => {
+      const base = { past: Math.PI, current: -Math.PI / 2, planned: 0 }[t.phase];
+      const angle = base + ((i % 12) - 6) * 0.12;
+      const d = 70 + Math.floor(i / 12) * 26;
+      const x = cx + Math.cos(angle) * d, y = cy + Math.sin(angle) * d;
+      ctx.strokeStyle = color("--edge"); ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fillStyle = color("--" + t.phase); ctx.fill();
+      hits.push({ x, y, r: 7, task: t.id });
+    });
+  }
+  if (!shown.length) { ctx.fillStyle = color("--dim"); ctx.fillText("Нет проектов для показа", cx, cy); }
+  $("scene-hint").textContent = "2D: проекты на кольце; слева — прошлое, сверху — сейчас, справа — в плане.";
+}
+
+/* ---------- 3D scene: genuine XYZ through the shared projection ---------- */
+let view3d = null;
+const HINT3D = "3D: тяните мышью — поворот, колесо — приближение, F — к выбранному, 0 — все показанные проекты, Enter — открыть выбранное.";
+/* The legend names the phases and says which subset is drawn: only what this
+   page has loaded, bounded, never the whole graph. Built with textContent. */
+function buildLegend() {
+  const box = $("legend3d"); clear(box);
+  const line = el("div");
+  for (const phase of ["past", "current", "planned", "conflict"]) {
+    const item = el("span", null, phase);
+    item.appendChild(el("span", null, "dot"));
+    item.appendChild(el("span", { past: PHASE.past, current: PHASE.current, planned: PHASE.planned, conflict: "спор" }[phase]));
+    line.appendChild(item);
+  }
+  box.append(line, el("div", "", "subset"),
+    el("div", "«в плане» — поставлено, не начато; подписи задач написаны агентами и не проверены.", "dim"),
+    el("div", "Контур мозга: заполненный кружок — у области есть данные; пустой — пусто; пунктир — её записи смотрят на другой странице.", "dim"));
+}
+function updateLegend(view3) {
+  const sum = view3.summary(), box = $("legend3d").querySelector(".subset");
+  if (!box) return;
+  let text = "Показано проектов: " + sum.projectsShown + " из загруженных " + sum.projectsLoaded;
+  if (sum.selected !== null && sum.tasksLoaded) text += "; задач выбранного: " + sum.tasksShown + " из загруженных " + sum.tasksLoaded;
+  if (!$("more-projects").hidden) text += ". Остальное — «Ещё проекты» слева";
+  box.textContent = text + ".";
+}
+/* The eight regions as a list: the accessible twin of the canvas markers. */
+const REGION_ROUTES = { "/graph": "Открыть «Граф памяти»", "/": "Открыть «Настройки»" };
+const REGION_STATE = { data: "есть данные", empty: "пусто", elsewhere: "не загружается здесь" };
+function regionLine(region, status) {
+  return region.name + " — " + REGION_STATE[status.state]
+    + (status.state === "elsewhere" ? "" : " (" + status.count + ")") + (status.stale ? ", устарело" : "");
+}
+function renderRegions() {
+  const list = $("regions"); clear(list);
+  if (!view3d) return;
+  const statuses = view3d.regionStatuses();
+  for (const region of window.BrainMap3D.REGIONS) {
+    const status = statuses[region.id];
+    const li = el("li"), button = el("button", regionLine(region, status), "state-" + status.state);
+    button.type = "button";
+    button.onclick = () => showRegion(region.id);
+    li.appendChild(button);
+    list.appendChild(li);
+  }
+}
+function showRegion(id) {
+  if (!view3d) return;
+  const region = window.BrainMap3D.REGIONS.find((r) => r.id === id);
+  if (!region) return;
+  const status = view3d.regionStatuses()[id], box = $("detail");
+  clear(box);
+  box.append(el("h2", region.name), el("p", REGION_STATE[status.state], "tag state-" + status.state), el("p", status.text));
+  if (status.route && REGION_ROUTES[status.route]) {
+    const link = el("a", REGION_ROUTES[status.route], "btn");
+    link.href = status.route;
+    box.appendChild(link);
+  }
+  box.appendChild(el("p", "Названия и границы областей — предложение продукта, не нейроанатомия. Наблюдение за реальными действиями агентов (чтение, правка файлов) пока не подключено.", "dim"));
+}
+function handle3dSelect(hit) {
+  if (!hit) return;
+  if (hit.kind === "region") { showRegion(hit.id); return; }
+  if (hit.kind === "task") loadTimeline(hit.id, 0, true).catch(() => {});
+  else if (hit.kind === "project") selectProject(hit.id).catch(() => {});
+}
+function syncScene() {
+  if (view3d) view3d.setData(view.projects, view.selected, view.tasks);
+}
+function draw() {
+  if (mode === "3d") { if (view3d) { syncScene(); view3d.request(); } $("scene-hint").textContent = HINT3D; return; }
+  draw2d();
+}
+function setMode(next) {
+  mode = next === "3d" ? "3d" : "2d";
+  $("mode-2d").setAttribute("aria-pressed", String(mode === "2d"));
+  $("mode-3d").setAttribute("aria-pressed", String(mode === "3d"));
+  $("hover").textContent = "";
+  $("legend3d").hidden = mode !== "3d";
+  $("regions-panel").hidden = mode !== "3d";
+  canvas.setAttribute("aria-label", mode === "3d"
+    ? "Объёмный мозг: области и проекты; список областей — слева, проекты — в списке «Проекты»"
+    : "Карта проектов и задач");
+  if (mode === "3d") {
+    syncScene(); view3d.resize(); view3d.fit(false); view3d.request();
+    $("scene-hint").textContent = HINT3D;
+  } else {
+    draw2d();
+  }
+}
+
+canvas.addEventListener("click", (event) => {
+  if (mode === "3d") return; // the 3D view owns its own picking
+  const box = canvas.getBoundingClientRect();
+  const x = event.clientX - box.left, y = event.clientY - box.top;
+  const hit = hits.find((h) => Math.hypot(h.x - x, h.y - y) <= h.r + 3);
+  if (!hit) return;
+  if (hit.task !== undefined) loadTimeline(hit.task, 0, true).catch(() => {});
+  else selectProject(hit.project).catch(() => {});
+});
+window.addEventListener("resize", () => {
+  if (mode === "3d" && view3d) view3d.resize(); else draw2d();
+});
+$("open").onclick = () => openSpace();
+$("more-projects").onclick = () => loadProjects(false).catch(() => {});
+$("mode-2d").onclick = () => setMode("2d");
+$("mode-3d").onclick = () => setMode("3d");
+
+/* Built once; hidden until the 3D mode is chosen. Its scene is emptied on every
+   space switch, key reset and reload by resetPanels(). */
+if (window.BrainMap3D) {
+  view3d = new window.BrainMap3D.Map3DView({
+    wrap: document.querySelector("section.center"),
+    canvas,
+    active: () => mode === "3d",
+    onSelect: handle3dSelect,
+    onFrame: updateLegend,
+    /* Labels never go under the hover text, legend or hint drawn over the canvas. */
+    avoidRects: () => {
+      const wrap = document.querySelector("section.center").getBoundingClientRect();
+      return [...document.querySelectorAll(".overlay > *, #scene-hint")]
+        .filter((node) => node.textContent && node.getClientRects().length)
+        .map((node) => { const r = node.getBoundingClientRect(); return [r.left - wrap.left, r.top - wrap.top, r.width, r.height]; });
+    },
+    onHoverText: (n) => {
+      const box = $("hover");
+      if (!n) { box.textContent = ""; return; }
+      if (n.region !== undefined) { box.textContent = regionLine(n, n.status) + " · нажмите для подробностей"; return; }
+      box.textContent = n.task !== undefined
+        ? ("#" + n.task + " · " + PHASE[n.phase] + " · " + (n.title || "") + " (заголовок агента, не проверен)")
+        : (n.project === "-" ? "без проекта" : n.project);
+    },
+  });
+  buildLegend();
+}
+$("space").value = new URLSearchParams(location.search).get("space") || "default";
+openSpace();
+</script>
+</body>
+</html>

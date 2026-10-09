@@ -1,0 +1,42 @@
+[package]
+name = "brain-core"
+description = "Core library for the Brain for AI local memory engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+model2vec = ["dep:hf-hub", "dep:model2vec-rs"]
+
+[dependencies]
+blake3 = "1.5"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["ureq"] }
+libc = "0.2"
+model2vec-rs = { version = "0.2.1", optional = true, default-features = false, features = ["fancy-regex", "hf-hub"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde_json = "1.0"
+sqlite-vec = "0.1.9"
+thiserror = "2.0"
+tree-sitter = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+walkdir = "2.5"
+
+[lints]
+workspace = true
+
+# These examples load a real Model2Vec model, which exists only with the
+# optional `model2vec` feature; the other examples build without it.
+[[example]]
+name = "cosine_distribution"
+required-features = ["model2vec"]
+
+[[example]]
+name = "model_load_bench"
+required-features = ["model2vec"]

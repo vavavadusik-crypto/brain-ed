@@ -1,0 +1,166 @@
+name: CI
+
+'on':
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 0.1.0 early preview: Linux is the only supported platform. The source uses
+# Unix-only APIs (std::os::unix, /proc/self ownership checks), so macOS and
+# Windows jobs are not run and no support for them is claimed. A platform is
+# added here only together with the evidence that it passes.
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      # Pinned action revisions keep CI code reviewable and reproducible.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked --release -p brain-cli --all-features
+      # Includes the TLS/network tests; they are mandatory, not skipped.
+      - run: cargo test --locked --workspace --all-features
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  feature-boundaries:
+    name: Feature boundaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked --release -p brain-cli --no-default-features
+      - run: cargo test --locked --workspace --no-default-features
+
+  javascript:
+    name: UI JavaScript (Node, no browser)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Uses the runner's preinstalled Node; the tests need only node:assert/fs.
+      - run: node --version
+      - run: node tests/test_map3d.js
+      - run: node tests/test_graph3d.js
+
+  installer:
+    name: Source installer (synthetic HOME)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: bash -n install.sh
+      # shellcheck ships on the ubuntu-24.04 image; fail loudly if it ever does not.
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || { echo "::error::shellcheck not installed on runner"; exit 1; }
+          shellcheck --version
+          shellcheck install.sh
+      # Everything below writes only into a throwaway HOME; the runner's real
+      # home, desktop and ~/.brain are never touched.
+      - name: Help, dry run, install, uninstall
+        run: |
+          set -euo pipefail
+          fake="$(mktemp -d)/home with space"
+          mkdir -p "$fake"
+          apps="$fake/.local/share/applications"
+          desk="$fake/Desktop dir"
+          # Synthetic XDG desktop: user-dirs.dirs names it relative to $HOME.
+          mkdir -p "$fake/.config" "$desk"
+          printf 'XDG_DESKTOP_DIR="$HOME/Desktop dir"\n' > "$fake/.config/user-dirs.dirs"
+          # Run from elsewhere with a foreign CARGO_TARGET_DIR: the installer
+          # must still build into and use the checkout's own target/.
+          src="$PWD"
+          run() { (cd / && env HOME="$fake" XDG_DATA_HOME="$fake/.local/share" \
+            XDG_CONFIG_HOME="$fake/.config" CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" CARGO_TARGET_DIR="$(mktemp -d)" \
+            "$src/install.sh" "$@"); }
+          run --help
+          if run --bogus; then echo "unknown option accepted"; exit 1; fi
+          before="$(find "$fake" | sort)"
+          run --dry-run
+          test "$before" = "$(find "$fake" | sort)"
+          run
+          test -x "$fake/.brain/bin/brain"
+          for name in brain-for-ai-settings brain-for-ai-graph; do
+            test -f "$apps/$name.desktop"
+            test -x "$desk/$name.desktop"
+          done
+          # Trust marking via gio is best-effort and not asserted.
+          mkdir -p "$fake/.brain/keep" && echo synthetic > "$fake/.brain/keep/data"
+          run --uninstall --dry-run | grep -q 'nothing was removed'
+          test -f "$desk/brain-for-ai-graph.desktop"
+          run --uninstall
+          for name in brain-for-ai-settings brain-for-ai-graph; do
+            test ! -e "$apps/$name.desktop"
+            test ! -e "$desk/$name.desktop"
+          done
+          test -f "$fake/.brain/keep/data"
+
+  python-capture:
+    name: Capture collector, bridge and archive E2E
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked --release -p brain-cli
+      # Synthetic fixtures only. BRAIN_BIN drives the archive E2E tests; the
+      # bridge resolves `brain` through PATH, so the built binary goes first.
+      - name: Python suites against the built binary
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          export BRAIN_BIN="$PWD/target/release/brain"
+          export PATH="$PWD/target/release:$PATH"
+          python3 -B -m unittest -v tests.test_session_archive tests.test_session_collector \
+            tests.test_backfill tests.test_agent_bridge tests.test_archive_end_to_end \
+            tests.test_backfill_e2e
+      # Rotation/truncation semantics depend on inode reuse, which differs
+      # between the runner's disk filesystem and tmpfs.
+      - name: Collector on tmpfs
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          TMPDIR: /dev/shm
+        run: python3 -B -m unittest -v tests.test_session_collector
+
+  licences:
+    name: Dependency licences
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Allowlist policy over parsed SPDX expressions (OR/AND/WITH/parens);
+      # an unreviewed licence or an unpinned licence_file fails the job.
+      - run: python3 tools/check-licenses.py --self-test
+      - run: python3 tools/check-licenses.py

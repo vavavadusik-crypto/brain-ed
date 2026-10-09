@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<title>Brain for AI — граф памяти</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --panel: #fff; --edge: #e2e5ea; --ink: #14181f; --dim: #5c6472;
+  --accent: #0f7b5f; --soft: #e3f4ee; --warn: #9a5b00; --warnsoft: #fdf1dc;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #10131a; --panel: #171b24; --edge: #262c38; --ink: #e8ecf3; --dim: #9aa4b4;
+          --accent: #4ade9f; --soft: #14301f; --warn: #f0b45f; --warnsoft: #3a2d14; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--edge);
+  background: var(--panel); flex-wrap: wrap; }
+h1 { font-size: 17px; margin: 0; }
+.sub { color: var(--dim); font-size: 12px; }
+.spacer { flex: 1; }
+a.btn, button { font: inherit; font-size: 13px; color: var(--ink); background: transparent; border: 1px solid var(--edge);
+  border-radius: 7px; padding: 4px 10px; cursor: pointer; text-decoration: none; }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+main { flex: 1; display: grid; grid-template-columns: 300px 1fr 360px; min-height: 0; }
+aside, section.center { min-height: 0; overflow: auto; }
+aside { background: var(--panel); padding: 12px; }
+aside.left { border-right: 1px solid var(--edge); }
+aside.right { border-left: 1px solid var(--edge); }
+input, select { font: inherit; font-size: 13px; width: 100%; padding: 6px 8px; border: 1px solid var(--edge);
+  border-radius: 7px; background: var(--bg); color: var(--ink); margin-bottom: 6px; }
+.row { display: flex; gap: 6px; }
+.row > * { flex: 1; }
+.count { font-size: 12px; color: var(--dim); margin: 6px 0; }
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list li { padding: 6px 6px; border-radius: 6px; cursor: pointer; border-bottom: 1px solid var(--edge); }
+ul.list li:hover, ul.list li.on { background: var(--soft); }
+ul.list.stale li { opacity: .5; }
+.k { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; color: #fff; margin-right: 4px; }
+.meta { font-size: 11px; color: var(--dim); }
+.tabs { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--edge); background: var(--panel); }
+.tabs button.on { background: var(--soft); border-color: var(--accent); }
+section.center { display: flex; flex-direction: column; }
+#overview { padding: 14px 18px; overflow: auto; }
+#graphPane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--edge);
+  background: var(--panel); font-size: 12px; }
+.toolbar select { width: auto; margin: 0; padding: 3px 6px; font-size: 12px; }
+.toolbar label { color: var(--dim); }
+.seg { display: inline-flex; border: 1px solid var(--edge); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; }
+.seg button.on { background: var(--accent); color: #fff; }
+#crumbs { font-size: 12px; padding: 4px 10px; color: var(--dim); background: var(--bg); border-bottom: 1px solid var(--edge); }
+#crumbs button { padding: 1px 6px; font-size: 12px; }
+#stage { position: relative; flex: 1; min-height: 0; background: var(--bg); color: var(--ink); outline: none; cursor: grab;
+  touch-action: none; overflow: hidden; }
+#stage:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+#stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+#labels span { position: absolute; left: 0; top: 0; font-size: 11px; line-height: 18px; padding: 0 5px; border-radius: 4px; white-space: nowrap;
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis; background: color-mix(in srgb, var(--panel) 82%, transparent); color: var(--ink); }
+#labels span.strong { font-weight: 600; border: 1px solid var(--accent); }
+#canvasNote { font-size: 12px; color: var(--dim); padding: 5px 10px; border-top: 1px solid var(--edge); background: var(--panel); }
+#canvasNote button { margin-left: 8px; padding: 1px 8px; font-size: 12px; }
+#listErr button { margin-left: 8px; padding: 0 8px; font-size: 12px; }
+#rendererNote { display: none; }
+#hoverText { position: absolute; left: 10px; bottom: 8px; max-width: calc(100% - 20px); font-size: 12px; background: var(--panel);
+  border: 1px solid var(--edge); border-radius: 6px; padding: 2px 8px; pointer-events: none; display: none; }
+#legend { position: absolute; right: 10px; bottom: 8px; font-size: 11px; color: var(--dim); background: var(--panel);
+  border: 1px solid var(--edge); border-radius: 6px; padding: 3px 8px; pointer-events: none; max-width: 46%; }
+#legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 3px 0 6px; vertical-align: -1px; }
+details.metrics { position: absolute; left: 10px; top: 8px; font-size: 11px; color: var(--dim); background: var(--panel);
+  border: 1px solid var(--edge); border-radius: 6px; padding: 2px 8px; max-width: 60%; }
+details.metrics pre { margin: 4px 0; white-space: pre-wrap; }
+ul.list li:focus-visible { outline: 2px solid var(--accent); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 10px; }
+.card .n { font-size: 22px; font-weight: 600; }
+h2 { font-size: 14px; margin: 18px 0 8px; }
+.bar { display: grid; grid-template-columns: 170px 1fr 60px; gap: 8px; align-items: center; font-size: 12px;
+  cursor: pointer; padding: 2px 0; }
+.bar .fill { height: 10px; background: var(--accent); border-radius: 4px; min-width: 2px; }
+.bar .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar:hover .name { text-decoration: underline; }
+.timeline { display: flex; align-items: flex-end; gap: 2px; height: 90px; border-bottom: 1px solid var(--edge); }
+.timeline div { flex: 1; background: var(--accent); min-height: 1px; border-radius: 2px 2px 0 0; }
+.note { background: var(--warnsoft); color: var(--warn); border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 8px 0; }
+ul.scope { font-size: 12px; color: var(--dim); padding-left: 18px; }
+pre.body { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--edge);
+  border-radius: 8px; padding: 8px; font-size: 12px; max-height: 320px; overflow: auto; }
+dl { display: grid; grid-template-columns: 110px 1fr; gap: 3px 8px; font-size: 12px; margin: 8px 0; }
+dt { color: var(--dim); } dd { margin: 0; word-break: break-all; }
+.err { color: #c0392b; font-size: 12px; }
+.goal { font-size: 13px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Brain for AI — граф памяти</h1>
+  <label class="sub" for="space">Пространство</label>
+  <select id="space" style="width:auto;margin:0" title="Пространства памяти хранятся раздельно и не смешиваются"></select>
+  <span class="sub" id="headline">загрузка…</span>
+  <span class="spacer"></span>
+  <a class="btn" href="/graph/legacy-3d" title="Прежняя тяжёлая 3D-картинка: выборка 4000 узлов, анимация без остановки. Оставлена для сравнения.">Старый 3D-вид</a>
+  <a class="btn" href="/map" title="Проекты, их задачи, сессии и исходы из координатора и карты работы">Карта проектов</a>
+  <a class="btn" href="/">Настройки</a>
+</header>
+<main>
+  <aside class="left">
+    <input id="q" type="search" placeholder="Поиск по всем узлам: слова, путь, имя…" maxlength="200" autocomplete="off" aria-label="Поиск по всем узлам">
+    <div class="row">
+      <select id="kind" aria-label="Тип узла"><option value="">Все типы</option></select>
+      <select id="sort" aria-label="Порядок">
+        <option value="degree">Больше связей</option>
+        <option value="recent">Самые новые</option>
+        <option value="label">По названию</option>
+      </select>
+    </div>
+    <select id="group" aria-label="Группа источника"><option value="">Все источники</option></select>
+    <button id="drawSelection" type="button" class="primary" style="width:100%;margin:2px 0 4px">Показать выборку на графе</button>
+    <div class="count" id="count" aria-live="polite"></div>
+    <ul class="list" id="results"></ul>
+    <div class="row" style="margin-top:8px">
+      <button id="prev" type="button">← Назад</button>
+      <button id="next" type="button">Дальше →</button>
+    </div>
+    <div class="err" id="listErr"></div>
+    <details id="sceneBox" style="margin-top:12px">
+      <summary id="sceneSummary">Узлы на графе</summary>
+      <div class="meta">Тот же набор, что нарисован, — для клавиатуры: Tab к строке, Enter — открыть, «+» — раскрыть соседей.</div>
+      <ul class="list" id="sceneList"></ul>
+    </details>
+  </aside>
+  <section class="center">
+    <div class="tabs" role="tablist">
+      <button id="tabGraph" type="button" class="on" role="tab">Граф</button>
+      <button id="tabOverview" type="button" role="tab">Сводка</button>
+    </div>
+    <div id="graphPane">
+      <div class="toolbar">
+        <span class="seg" role="group" aria-label="Измерение">
+          <button id="dim3" type="button" class="on" title="Объём: вращение мышью, колесо — масштаб">3D</button>
+          <button id="dim2" type="button" title="Плоско: та же раскладка сверху, только сдвиг и масштаб">2D</button>
+        </span>
+        <label for="by">Группы</label>
+        <select id="by" title="Как сворачивать узлы в группы на обзоре и где группа стоит на раскладке">
+          <option value="group">по источнику (производные)</option>
+          <option value="kind">по типу</option>
+          <option value="month">по месяцу записи</option>
+        </select>
+        <label for="layout">Раскладка</label>
+        <select id="layout">
+          <option value="group">по группам</option>
+          <option value="links">по связям</option>
+          <option value="time">по времени</option>
+        </select>
+        <label for="budget">Узлов</label>
+        <select id="budget"><option>300</option><option selected>400</option><option>600</option><option>1000</option></select>
+        <label for="quality">Чёткость</label>
+        <select id="quality" title="Предел плотности пикселей холста; меньше — легче для видеокарты">
+          <option value="1">1×</option><option value="1.5" selected>1,5×</option><option value="2">2×</option>
+        </select>
+        <button id="fit" type="button" title="Вписать всё (клавиша F)">Вписать</button>
+        <button id="clear" type="button" title="Вернуться к обзору групп">Очистить</button>
+      </div>
+      <div id="crumbs"></div>
+      <div id="stage" tabindex="0" role="application"
+           aria-label="Граф памяти. Стрелки — вращение, плюс и минус — масштаб, F — вписать, Enter — раскрыть выбранный узел. Тот же набор доступен списком слева.">
+        <canvas id="glCanvas" aria-hidden="true"></canvas>
+        <canvas id="flatCanvas" aria-hidden="true" hidden></canvas>
+        <div id="labels" aria-hidden="true"></div>
+        <div id="hoverText"></div>
+        <div id="legend"></div>
+        <details class="metrics" id="metricsBox"><summary>Замеры</summary><pre id="metricsOut"></pre></details>
+      </div>
+      <div id="canvasNote" aria-live="polite">Загрузка…</div>
+      <div class="note" id="rendererNote"></div>
+    </div>
+    <div id="overview" style="display:none"></div>
+  </section>
+  <aside class="right" id="detail">
+    <p class="sub">Щёлкните узел на графе, в списке или среди соседей — здесь появится его содержимое и связи. Двойной щелчок по узлу — раскрыть соседей.</p>
+  </aside>
+</main>
+<script src="/graph/graph3d.js"></script>
+<script>
+"use strict";
+// The window key never appears in this page. The launcher opens the page with
+// it in the URL fragment (never sent to the server, never in a Referer); it is
+// moved into this origin's sessionStorage and the fragment is erased at once.
+const TOKEN = (() => {
+  const SLOT = "brain-ui-token";
+  const match = /^#k=([0-9a-f]{64})$/.exec(location.hash);
+  if (match) history.replaceState(null, "", location.pathname + location.search);
+  try {
+    if (match) sessionStorage.setItem(SLOT, match[1]);
+    return sessionStorage.getItem(SLOT) || "";
+  } catch (_) {
+    return match ? match[1] : "";
+  }
+})();
+const PAGE = 50;
+const KIND_RU = { code: "код", document: "документ", memory: "память", session: "сессия",
+  decision: "решение", error: "ошибка", concept: "понятие", entity: "сущность" };
+const KIND_COLOR = { code: "#3b82f6", document: "#64748b", memory: "#0f9d74", session: "#a855f7",
+  decision: "#ea580c", error: "#dc2626", concept: "#0891b2", entity: "#ca8a04" };
+const BY_RU = { group: "группа источника", kind: "тип", month: "месяц записи" };
+const $ = (id) => document.getElementById(id);
+const ru = (n) => Number(n).toLocaleString("ru-RU");
+const when = (ts) => ts ? new Date(ts * 1000).toLocaleString("ru-RU") : "—";
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
+const kindBadge = (kind) => { const b = el("span", KIND_RU[kind] || kind || "?", "k"); b.style.background = KIND_COLOR[kind] || "#888"; return b; };
+const hashParams = () => new URLSearchParams(location.hash.slice(1));
+const DEBUG = new URLSearchParams(location.search).get("debug") === "1";
+
+/* Requests travel on named channels: list, detail, overview, scene, links.
+   Starting a new request on a channel cancels the previous one there; changing
+   space cancels them all and bumps `spaceGen`; replacing the picture bumps
+   `sceneGen`. Answers check both before touching the page, so a late reply
+   about a previous space or picture is dropped, never drawn. */
+let spaceGen = 0, sceneGen = 0;
+const channels = {};
+function channel(name) { if (channels[name]) channels[name].abort(); channels[name] = new AbortController(); return channels[name].signal; }
+function signalOf(name) { if (!channels[name]) channels[name] = new AbortController(); return channels[name].signal; }
+function abortAll() { for (const c of Object.values(channels)) c.abort(); }
+function newScene() { sceneGen++; channel("scene"); channel("links"); return { gen: sceneGen, space: spaceGen }; }
+const sceneStale = (t) => t.gen !== sceneGen || t.space !== spaceGen;
+async function api(path, signal, init) {
+  const started = performance.now();
+  const response = await fetch(path, Object.assign({ headers: { "X-Brain-Token": TOKEN }, cache: "no-store", signal }, init || {}));
+  const text = await response.text();
+  let body; try { body = JSON.parse(text); } catch (_) { body = { message: "ответ не разобран" }; }
+  if (!response.ok) {
+    const error = new Error(body.message || ("HTTP " + response.status));
+    // A restarted server forgets the window key: the old page's API calls all
+    // answer 403 "нет ключа окна настроек", and retrying can never heal it —
+    // only a reload stamps a fresh token in. Mark it so panels offer that once.
+    if (response.status === 401 || response.status === 403) error.auth = true;
+    throw error;
+  }
+  netLog.push({ path: path.split("?")[0], bytes: text.length, ms: Math.round(performance.now() - started) });
+  if (netLog.length > 20) netLog.shift();
+  return body;
+}
+const netLog = [];
+const quiet = (error) => error && error.name === "AbortError";
+/* 403 (and 401 anywhere else) mean the server restarted and this page's
+   window key is gone. No retry heals it, so instead of looping we clear the
+   page for the new space and offer one visible reconnect button. */
+function authFailure(error) {
+  if (!error || !error.auth) return false;
+  clearForSpace();
+  $("headline").textContent = "сервер перезапущен — ключ этого окна больше не действует";
+  return true;
+}
+function reloadButton() {
+  const b = el("button", "Переподключиться"); b.type = "button";
+  b.title = "Перезагрузить страницу: сервер выдаст новый ключ окна";
+  b.onclick = () => location.reload();
+  return b;
+}
+
+/* ---------- state in the address ---------- */
+let currentSpace = hashParams().get("space") || "";
+const linkedNode = hashParams().get("node"); // read before anything rewrites the address
+let selectedId = null, totalNodes = 0, totalEdges = 0;
+const view = { tab: "graph", dim: "3d", by: "group", layout: "group", budget: 400, selection: null };
+{
+  const h = hashParams();
+  if (h.get("tab") === "summary") view.tab = "summary";
+  if (h.get("dim") === "2d") view.dim = "2d";
+  if (["group", "kind", "month"].includes(h.get("by"))) view.by = h.get("by");
+  if (["group", "links", "time"].includes(h.get("layout"))) view.layout = h.get("layout");
+  if (["300", "400", "600", "1000"].includes(h.get("n"))) view.budget = Number(h.get("n"));
+  const sel = {}; for (const k of ["q", "kind", "group", "month"]) if (h.get("s" + k)) sel[k] = h.get("s" + k);
+  if (Object.keys(sel).length) view.selection = sel;
+}
+const withSpace = (params) => { if (currentSpace) params.set("space", currentSpace); return params; };
+function writeHash() {
+  const h = new URLSearchParams();
+  if (currentSpace) h.set("space", currentSpace);
+  if (selectedId) h.set("node", selectedId);
+  if (view.tab !== "graph") h.set("tab", "summary");
+  if (view.dim !== "3d") h.set("dim", view.dim);
+  if (view.by !== "group") h.set("by", view.by);
+  if (view.layout !== "group") h.set("layout", view.layout);
+  if (view.budget !== 400) h.set("n", view.budget);
+  if (view.selection) for (const [k, v] of Object.entries(view.selection)) h.set("s" + k, v);
+  history.replaceState(null, "", "#" + h);
+}
+
+/* ---------- list ---------- */
+let offset = 0, searchTimer = null;
+function listParams() {
+  const p = withSpace(new URLSearchParams({ offset, limit: PAGE, sort: $("sort").value }));
+  if ($("q").value.trim()) p.set("q", $("q").value.trim());
+  if ($("kind").value) p.set("kind", $("kind").value);
+  if ($("group").value) p.set("group", $("group").value);
+  return p;
+}
+function keyRow(li, open, expand) {
+  li.tabIndex = 0;
+  li.onclick = open;
+  li.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    else if (expand && (e.key === "+" || e.key === "=")) { e.preventDefault(); expand(); }
+    else if (e.key === "ArrowDown" && li.nextElementSibling) { e.preventDefault(); li.nextElementSibling.focus(); }
+    else if (e.key === "ArrowUp" && li.previousElementSibling) { e.preventDefault(); li.previousElementSibling.focus(); }
+  };
+}
+async function loadList() {
+  $("listErr").textContent = "";
+  const space = spaceGen, signal = channel("list");
+  try {
+    const page = await api("/api/explore/nodes?" + listParams(), signal);
+    if (space !== spaceGen || signal.aborted) return;
+    totalNodes = page.total_nodes;
+    const from = page.returned ? page.offset + 1 : 0;
+    $("count").textContent = `Показано ${ru(from)}–${ru(page.offset + page.returned)} из ${ru(page.matched)} найденных` +
+      ` (всего узлов в пространстве ${ru(page.total_nodes)})` + (page.matches_capped ? ". Совпадений больше 5000 — уточните запрос." : "");
+    const items = page.rows.map((row) => {
+      const li = el("li");
+      if (row.id === selectedId) li.className = "on";
+      li.append(kindBadge(row.kind), el("span", row.label));
+      li.append(el("div", `${row.group} · связей ${ru(row.degree)} · ${when(row.created_at)}`, "meta"));
+      keyRow(li, () => select(row.id), () => expand(row.id));
+      return li;
+    });
+    $("results").classList.remove("stale");
+    $("results").replaceChildren(...items);
+    $("prev").disabled = page.offset === 0;
+    $("next").disabled = page.offset + page.returned >= page.matched;
+  } catch (error) {
+    if (quiet(error)) return;
+    if (authFailure(error)) { $("listErr").append("Список очищен: ", reloadButton()); return; }
+    // The rows on screen no longer answer the filters just set: mark them as
+    // stale right away, then clear once the retry window has passed.
+    if (space !== spaceGen || signal.aborted) return;
+    totalNodes = 0;
+    $("count").textContent = "список устарел — показаны прошлые результаты, не ответ на текущий запрос";
+    $("results").classList.add("stale");
+    const shown = $("results");
+    setTimeout(() => {
+      if (space !== spaceGen || !shown.classList.contains("stale")) return;
+      shown.replaceChildren(); $("count").textContent = ""; $("prev").disabled = true; $("next").disabled = true;
+    }, 1500);
+    $("listErr").append("Список не загружен: " + error.message + ".");
+  }
+}
+function resetAndLoad() { offset = 0; loadList(); }
+$("q").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(resetAndLoad, 300); });
+["kind", "group", "sort"].forEach((id) => $(id).addEventListener("change", resetAndLoad));
+$("prev").onclick = () => { offset = Math.max(0, offset - PAGE); loadList(); };
+$("next").onclick = () => { offset += PAGE; loadList(); };
+$("drawSelection").onclick = () => {
+  const sel = {};
+  if ($("q").value.trim()) sel.q = $("q").value.trim();
+  if ($("kind").value) sel.kind = $("kind").value;
+  if ($("group").value) sel.group = $("group").value;
+  showTab("graph"); drawSelection(Object.keys(sel).length ? sel : {});
+};
+/* ---------- overview ---------- */
+function bars(container, items, onPick) {
+  const max = Math.max(1, ...items.map((i) => i.count));
+  for (const item of items) {
+    const row = el("div", undefined, "bar");
+    const fill = el("div", undefined, "fill"); fill.style.width = (100 * item.count / max) + "%";
+    const track = el("div"); track.append(fill);
+    row.append(el("span", item.name, "name"), track, el("span", ru(item.count)));
+    if (onPick) { row.title = "Показать в списке"; row.onclick = () => onPick(item); }
+    container.append(row);
+  }
+}
+
+async function loadOverview() {
+  const box = $("overview");
+  const space = spaceGen, signal = channel("overview");
+  try {
+    const o = await api("/api/explore/overview?" + withSpace(new URLSearchParams()), signal);
+    if (space !== spaceGen || signal.aborted) return;
+    totalNodes = o.total_nodes; totalEdges = o.total_edges;
+    currentSpace = o.space;
+    $("space").replaceChildren(...o.spaces.map((sp) => { const opt = new Option(`${sp.space} (${ru(sp.nodes)})`, sp.space); opt.selected = sp.space === o.space; return opt; }));
+    $("kind").replaceChildren(new Option("Все типы", ""));
+    $("group").replaceChildren(new Option("Все источники", ""));
+    $("headline").textContent = `пространство «${o.space}»: ${ru(o.total_nodes)} узлов, ${ru(o.total_edges)} связей — всё доступно через поиск и список`;
+    for (const kind of Object.keys(o.kinds)) $("kind").append(new Option(`${KIND_RU[kind] || kind} (${ru(o.kinds[kind])})`, kind));
+    for (const g of o.groups) $("group").append(new Option(`${g.group} (${ru(g.count)})`, g.group));
+    box.replaceChildren();
+    const cards = el("div", undefined, "cards");
+    const card = (n, k) => { const c = el("div", undefined, "card"); c.append(el("div", ru(n), "n"), el("div", k, "meta")); cards.append(c); };
+    card(o.total_nodes, "узлов всего"); card(o.total_edges, "связей"); card(Object.keys(o.kinds).length, "типов");
+    card(o.group_count, "групп источников");
+    box.append(cards);
+
+    const work = o.work || {};
+    box.append(el("h2", "Цели и блокеры (из записей Brain)"));
+    const goals = work.goals || {};
+    if (goals.stated && goals.stated.text) box.append(el("div", "Заявленная цель: " + goals.stated.text + (goals.stated.stated_at ? ` (задана ${when(goals.stated.stated_at)})` : ""), "goal"));
+    const inferred = (goals.inferred && (goals.inferred.goals || goals.inferred)) || [];
+    if (Array.isArray(inferred) && inferred.length) {
+      box.append(el("div", "Темы, которые Brain вывел из частоты упоминаний (эвристика, не задачи и не подтверждено человеком):", "meta"));
+      for (const g of inferred.slice(0, 5)) {
+        const name = g.subject || g.title || g.label || g.text || "?";
+        const facts = [g.state, g.mentions !== undefined ? `упоминаний ${ru(g.mentions)}` : "",
+          g.last_touched_days_ago !== undefined ? `последнее ${g.last_touched_days_ago} дн назад` : ""].filter(Boolean).join(", ");
+        const row = el("div", "• " + name + (facts ? " — " + facts : ""), "goal");
+        row.title = "Найти в списке"; row.style.cursor = "pointer";
+        row.onclick = () => { $("q").value = name; resetAndLoad(); };
+        box.append(row);
+      }
+    }
+    const blockers = (work.blockers && (work.blockers.blockers || work.blockers)) || [];
+    if (Array.isArray(blockers) && blockers.length) {
+      box.append(el("div", "Блокеры, записанные в памяти. Это исторические записи: дата — когда записано, актуальность сейчас не проверялась.", "meta"));
+      for (const b of blockers.slice(0, 6)) {
+        const age = b.age_days !== undefined ? `записано ${b.age_days} дн назад` : (b.recorded_at ? "записано " + when(b.recorded_at) : "дата неизвестна");
+        const row = el("div", "• " + (b.title || b.label || b.text || "?") + " — " + age, "goal");
+        if (b.id) { row.style.cursor = "pointer"; row.title = "Открыть запись"; row.onclick = () => select(b.id); }
+        box.append(row);
+      }
+    }
+    if (!(goals.stated && goals.stated.text) && !inferred.length && !blockers.length) box.append(el("div", "Целей и блокеров в памяти нет.", "meta"));
+
+    box.append(el("h2", "Типы знаний"));
+    const kindBox = el("div"); box.append(kindBox);
+    bars(kindBox, Object.entries(o.kinds).map(([k, c]) => ({ name: KIND_RU[k] || k, key: k, count: c })),
+      (item) => { $("kind").value = item.key; resetAndLoad(); });
+
+    box.append(el("h2", "Откуда знания (первая папка пути источника)"));
+    const groupBox = el("div"); box.append(groupBox);
+    bars(groupBox, o.groups.slice(0, 20).map((g) => ({ name: g.group, count: g.count })),
+      (item) => { $("group").value = item.name; resetAndLoad(); });
+    if (o.unlisted_group_nodes) box.append(el("div", `Ещё ${ru(o.unlisted_group_nodes)} узлов в мелких группах — найдите их поиском.`, "meta"));
+
+    box.append(el("h2", "Связи по видам"));
+    const relBox = el("div"); box.append(relBox);
+    bars(relBox, o.relations.map((r) => ({ name: r.relation, count: r.count })));
+
+    box.append(el("h2", "Хронология записи"));
+    const line = el("div", undefined, "timeline");
+    const maxMonth = Math.max(1, ...o.timeline.map((t) => t.count));
+    for (const t of o.timeline) { const b = el("div"); b.style.height = (100 * t.count / maxMonth) + "%"; b.title = `${t.month}: ${ru(t.count)}`; line.append(b); }
+    box.append(line);
+    if (o.timeline.length) box.append(el("div", `${o.timeline[0].month} … ${o.timeline[o.timeline.length - 1].month}. ${o.timeline_meaning}.`, "meta"));
+
+    box.append(el("h2", "Что сюда входит и что нет"));
+    const scope = el("ul", undefined, "scope");
+    for (const line of o.scope) scope.append(el("li", line));
+    if (o.spaces.length > 1) scope.append(el("li", "Другие пространства: " + o.spaces.filter((s) => s.space !== o.space).map((s) => `${s.space} (${s.nodes})`).join(", ") + " — выберите их в переключателе вверху."));
+    box.append(scope);
+  } catch (error) {
+    if (quiet(error)) return;
+    authFailure(error);
+    const msg = el("div", "Обзор не загружен: " + error.message, "err");
+    box.replaceChildren(msg);
+    if (error.auth) box.append(reloadButton());
+    if (!error.auth) $("headline").textContent = "память недоступна";
+  }
+}
+
+
+/* ---------- detail ---------- */
+let neighbourOffset = 0;
+async function select(id, keepOffset) {
+  selectedId = id;
+  graphView.select(id && graphView.has(id) ? id : null);
+  if (!keepOffset) neighbourOffset = 0;
+  writeHash();
+  document.querySelectorAll("#results li, #sceneList li").forEach((li) => li.classList.toggle("on", li.dataset.id === id));
+  const d = $("detail");
+  const signal = channel("detail");
+  if (!id) { d.replaceChildren(el("p", "Ничего не выбрано.", "sub")); return; }
+  const space = spaceGen;
+  try {
+    const n = await api("/api/explore/node?" + withSpace(new URLSearchParams({ id, offset: neighbourOffset, limit: 40 })), signal);
+    if (space !== spaceGen || selectedId !== id || signal.aborted) return;
+    d.replaceChildren();
+    const title = el("h2", ""); title.append(kindBadge(n.kind), document.createTextNode(n.label)); d.append(title);
+    const tools = el("div", undefined, "row");
+    const grow = el("button", graphView.has(id) ? "Раскрыть соседей" : "Показать на графе с соседями"); grow.type = "button";
+    grow.onclick = () => { showTab("graph"); expand(n.id); };
+    const look = el("button", "Найти на графе"); look.type = "button"; look.disabled = !graphView.has(id);
+    look.onclick = () => { showTab("graph"); graphView.focus(id); $("stage").focus(); };
+    tools.append(grow, look); d.append(tools);
+    const dl = el("dl");
+    const add = (k, v) => dl.append(el("dt", k), el("dd", v));
+    add("Источник", n.source || "—"); add("Группа", n.group + " (производная)"); add("Записал", n.agent);
+    add("Создан", when(n.created_at)); add("Действует с", when(n.valid_from)); add("Записан", when(n.recorded_at));
+    add("Обращений", `${ru(n.access_count)}, последнее ${when(n.last_accessed)}`);
+    add("Важность", `${n.salience.toFixed(2)} (слой ${n.layer})`); add("Версия", String(n.revision));
+    add("Связей", ru(n.degree)); add("Метаданные", n.metadata_keys.join(", ") || "—"); add("id", n.id);
+    d.append(dl);
+    d.append(el("pre", n.body || "(пусто)", "body"));
+    if (n.body_truncated) d.append(el("div", `Показаны первые 4000 из ${ru(n.body_chars)} символов.`, "meta"));
+    const nb = n.neighbours;
+    d.append(el("h2", `Связи: ${ru(nb.total)}`));
+    d.append(el("div", Object.entries(nb.by_relation).map(([r, c]) => `${r} ${c}`).join(" · "), "meta"));
+    const list = el("ul", undefined, "list");
+    for (const row of nb.rows) {
+      const li = el("li"); li.dataset.id = row.id;
+      li.append(el("span", (row.direction === "out" ? "→ " : "← ") + row.relation + " ", "meta"), kindBadge(row.kind), el("span", row.label));
+      keyRow(li, () => select(row.id), () => expand(row.id));
+      list.append(li);
+    }
+    d.append(list);
+    if (nb.total > nb.limit) {
+      const pager = el("div", undefined, "row");
+      const back = el("button", "← Назад"); back.disabled = nb.offset === 0;
+      back.onclick = () => { neighbourOffset = Math.max(0, nb.offset - nb.limit); select(id, true); };
+      const fwd = el("button", "Дальше →"); fwd.disabled = nb.offset + nb.returned >= nb.total;
+      fwd.onclick = () => { neighbourOffset = nb.offset + nb.limit; select(id, true); };
+      pager.append(back, fwd); d.append(el("div", `Соседи ${nb.offset + 1}–${nb.offset + nb.returned} из ${nb.total}`, "meta"), pager);
+    }
+  } catch (error) {
+    if (quiet(error)) return;
+    const msg = el("div", "Узел не загружен: " + error.message, "err");
+    d.replaceChildren(msg);
+    if (error.auth) { authFailure(error); d.append(reloadButton()); }
+  }
+}
+
+/* ---------- the graph ---------- */
+const graphView = new BrainGraph.GraphView({
+  wrap: $("stage"), glCanvas: $("glCanvas"), flatCanvas: $("flatCanvas"), labels: $("labels"),
+  onSelect: (id) => select(id),
+  onExpand: (id) => expand(id),
+  onCluster: (cluster) => drillCluster(cluster),
+  /* Measured, not estimated: time spent in our draw call on this machine, how
+     many GPU draw calls, and the bytes uploaded. FPS is not shown because
+     nothing is drawn unless something changed. */
+  onFrame: (v) => fillMetrics(v),
+  onHoverText: (n) => {
+    const box = $("hoverText");
+    if (!n) { box.style.display = "none"; return; }
+    box.textContent = n.cluster
+      ? `${n.label}: ${ru(n.count)} узлов, ${ru(n.cluster.internal_links)} связей внутри — щелчок: показать эту группу`
+      : `${n.label} · ${KIND_RU[n.kind] || n.kind} · связей ${ru(n.links || 0)} — щелчок: подробности, двойной: раскрыть`;
+    box.style.display = "block";
+  },
+  onRenderer: (kind, reason) => {
+    const note = $("rendererNote");
+    if (kind === "webgl") { note.style.display = "none"; return; }
+    note.textContent = "Объёмная отрисовка WebGL недоступна" + (reason ? ` (${reason})` : "") +
+      ". Граф рисуется проще, через Canvas 2D: те же узлы и связи, вращение и выбор работают, просто медленнее на больших наборах. Список слева и карточка справа работают как обычно.";
+    note.style.display = "block";
+  },
+});
+/* The metrics panel is measured, not estimated; show its current values the
+   moment it opens, without starting an animation loop to produce them. */
+function fillMetrics(v) {
+  if (!$("metricsBox").open && !DEBUG) return;
+  const m = v.summary(), net = netLog.slice(-4).map((r) => `${r.path} ${ru(r.bytes)} Б, ${r.ms} мс`).join("\n");
+  $("metricsOut").textContent = `отрисовщик: ${m.renderer}${m.renderer === "webgl" ? `, точка до ${m.pointSizeMax}px` : ""}\n` +
+    `кадров нарисовано: ${m.draws} (только по событию)\nпоследний: ${m.lastDrawMs.toFixed(2)} мс, p50 ${m.p50.toFixed(2)}, p95 ${m.p95.toFixed(2)}\n` +
+    `вызовов отрисовки за кадр: ${m.drawCalls}\nузлов ${m.nodes}, линий ${m.edges}\n` +
+    `загружено в видеопамять: ${ru(m.uploadedBytes)} Б (последний раз ${ru(m.lastUploadBytes)})\n` +
+    `раскладка: ${m.layoutMs.toFixed(1)} мс; плотность пикселей ${m.pixelRatio}; потерь контекста ${m.contextLosses}\n` + net;
+}
+$("metricsBox").addEventListener("toggle", () => { if ($("metricsBox").open) fillMetrics(graphView); });
+let anchors = null, scene = { kind: "empty" };
+
+async function ensureAnchors(ticket) {
+  // Keyed on the generation, never on the mutable currentSpace: the space a
+  // scene belongs to cannot change under it without bumping spaceGen first.
+  if (anchors && anchors.gen === ticket.space && anchors.by === view.by) return anchors.doc;
+  const doc = await api("/api/explore/clusters?" + withSpace(new URLSearchParams({ by: view.by })), signalOf("scene"));
+  if (sceneStale(ticket)) throw Object.assign(new Error("stale"), { name: "AbortError" });
+  anchors = { gen: ticket.space, by: view.by, doc };
+  graphView.setAnchors(doc);
+  return doc;
+}
+
+async function showClusters() {
+  const ticket = newScene();
+  view.selection = null; writeHash();
+  note("Загрузка обзора групп…");
+  try {
+    const doc = await ensureAnchors(ticket);
+    graphView.showClusters(doc);
+    scene = { kind: "clusters", doc };
+    crumbs();
+    const listed = doc.clusters.length, drawnPairs = graphView.edges.length;
+    note(`Обзор: ${ru(doc.total_nodes)} узлов и ${ru(doc.total_edges)} связей пространства «${doc.space}» свёрнуты в ${ru(listed)} ` +
+      (doc.cluster_total > listed ? `групп (из ${ru(doc.cluster_total)}; мелкие собраны в «прочие») ` : "групп ") +
+      `по признаку «${BY_RU[doc.by]}». Размер кружка — число узлов; линия — сколько настоящих связей между группами (сводка, не ребро); ` +
+      `нарисовано ${ru(drawnPairs)} из ${ru(doc.cluster_link_total)} пар групп — у каждой три самые сильные. ` +
+      (doc.derived ? "Группы по источнику — производные: первая папка пути, а не размеченные проекты. " : "Признак записан в базе. ") +
+      "Щелчок по группе — показать её узлы.");
+    legend();
+    sceneList();
+  } catch (error) { if (!quiet(error)) { authFailure(error); note("Обзор не загружен: " + error.message, true, error.auth); } }
+}
+
+function drillCluster(cluster) {
+  if (cluster.key === null) {
+    note(`«Прочие» — ${ru(cluster.rest_clusters)} мелких групп, вместе ${ru(cluster.count)} узлов. Их не показать одной группой: найдите нужное поиском слева или выберите источник в фильтре.`);
+    return;
+  }
+  drawSelection({ [view.by === "group" ? "group" : view.by]: cluster.key });
+}
+
+async function drawSelection(sel) {
+  const ticket = newScene();
+  // Until it lands, an expansion is a new user action and must replace this
+  // load rather than be erased by it.
+  scene = { kind: "loading" };
+  view.selection = sel; writeHash();
+  note("Загрузка выборки…");
+  try {
+    await ensureAnchors(ticket);
+    const params = withSpace(new URLSearchParams({ limit: view.budget }));
+    for (const [k, v] of Object.entries(sel)) params.set(k, v);
+    const doc = await api("/api/explore/graph?" + params, signalOf("scene"));
+    if (sceneStale(ticket)) return;
+    graphView.showNodes(doc);
+    scene = { kind: "nodes", doc, sel };
+    if (selectedId && graphView.has(selectedId)) graphView.select(selectedId);
+    crumbs(); legend(); describeNodes(); sceneList();
+  } catch (error) { if (!quiet(error)) { authFailure(error); note("Выборка не загружена: " + error.message, true, error.auth); } }
+}
+
+/* Add a page of a node's neighbours to the picture. The first expansion from
+   the overview starts a fresh picture around that node. */
+async function expand(id) {
+  // Several expansions may run at once in one picture; only a new picture or
+  // another space makes their answers stale. Switching into a picture takes
+  // the scene channel exclusively, so an in-flight selection load that was
+  // still awaiting its reply cannot land after and erase the expansion.
+  if (scene.kind !== "nodes") { newScene(); scene = { kind: "nodes", doc: null, sel: null }; view.selection = null; writeHash(); channel("scene"); }
+  const ticket = { gen: sceneGen, space: spaceGen };
+  try {
+    await ensureAnchors(ticket);
+    const n = await api("/api/explore/node?" + withSpace(new URLSearchParams({ id, limit: 40, order: "links" })), signalOf("scene"));
+    if (sceneStale(ticket)) return;
+    const center = { id: n.id, label: n.label, kind: n.kind, group: n.group, created_at: n.created_at, links: n.degree };
+    const result = graphView.addNeighbours(center, n.neighbours.rows, view.budget);
+    scene.lastExpand = { label: n.label, total: n.neighbours.total, shown: n.neighbours.returned, added: result.added, skipped: result.skipped };
+    select(id); // refresh the card: its buttons depend on what is drawn now
+    crumbs(); legend(); describeNodes(); sceneList();
+    graphView.focus(id);
+    refreshLinks(ticket);
+  } catch (error) { if (!quiet(error)) { authFailure(error); note("Не удалось раскрыть: " + error.message, true, error.auth); } }
+}
+
+/* After the set changed, ask for the exact edges among everything drawn. */
+let linksSeq = 0;
+async function refreshLinks(ticket) {
+  const seq = ++linksSeq, ids = graphView.visibleIds(), signal = channel("links");
+  if (!ids.length) return;
+  const post = (list) => api("/api/explore/links?" + withSpace(new URLSearchParams()), signal, {
+    method: "POST", headers: { "X-Brain-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify({ ids: list }) });
+  try {
+    // IDs the space no longer has are dropped and the rest asked again, until
+    // an answer names none missing (bounded: each round strictly shrinks).
+    let sent = ids, doc = await post(sent);
+    for (let round = 0; ; round++) {
+      if (sceneStale(ticket) || seq !== linksSeq) return;
+      if (!doc.missing.length) { scene.linksIncomplete = false; break; }
+      graphView.dropMissing(sent, doc.missing);
+      sent = sent.filter((_, i) => !doc.missing.includes(i));
+      if (!sent.length || round >= 3) {
+        // Bounded retries ran out: the drawn edges are a best effort, not the
+        // exact set — say so instead of claiming final answers.
+        scene.links = doc; scene.linksIncomplete = true; describeNodes(); sceneList();
+        note("Связи обновлены не полностью: часть узлов исчезала четыре раза подряд — показанные линии не окончательны, попробуйте «Очистить» и открыть выборку заново.", true);
+        return;
+      }
+      doc = await post(sent);
+    }
+    graphView.applyLinks(sent, doc); scene.links = doc;
+    describeNodes(); sceneList();
+  } catch (error) { if (!quiet(error)) { authFailure(error); note("Связи между узлами не загружены: " + error.message, true, error.auth); } }
+}
+
+function note(text, error, auth) {
+  const box = $("canvasNote"); box.replaceChildren(document.createTextNode(text));
+  if (auth) box.append(reloadButton());
+  box.classList.toggle("err", !!error);
+}
+function describeNodes() {
+  const shown = graphView.nodes.length, edges = graphView.edges.length, parts = [];
+  parts.push(`На графе ${ru(shown)} узлов из ${ru(totalNodes)} в пространстве (лимит ${ru(view.budget)})`);
+  const doc = scene.doc;
+  if (doc) {
+    const why = doc.selection.q ? `лучшие совпадения запроса «${doc.selection.q}»` : "самые связанные";
+    parts.push(`выборка: ${why}` + (doc.matched > doc.returned ? `, совпало ${ru(doc.matched)} — остальные в списке слева` : ""));
+  }
+  const links = scene.links || doc;
+  if (links) parts.push(`связей между нарисованными ${ru(edges)}` + (links.edges_truncated ? ` (из ${ru(links.edges_among)}, остальные не нарисованы)` : "") + ` из ${ru(totalEdges)} в пространстве` +
+    (scene.linksIncomplete ? "; набор связей не окончательный — часть узлов исчезала при повторных запросах" : ""));
+  else parts.push(`связей нарисовано ${ru(edges)}`);
+  if (scene.lastExpand) {
+    const e = scene.lastExpand;
+    parts.push(`у «${e.label.slice(0, 40)}» соседей ${ru(e.total)}, добавлено ${e.added}` + (e.skipped ? `, ${e.skipped} не поместились в лимит` : "") +
+      (e.total > e.shown ? `; все соседи — в карточке справа постранично` : ""));
+  }
+  parts.push(view.layout === "links" ? "раскладка по связям: новые узлы досчитываются, прежние не двигаются"
+    : view.layout === "time" ? "по горизонтали — время записи в Brain, по кругу — тип"
+    : `раскладка по группам (${BY_RU[view.by]})`);
+  note(parts.join(" · ") + ".");
+}
+function legend() {
+  const box = $("legend"); box.replaceChildren();
+  if (scene.kind === "clusters" && scene.doc.derived) { box.append(el("span", "○ производная группа · линия — сумма связей")); return; }
+  const kinds = new Set(graphView.nodes.map((n) => n.kind));
+  for (const k of Object.keys(KIND_RU)) if (kinds.has(k)) { const i = el("i"); i.style.background = KIND_COLOR[k]; box.append(i, document.createTextNode(KIND_RU[k])); }
+}
+function crumbs() {
+  const box = $("crumbs"); box.replaceChildren();
+  const home = el("button", "Все группы"); home.type = "button"; home.onclick = showClusters; home.disabled = scene.kind === "clusters";
+  box.append(home);
+  const sel = scene.sel || {};
+  const bits = [sel.group && `источник «${sel.group}»`, sel.kind && `тип «${KIND_RU[sel.kind] || sel.kind}»`, sel.month && `месяц ${sel.month}`, sel.q && `поиск «${sel.q}»`].filter(Boolean);
+  if (scene.kind === "nodes") box.append(document.createTextNode(" › " + (bits.length ? bits.join(", ") : scene.doc ? "самые связанные во всём пространстве" : "окрестность узла")));
+  if (graphView.expanded.size) box.append(document.createTextNode(` › раскрыто узлов: ${graphView.expanded.size}`));
+}
+function sceneList() {
+  const nodes = graphView.mode === "clusters" ? [] : graphView.nodes.slice().sort((a, b) => (b.links || 0) - (a.links || 0));
+  $("sceneSummary").textContent = graphView.mode === "clusters"
+    ? `Группы на графе: ${graphView.nodes.length}` : `Узлы на графе: ${ru(nodes.length)}` + (nodes.length > 200 ? " (первые 200 по связям)" : "");
+  const items = graphView.mode === "clusters"
+    ? graphView.nodes.map((n) => { const li = el("li", `${n.label} — ${ru(n.count)} узлов`); keyRow(li, () => drillCluster(n.cluster)); return li; })
+    : nodes.slice(0, 200).map((n) => {
+      const li = el("li"); li.dataset.id = n.id; if (n.id === selectedId) li.className = "on";
+      li.append(kindBadge(n.kind), el("span", n.label || n.id), el("div", `связей ${ru(n.links || 0)}`, "meta"));
+      keyRow(li, () => { select(n.id); graphView.focus(n.id); }, () => expand(n.id));
+      return li;
+    });
+  $("sceneList").replaceChildren(...items);
+}
+
+/* ---------- toolbar ---------- */
+function setDim(dim) {
+  view.dim = dim; $("dim3").classList.toggle("on", dim === "3d"); $("dim2").classList.toggle("on", dim === "2d");
+  graphView.setFlat(dim === "2d"); writeHash();
+}
+$("dim3").onclick = () => setDim("3d");
+$("dim2").onclick = () => setDim("2d");
+$("by").onchange = () => {
+  view.by = $("by").value; anchors = null; writeHash();
+  if (scene.kind === "nodes" && scene.sel) drawSelection(scene.sel); else showClusters();
+};
+$("layout").onchange = () => { view.layout = $("layout").value; graphView.setLayout(view.layout); writeHash(); if (scene.kind === "nodes") describeNodes(); };
+$("budget").onchange = () => { view.budget = Number($("budget").value); writeHash(); if (scene.kind === "nodes" && scene.sel) drawSelection(scene.sel); };
+$("quality").onchange = () => graphView.setQuality(Number($("quality").value));
+$("fit").onclick = () => graphView.fit(true);
+$("clear").onclick = () => { scene = { kind: "empty" }; showClusters(); };
+
+function showTab(which) {
+  view.tab = which === "summary" ? "summary" : "graph";
+  const isGraph = view.tab === "graph";
+  $("overview").style.display = isGraph ? "none" : "block";
+  $("graphPane").style.display = isGraph ? "flex" : "none";
+  $("tabGraph").classList.toggle("on", isGraph); $("tabOverview").classList.toggle("on", !isGraph);
+  writeHash();
+}
+$("tabOverview").onclick = () => showTab("summary");
+$("tabGraph").onclick = () => showTab("graph");
+
+/* Changing the space synchronously drops everything that described the old
+   one — list, filters, overview, scene, captions and metrics — before a
+   single request for the new one goes out. A failed request then shows an
+   empty state, never the old space's rows under the new space's name. */
+function clearForSpace() {
+  graphView.clear();
+  totalNodes = 0; totalEdges = 0;
+  $("results").classList.remove("stale");
+  $("results").replaceChildren(); $("sceneList").replaceChildren();
+  $("count").textContent = ""; $("prev").disabled = true; $("next").disabled = true;
+  $("headline").textContent = "загрузка…";
+  $("kind").replaceChildren(new Option("Все типы", ""));
+  $("group").replaceChildren(new Option("Все источники", ""));
+  $("q").value = "";
+  $("overview").replaceChildren();
+  $("crumbs").replaceChildren(); $("legend").replaceChildren();
+  $("detail").replaceChildren(el("p", "Выберите узел в этом пространстве.", "sub"));
+  $("sceneSummary").textContent = "Узлы на графе";
+  $("canvasNote").replaceChildren(); $("canvasNote").classList.remove("err");
+  $("listErr").replaceChildren();
+  $("metricsOut").textContent = ""; netLog.length = 0;
+}
+
+/* ---------- space ---------- */
+$("space").addEventListener("change", () => {
+  abortAll(); spaceGen++; sceneGen++;
+  currentSpace = $("space").value; selectedId = null; offset = 0; anchors = null; scene = { kind: "empty" };
+  clearForSpace();
+  view.selection = null; writeHash();
+  loadOverview().then(loadList).then(showClusters);
+});
+
+/* Reload restores what the address says: space, tab, view, selection, node. */
+async function start() {
+  $("by").value = view.by; $("layout").value = view.layout; $("budget").value = String(view.budget);
+  graphView.layout = view.layout;
+  if (view.dim === "2d") setDim("2d");
+  showTab(view.tab);
+  await loadOverview();
+  loadList();
+  const node = linkedNode;
+  if (node) { selectedId = node; writeHash(); }
+  if (view.selection) await drawSelection(view.selection);
+  if (node) { select(node); await expand(node); }
+  else if (!view.selection) await showClusters();
+}
+window.__brainGraph = { view: graphView, metrics: () => Object.assign(graphView.summary(), { net: netLog.slice() }) };
+if (DEBUG) $("metricsBox").open = true;
+/* Test hook, only with ?debug=1&lose=1: drop the WebGL context once after the
+   first picture, the way a GPU reset would, to exercise the fallback. */
+if (DEBUG && new URLSearchParams(location.search).get("lose") === "1") {
+  setTimeout(() => { const gl = graphView.gl && graphView.gl.gl, ext = gl && gl.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); }, 2500);
+}
+start();
+</script>
+</body>
+</html>

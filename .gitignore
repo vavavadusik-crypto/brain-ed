@@ -1,0 +1,15 @@
+/target
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+.env
+.brain/
+graphify-out/
+
+# Local agent handover notes; never part of the repository.
+HANDOFF-CODEX.md
+start-codex-session.sh
+__pycache__/

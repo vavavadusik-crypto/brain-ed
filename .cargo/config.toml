@@ -1,0 +1,14 @@
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+ar = "x86_64-linux-musl-ar"
+# zig подставляет свои crt-объекты; без этого они дублируют rust self-contained
+rustflags = [
+    "-C", "link-self-contained=no",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+rustflags = ["-C", "linker=aarch64-linux-gnu-gcc", "-C", "link-self-contained=no"]
