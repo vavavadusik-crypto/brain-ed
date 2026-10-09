@@ -77,8 +77,9 @@ case "${HOME:-}" in
 esac
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-[ -f "$repo_dir/Cargo.lock" ] && [ -d "$repo_dir/brain-cli" ] \
-    || fail "run install.sh from a Brain ED source checkout (Cargo.lock not found in $repo_dir)"
+if [ ! -f "$repo_dir/Cargo.lock" ] || [ ! -d "$repo_dir/brain-cli" ]; then
+    fail "run install.sh from a Brain ED source checkout (Cargo.lock not found in $repo_dir)"
+fi
 
 # Pin the target directory so an inherited CARGO_TARGET_DIR cannot move the
 # build somewhere this script does not look.
