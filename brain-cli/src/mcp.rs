@@ -60,7 +60,11 @@ pub(crate) fn handle_request(config: &RuntimeConfig, request: &Value) -> Option<
                 }),
             ))
         }
-        "tools/list" => Some(rpc_ok(id, json!({"tools": tool_definitions()}))),
+        "tools/list" => {
+            let mut tools = tool_definitions();
+            tools.extend(crate::remote_mcp::tool_definitions());
+            Some(rpc_ok(id, json!({"tools": tools})))
+        }
         "tools/call" => {
             let name = request
                 .pointer("/params/name")
@@ -70,6 +74,12 @@ pub(crate) fn handle_request(config: &RuntimeConfig, request: &Value) -> Option<
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // Opt-in remote reads answer with their own complete, budgeted
+            // response (text only, no structuredContent copy).
+            if crate::remote_mcp::configured().is_some() && crate::remote_mcp::is_remote_tool(name)
+            {
+                return Some(crate::remote_mcp::respond(id, name, &args));
+            }
             // A compact map packet is already its exact, budgeted content
             // text; it is sent once, without a structuredContent copy.
             // Each tool runs exactly once; map names never overlap others.

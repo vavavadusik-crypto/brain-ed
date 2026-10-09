@@ -1,4 +1,51 @@
-# Validation of the 0.1.0 Linux preview
+# Validation of the Linux previews
+
+## 0.1.1 local release checks — 2026-10-10
+
+The combined LAN, remote MCP, memory explorer and installer candidate was
+checked as Linux x86_64 user 1000 with Rust 1.97.1, locked dependencies and
+offline Cargo. All 13 local checks passed. The 148 source-file hashes stayed
+unchanged throughout the suite; this report was updated afterwards.
+
+| Check | Observed result |
+|---|---|
+| Rust workspace, all features, default parallel tests | 473 passed, 0 failed |
+| Rust workspace, no default features | 468 passed, 0 failed |
+| Clippy both feature configurations, all targets | Passed with `-D warnings` |
+| Formatting; Node map and memory graph suites | Passed |
+| Python archive, collector, backfill, bridge and real-binary E2E | 116 passed, no skips |
+| Collector on tmpfs | 29 passed |
+| Release build; ShellCheck; licence checks | Passed; 247 dependency packages checked |
+| Actual source installer in a synthetic HOME with spaces | Two desktop and two menu entries; installed bytes match the build |
+| Install/uninstall dry runs; uninstall | No dry-run changes; synthetic SQLite database bytes preserved |
+
+The Rust totals overlap. Remote MCP tests include real TLS sockets, separate
+synthetic stores, fixed-tool authorization, malformed/error replies, project
+grammar, duplicate configuration keys and the whole 16 KiB reply budget.
+LAN address tests exercised alternate loopback IPv4 and IPv6; they do not
+prove connectivity between physical computers. The memory explorer was also
+checked in a browser using synthetic data at wide and 390 x 844 viewports,
+including the 2D fallback. Private history was not used in that browser test.
+
+Independent Opus review of the remote adapter and root review/reproductions
+found issues with key collisions, trimming cost and misleading server errors.
+The fixes and regressions are included. Final malformed-envelope and project
+grammar changes were reviewed by root and passed the combined suite.
+This is a bounded review of the changed first-party paths, not an external
+certification or a line-by-line audit of all dependencies.
+
+The first source scan produced 26 reviewed matches: synthetic authorization
+fixtures, synthetic UI tokens, token-estimator identifiers and SQLite API
+macros. No actual provider credential or personal data file was found in
+that source snapshot. Final Git history and archive scans are separate
+publication gates. A successful scan cannot detect every possible secret.
+
+The source installer is still Linux-only and requires Rust and a C build
+toolchain. No prebuilt binary, physical fleet validation, complete native
+capture or enterprise access-control claim is made. `--offline` controls
+model downloads; explicitly enabled remote tools still make TLS calls.
+
+## 0.1.0 historical local release checks
 
 Recorded on 2026-10-09 on Linux x86_64 as an ordinary user, using Rust 1.97.1.
 These are local release checks. GitHub CI is a separate result shown in the
@@ -55,8 +102,9 @@ upgrade to 0.23.45.
   browser, whose policy refuses local files. It was not bypassed or reported
   as a browser pass. Launcher quoting and private bootstrap file modes were
   checked separately.
-- The brain-shaped screenshot demonstrates the bounded project map, not a
-  complete brain-shaped projection of all personal memory records.
+- The original 0.1.0 brain-shaped screenshot demonstrates the bounded project
+  map. In 0.1.1 the memory explorer also projects its loaded selection by
+  stored kind; neither view displays every record at once.
 - The UI currently permits inline scripts in its CSP. Schema/path hardening for
   owner-supplied import sources and peak memory use for large JSON imports remain
   follow-up work. Do not treat the preview as an enterprise isolation boundary.

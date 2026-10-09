@@ -13,7 +13,7 @@
 //! only changes bookkeeping, not rights.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,52 @@ use crate::network::protocol::{
 use crate::sharing::{
     MAX_WIRE_PAGE, Principal as SharePrincipal, ShareError, ShareEvent, ShareStore,
 };
+
+/// Validates a listen (or dial) address against the binding policy.
+///
+/// Loopback is always allowed and is the default. Any other address needs the
+/// explicit `allow_lan` opt-in AND must be a numeric private unicast LAN
+/// address: IPv4 RFC 1918 or IPv6 unique-local (`fc00::/7`). Unspecified
+/// (`0.0.0.0`, `::`), multicast, broadcast, link-local, IPv4-mapped, CGNAT,
+/// documentation and public addresses are refused even with the opt-in, so a
+/// single flag can never open a wildcard or Internet-facing listener.
+///
+/// # Errors
+/// `NetError::InvalidRequest` (400) naming the refused address.
+pub fn checked_listen_ip(ip: IpAddr, allow_lan: bool) -> Result<IpAddr, NetError> {
+    if ip.is_loopback() {
+        return Ok(ip);
+    }
+    if !allow_lan {
+        return Err(NetError::invalid(format!(
+            "{ip} is not loopback; a LAN address needs the explicit LAN opt-in"
+        )));
+    }
+    let private_unicast = match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.is_unique_local() && v6.to_ipv4_mapped().is_none(),
+    };
+    if private_unicast {
+        Ok(ip)
+    } else {
+        Err(NetError::invalid(format!(
+            "{ip} is not a private unicast LAN address (RFC 1918 or fc00::/7); unspecified, \
+             multicast, broadcast, link-local, mapped and public addresses are refused"
+        )))
+    }
+}
+
+/// Whether a `Host` header names exactly `ip` (bare, `[v6]`, or with a port).
+fn host_names_ip(host: &str, ip: IpAddr) -> bool {
+    if let Ok(address) = host.parse::<SocketAddr>() {
+        return address.ip() == ip;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<IpAddr>().is_ok_and(|parsed| parsed == ip)
+}
 
 /// How the listener is bound.
 #[derive(Clone, Debug)]
@@ -70,6 +116,11 @@ pub(crate) struct Inner {
     /// Set once by an owned stop: every request that reaches the state
     /// lock afterwards is refused before dispatch.
     stopped: AtomicBool,
+    /// The exact IP a TLS server is bound to (loopback or opted-in LAN),
+    /// accepted as `Host` in addition to the loopback names, so a client
+    /// whose `--server-name` is that IP (its certificate's IP SAN) is not
+    /// refused. `None` (plaintext server) keeps the loopback names only.
+    bound_host: Option<IpAddr>,
 }
 
 impl Inner {
@@ -89,7 +140,14 @@ impl Inner {
             }),
             live: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
+            bound_host: None,
         })
+    }
+
+    /// Also accepts `Host: <ip>` (exactly) for a TLS listener bound to `ip`.
+    pub(crate) fn with_bound_host(mut self, ip: IpAddr) -> Self {
+        self.bound_host = Some(ip);
+        self
     }
 
     /// Serves exactly one request on an already-established byte stream
@@ -396,7 +454,8 @@ fn route(inner: &Inner, request: &HttpRequest) -> CallOutcome {
     let host_ok = host == "127.0.0.1"
         || host == "localhost"
         || host == expected_loopback
-        || host == format!("localhost:{}", host.rsplit(':').next().unwrap_or(""));
+        || host == format!("localhost:{}", host.rsplit(':').next().unwrap_or(""))
+        || inner.bound_host.is_some_and(|ip| host_names_ip(host, ip));
     if !host_ok {
         return CallOutcome {
             status: 403,
@@ -761,6 +820,111 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
     use crate::network::protocol;
+
+    #[test]
+    fn listen_policy_defaults_to_loopback_and_gates_lan() {
+        let ip = |text: &str| text.parse::<IpAddr>().expect("ip");
+        for loopback in ["127.0.0.1", "127.8.9.10", "::1"] {
+            assert_eq!(
+                checked_listen_ip(ip(loopback), false).ok(),
+                Some(ip(loopback))
+            );
+        }
+        for lan in ["192.168.1.10", "10.0.0.7", "172.16.4.2", "fd00::17"] {
+            let refused = checked_listen_ip(ip(lan), false).expect_err("needs opt-in");
+            assert_eq!(refused.status(), 400);
+            assert!(refused.body().to_string().contains("opt-in"), "{lan}");
+            assert_eq!(checked_listen_ip(ip(lan), true).ok(), Some(ip(lan)));
+        }
+        for wide in [
+            "0.0.0.0",
+            "::",
+            "255.255.255.255",
+            "224.0.0.1",
+            "239.1.2.3",
+            "ff02::1",
+            "169.254.10.1",
+            "fe80::1",
+            "::ffff:192.168.1.10",
+            "100.64.0.1",
+            "192.0.2.1",
+            "8.8.8.8",
+            "2001:4860::8888",
+        ] {
+            let refused = checked_listen_ip(ip(wide), true).expect_err("never allowed");
+            assert_eq!(refused.status(), 400, "{wide}");
+        }
+    }
+
+    #[test]
+    fn lan_host_is_accepted_only_when_opted_in_and_auth_still_applies() {
+        let dir = std::env::temp_dir().join(format!(
+            "brain-lan-host-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(&dir)
+            .expect("state dir");
+        let lan: IpAddr = "192.168.77.10".parse().expect("ip");
+        let request = |host: &str, origin: bool| HttpRequest {
+            method: "POST".to_owned(),
+            path: ENDPOINT.to_owned(),
+            headers: {
+                let mut headers = vec![("host".to_owned(), host.to_owned())];
+                if origin {
+                    headers.push(("origin".to_owned(), "http://192.168.77.10".to_owned()));
+                }
+                headers
+            },
+            body: br#"{"tool":"work_board","arguments":{}}"#.to_vec(),
+        };
+        let loopback_only = Inner::open(&dir).expect("open");
+        assert_eq!(
+            route(&loopback_only, &request("192.168.77.10:7443", false)).status,
+            403
+        );
+        drop(loopback_only);
+        let opted = Inner::open(&dir).expect("open").with_bound_host(lan);
+        for host in ["192.168.77.10", "192.168.77.10:7443"] {
+            // Host passes; the missing credential is still refused.
+            assert_eq!(route(&opted, &request(host, false)).status, 401, "{host}");
+        }
+        for host in [
+            "192.168.77.11",
+            "evil.example",
+            "192.168.77.10.evil",
+            "0.0.0.0",
+        ] {
+            assert_eq!(route(&opted, &request(host, false)).status, 403, "{host}");
+        }
+        assert_eq!(
+            route(&opted, &request("192.168.77.10", true)).status,
+            403,
+            "Origin"
+        );
+        assert!(host_names_ip(
+            "[fd00::17]:7443",
+            "fd00::17".parse().expect("v6")
+        ));
+        assert!(host_names_ip("[fd00::17]", "fd00::17".parse().expect("v6")));
+        drop(opted);
+        // An explicit alternate loopback bind accepts exactly its own IP.
+        let alt = Inner::open(&dir)
+            .expect("open")
+            .with_bound_host("127.0.0.2".parse().expect("ip"));
+        assert_eq!(route(&alt, &request("127.0.0.2:7443", false)).status, 401);
+        assert_eq!(route(&alt, &request("127.0.0.3:7443", false)).status, 403);
+        assert_eq!(
+            route(&alt, &request("127.0.0.2", true)).status,
+            403,
+            "Origin"
+        );
+        drop(alt);
+        let _ = fs::remove_dir_all(&dir);
+    }
     use std::fs;
     use std::net::TcpStream;
 

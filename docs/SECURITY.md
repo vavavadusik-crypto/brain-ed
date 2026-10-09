@@ -10,10 +10,15 @@ proof, and no external audit has been done.
   coordination databases: directory `0700`, file `0600`, owner and no-symlink
   checks). Any process running as the same OS user can read that data and is
   outside the boundary.
-- **Loopback only.** `brain ui` binds `127.0.0.1`. The coordinator
-  (`brain net`) serves `brain-coord/1` over loopback TLS; tokens live in
-  `0600` credential files or inherited descriptors, never in argv. LAN binding
-  is not released.
+- **Loopback by default.** `brain ui` binds `127.0.0.1`. The coordinator
+  (`brain net`) serves `brain-coord/1` over loopback TLS by default; tokens
+  live in `0600` credential files or inherited descriptors, never in argv.
+  An experimental, TLS-only LAN listener needs `--listen <private IP>
+  --allow-lan` (wildcard, multicast, `255.255.255.255`, link-local and public
+  addresses are refused; subnet broadcast/network addresses cannot be
+  detected without the netmask). It has no rate limiting: unauthenticated
+  LAN hosts can exhaust the 64 global connections, so an operator firewall
+  is required. Not production- or fleet-proven.
 - **MCP over stdio.** `brain serve` has no network listener.
 
 ## Data classes

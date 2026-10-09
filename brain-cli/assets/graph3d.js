@@ -12,6 +12,14 @@
  * the "links" mode only, a fixed number of relaxation steps for nodes that
  * have just arrived, with every earlier node pinned. Reloading the same view
  * gives the same picture; expanding a node never moves the rest.
+ *
+ * The "brain" layout puts every drawn node into one of eight regions of a
+ * brain-shaped volume, chosen only by the node's stored `kind` (the eight
+ * NodeKind values); a kind outside that list goes to an "unknown" zone on the
+ * stem. Labels, titles and text are never read to classify anything. The
+ * silhouette and the region names are drawn on a separate transparent 2D
+ * overlay, so the WebGL and Canvas renderers stay as they are. Region numbers
+ * count the nodes of the drawn selection only, never the whole space.
  */
 "use strict";
 (function () {
@@ -61,6 +69,137 @@
     });
     return anchors;
   }
+
+  /* ---------- the brain layout ---------- */
+  /* Axes: +x is the front, +y is up, z is across (left hemisphere z<0), so the
+     flat 2D view (camera on +z) is a side view of the same brain. Each
+     hemisphere is a side profile swept across z: a point is on its surface
+     when ((z - side*CZ) / w)^2 + (r / rho(theta))^2 = 1, with r, theta the
+     polar radius and angle of (x, y) and w wider on the outer side, which
+     leaves a narrow fissure between the halves. A sketch, not anatomy. */
+  const TAU = 2 * Math.PI;
+  const BRAIN_SHAPE = { cz: 74, w: 80, wInner: 70, h: 100, l: 168 };
+  const PROFILE = [[1, 0.05], [0.9, 0.48], [0.62, 0.84], [0.2, 1], [-0.25, 0.96], [-0.66, 0.74], [-0.93, 0.36],
+    [-1, -0.04], [-0.86, -0.34], [-0.56, -0.44], [-0.15, -0.56], [0.24, -0.74], [0.5, -0.63], [0.6, -0.42],
+    [0.56, -0.27], [0.8, -0.22], [0.96, -0.12]].map(([x, y]) => ({ a: (Math.atan2(y * BRAIN_SHAPE.h, x * BRAIN_SHAPE.l) + TAU) % TAU,
+    r: Math.hypot(y * BRAIN_SHAPE.h, x * BRAIN_SHAPE.l) })).sort((p, q) => p.a - q.a);
+  const CEREBELLUM = { c: [-112, -70, 0], r: [50, 38, 100] };
+  const STEM = [[-40, -58, 0], [-56, -182, 0]];
+  /* Eight regions, one per stored kind; the place follows the usual
+     association of the word, not neuroanatomy. at: (x / l, y / h) on the
+     side profile; side: -1 left, 1 right, 0 split between both halves. */
+  const BRAIN_REGIONS = [
+    { kind: "decision", name: "решения", side: -1, at: [0.62, 0.35] },
+    { kind: "concept", name: "понятия", side: 1, at: [0.62, 0.35] },
+    { kind: "memory", name: "память", side: -1, at: [0.24, -0.42] },
+    { kind: "session", name: "сессии", side: 1, at: [0.24, -0.42] },
+    { kind: "entity", name: "сущности", side: -1, at: [-0.32, 0.55] },
+    { kind: "code", name: "код", side: 1, at: [-0.32, 0.55] },
+    { kind: "document", name: "документы", side: 0, at: [-0.76, 0.12] },
+    { kind: "error", name: "ошибки", cerebellum: true },
+  ];
+  const UNKNOWN_REGION = { kind: null, name: "тип неизвестен", stem: true };
+  const REGION_OF = new Map(BRAIN_REGIONS.map((r) => [r.kind, r]));
+  /* Only an exact stored kind picks a region; anything else is unknown. */
+  const regionOf = (kind) => (typeof kind === "string" && REGION_OF.get(kind)) || UNKNOWN_REGION;
+  const REGION_SPREAD = 34, MESH_AROUND = 36, MESH_ACROSS = 10;
+  const brainScaleFor = (n) => Math.max(1, Math.cbrt(Math.max(0, n) / 240));
+
+  function profileRadius(theta) {
+    const P = PROFILE, n = P.length;
+    let a = ((theta % TAU) + TAU) % TAU, i = n - 1;
+    for (let k = 0; k < n; k++) if (P[k].a <= a) i = k;
+    if (a < P[0].a) a += TAU;
+    const j = (i + 1) % n, a1 = j === 0 ? P[0].a + TAU : P[j].a, t = (a - P[i].a) / (a1 - P[i].a);
+    const p0 = P[(i - 1 + n) % n].r, p1 = P[i].r, p2 = P[j].r, p3 = P[(j + 1) % n].r;
+    return 0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (3 * p1 - p0 - 3 * p2 + p3) * t * t * t);
+  }
+  /* 1 on a hemisphere's surface, below 1 inside (scaled world units). */
+  function hemisphereNorm(p, scale) {
+    const k = scale || 1, x = p[0] / k, y = p[1] / k, side = p[2] < 0 ? -1 : 1, dz = p[2] / k - side * BRAIN_SHAPE.cz;
+    return Math.hypot(dz / (dz * side >= 0 ? BRAIN_SHAPE.w : BRAIN_SHAPE.wInner), Math.hypot(x, y) / profileRadius(Math.atan2(y, x)));
+  }
+  const cerebellumNorm = (p, scale) => Math.hypot(...[0, 1, 2].map((k) => (p[k] / (scale || 1) - CEREBELLUM.c[k]) / CEREBELLUM.r[k]));
+  /* A side-profile point lifted onto the outer face of one hemisphere, times k
+     from the hemisphere's centre line (k < 1 is inside, k > 1 outside). */
+  function liftOuter(side, at, k) {
+    const x = at[0] * BRAIN_SHAPE.l, y = at[1] * BRAIN_SHAPE.h;
+    const q = Math.min(0.999, Math.hypot(x, y) / profileRadius(Math.atan2(y, x)));
+    return [x, y, side * (BRAIN_SHAPE.cz + BRAIN_SHAPE.w * Math.sqrt(1 - q * q) * (k === undefined ? 1 : k))];
+  }
+  function regionSide(region, id) { return region.side ? region.side : (unit(String(id), 7) < 0.5 ? -1 : 1); }
+  /* Unscaled centre of a region (for side 0, of the half the id picks). */
+  function regionAnchor(region, side) {
+    if (region.cerebellum) return [CEREBELLUM.c[0] - 6, CEREBELLUM.c[1] + 4, 0];
+    if (region.stem) return [STEM[0][0] - 8, STEM[0][1] - 60, 0];
+    const x = region.at[0] * BRAIN_SHAPE.l, y = region.at[1] * BRAIN_SHAPE.h;
+    return [x, y, side * (BRAIN_SHAPE.cz + 0.3 * BRAIN_SHAPE.w)];
+  }
+  /* Where a node sits: its region's ball, fixed by the id, pulled inward until
+     it is inside the solid that region belongs to. Pure function of id, kind
+     and scale, so expanding never moves anything already drawn. */
+  function brainPosition(node, scale) {
+    const region = regionOf(node.kind), side = regionSide(region, node.id), a = regionAnchor(region, side);
+    let o = ballOffset(String(node.id), region.stem ? 16 : REGION_SPREAD);
+    if (region.stem) o = [o[0] * 0.7, o[1] * 2.6, o[2] * 0.7];
+    if (region.cerebellum) o = [o[0] * 0.8, o[1] * 0.6, o[2] * 1.9];
+    const inside = (p) => region.stem ? true : region.cerebellum ? cerebellumNorm(p) <= 0.86
+      : hemisphereNorm(p) <= 0.9 && Math.sign(p[2]) === side;
+    let p = [a[0] + o[0], a[1] + o[1], a[2] + o[2]];
+    for (let step = 0; step < 6 && !inside(p); step++) { o = o.map((v) => v * 0.6); p = [a[0] + o[0], a[1] + o[1], a[2] + o[2]]; }
+    if (!inside(p)) p = a.slice();
+    return p.map((v) => v * scale);
+  }
+  /* Loaded-sample counts per region: {kind|"unknown": n}. Never a total. */
+  function brainCounts(nodes) {
+    const counts = Object.fromEntries(BRAIN_REGIONS.map((r) => [r.kind, 0]).concat([["unknown", 0]]));
+    for (const n of nodes || []) { const r = regionOf(n.kind); counts[r.kind || "unknown"]++; }
+    return counts;
+  }
+  const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  /* Closed meshes (unscaled) of both hemispheres and the cerebellum: points
+     and quads with outward normals, for the silhouette. Bounded: 3 meshes of
+     (MESH_ACROSS + 1) * MESH_AROUND points. */
+  function brainMeshes() {
+    const loft = (centre, point) => {
+      const points = [];
+      for (let i = 0; i <= MESH_ACROSS; i++) {
+        const s = -Math.PI / 2 + Math.PI * i / MESH_ACROSS;
+        for (let j = 0; j < MESH_AROUND; j++) points.push(point(TAU * j / MESH_AROUND, s));
+      }
+      const faces = [];
+      for (let i = 0; i < MESH_ACROSS; i++) for (let j = 0; j < MESH_AROUND; j++) {
+        const jn = (j + 1) % MESH_AROUND;
+        const quad = [i * MESH_AROUND + j, i * MESH_AROUND + jn, (i + 1) * MESH_AROUND + jn, (i + 1) * MESH_AROUND + j];
+        const [a, b, c, d] = quad.map((q) => points[q]), u = sub3(c, a), v = sub3(d, b);
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        const mid = [0, 1, 2].map((k) => (a[k] + b[k] + c[k] + d[k]) / 4);
+        if (dot3(n, sub3(mid, centre)) < 0) n = n.map((x) => -x);
+        faces.push({ quad, mid, n });
+      }
+      return { centre, points, faces };
+    };
+    const hemi = (side) => loft([0, 0, side * BRAIN_SHAPE.cz], (theta, s) => {
+      const rho = profileRadius(theta) * Math.cos(s), w = s >= 0 ? BRAIN_SHAPE.w : BRAIN_SHAPE.wInner;
+      return [rho * Math.cos(theta), rho * Math.sin(theta), side * (BRAIN_SHAPE.cz + w * Math.sin(s))];
+    });
+    const { c, r } = CEREBELLUM;
+    return [hemi(-1), hemi(1), loft(c, (theta, s) =>
+      [c[0] + r[0] * Math.cos(s) * Math.cos(theta), c[1] + r[1] * Math.cos(s) * Math.sin(theta), c[2] + r[2] * Math.sin(s)])];
+  }
+  const MESHES = brainMeshes();
+  /* Two fissures per hemisphere (lateral, central), lifted onto its outer face. */
+  const SULCI = [[[0.57, -0.27], [0.3, -0.17], [0.04, -0.1], [-0.24, 0.02], [-0.42, 0.18]],
+    [[0.02, 0.99], [0.09, 0.74], [0, 0.5], [0.08, 0.27], [0.02, 0.02]]];
+  const SULCUS_LINES = [-1, 1].flatMap((side) => SULCI.map((at) => {
+    const points = [];
+    for (let i = 0; i + 1 < at.length; i++) for (let t = 0; t < 4; t++) {
+      const f = t / 4; points.push(liftOuter(side, [at[i][0] + (at[i + 1][0] - at[i][0]) * f, at[i][1] + (at[i + 1][1] - at[i][1]) * f]));
+    }
+    points.push(liftOuter(side, at[at.length - 1]));
+    return { side, points };
+  }));
 
   /* ---------- camera and the one projection ---------- */
   function lookAt(eye, target) {
@@ -348,6 +487,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       for (const n of nodes) {
         const parent = parentOf && parentOf.get(n.id);
         if (this.layout === "time") n.pos = this.timePosition(n);
+        else if (this.layout === "brain") n.pos = brainPosition(n, this.brainScale || 1);
         else if (this.layout === "links" && parent && parent.pos) {
           const o = ballOffset(n.id, 34); n.pos = [parent.pos[0] + o[0], parent.pos[1] + o[1], parent.pos[2] + o[2]];
         } else n.pos = this.groupPosition(n);
@@ -414,6 +554,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       const started = performance.now();
       this.clear(); this.mode = "nodes";
       for (const row of doc.nodes) this.addNode(Object.assign({}, row, { size: nodeSize(row.links) }));
+      this.brainScale = brainScaleFor(this.nodes.length);
       this.relations = doc.relations.slice();
       this.edges = doc.edges.map(([a, b, r]) => ({ a, b, relation: r }));
       this.place(this.nodes, null);
@@ -424,7 +565,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
     /* Add a page of neighbours around one node, up to the budget. */
     addNeighbours(center, rows, budget) {
       const started = performance.now();
-      if (this.mode !== "nodes") { this.clear(); this.mode = "nodes"; }
+      if (this.mode !== "nodes") { this.clear(); this.mode = "nodes"; this.brainScale = brainScaleFor(budget); }
       let c = this.index.has(center.id) ? this.nodes[this.index.get(center.id)] : null;
       const fresh = [];
       if (!c) { c = this.addNode(Object.assign({}, center, { size: nodeSize(center.links) })); this.place([c], null); fresh.push(this.index.get(c.id)); }
@@ -482,6 +623,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       if (this.mode !== "nodes") return;
       const started = performance.now();
       for (const n of this.nodes) n.pos = null;
+      this.brainScale = brainScaleFor(this.nodes.length);
       this.place(this.nodes, null);
       this.settle(this.nodes.map((_, i) => i), 60);
       this.metrics.layoutMs = performance.now() - started;
@@ -497,12 +639,17 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
     bounds() {
       if (!this.nodes.length) return { center: [0, 0, 0], radius: 200 };
       const pts = this.nodes.map((n) => this.drawnPos(n));
+      // The brain layout frames the whole brain, not only the drawn nodes.
+      if (this.brainShown()) for (const m of MESHES) for (const q of m.points) pts.push(this.drawnPos({ pos: q.map((v) => v * this.brainScale) }));
       const center = [0, 1, 2].map((k) => pts.reduce((s, p) => s + p[k], 0) / pts.length);
       const radius = Math.max(60, ...pts.map((p) => Math.hypot(p[0] - center[0], p[1] - center[1], p[2] - center[2])));
       return { center, radius };
     }
     fit(animate) {
-      const { center, radius } = this.bounds(), dist = radius / Math.sin(FOV / 2) * 1.08;
+      // Fit the narrower field of view: FOV is vertical, so a portrait panel
+      // (aspect < 1) has a smaller horizontal half-angle and needs more room.
+      const { center, radius } = this.bounds(), aspect = this.size ? this.size.width / Math.max(1, this.size.height) : 1;
+      const half = Math.atan(Math.tan(FOV / 2) * Math.min(1, aspect)), dist = radius / Math.sin(half) * 1.08;
       this.camera.ref = dist;
       this.moveCamera(center, dist, animate);
     }
@@ -522,6 +669,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       this.request();
     }
     drawnPos(n) { return this.camera.flat ? [n.pos[0], n.pos[1], 0] : n.pos; }
+    brainShown() { return this.layout === "brain" && this.mode === "nodes" && !!this.brainScale; }
 
     /* ----- drawing on demand ----- */
     request() {
@@ -533,10 +681,13 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       const rect = this.host.wrap.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
       const ratio = Math.min(window.devicePixelRatio || 1, this.ratioCap);
-      for (const canvas of [this.host.glCanvas, this.host.flatCanvas]) {
+      const changed = !this.size || this.size.width !== rect.width || this.size.height !== rect.height;
+      for (const canvas of [this.host.glCanvas, this.host.flatCanvas, this.host.brainCanvas].filter(Boolean)) {
         canvas.width = Math.max(1, Math.round(rect.width * ratio)); canvas.height = Math.max(1, Math.round(rect.height * ratio));
       }
       this.size = { width: rect.width, height: rect.height, ratio }; this.metrics.pixelRatio = ratio;
+      // A new panel shape (phone rotation, window resize) refits, so nothing is left off-screen.
+      if (changed && this.nodes.length) this.fit(false);
       this.request();
     }
     style() {
@@ -592,6 +743,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       }
       this.frame = frame;
       const calls = this.renderer.draw(frame, style, this.size.ratio);
+      this.drawBrain(frame, style);
       this.drawLabels(frame);
       const ms = performance.now() - started;
       const m = this.metrics; m.draws++; m.drawCalls = calls; m.lastDrawMs = ms;
@@ -604,6 +756,98 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
       return Object.assign({}, this.metrics, { samples: undefined, p50: q(0.5), p95: q(0.95), nodes: this.nodes.length, edges: this.edges.length });
     }
 
+    /* The brain overlay: a transparent 2D canvas above the renderer. In 3D the
+       front faces of each solid are filled once as one path (their union is
+       the true silhouette) and the contour is where a front face meets a back
+       face; in 2D the side profile is drawn. Region names carry only fixed
+       words and loaded-sample counts — no stored text ever reaches it. A
+       fixed cost per frame: ~1.2k projected points, a few paths, <= 9 texts. */
+    drawBrain(frame, style) {
+      const canvas = this.host.brainCanvas, ctx = canvas && canvas.getContext && canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(this.size.ratio, 0, 0, this.size.ratio, 0, 0);
+      ctx.clearRect(0, 0, frame.width, frame.height);
+      this.regionLabels = [];
+      if (!this.brainShown()) return;
+      const k = this.brainScale, ink = rgb(style.ink), flat = this.camera.flat;
+      const at = (q) => project(frame, ...this.drawnPos({ pos: [q[0] * k, q[1] * k, q[2] * k] }), 0);
+      ctx.strokeStyle = ink; ctx.fillStyle = ink;
+      if (flat) {
+        ctx.beginPath();
+        for (let i = 0; i <= 72; i++) {
+          const t = TAU * i / 72, r = profileRadius(t), s = at([r * Math.cos(t), r * Math.sin(t), 0]);
+          if (s) { if (i) ctx.lineTo(s.x, s.y); else ctx.moveTo(s.x, s.y); }
+        }
+        ctx.globalAlpha = 0.05; ctx.fill(); ctx.globalAlpha = 0.5; ctx.lineWidth = 1.4; ctx.stroke();
+        ctx.beginPath();
+        for (let i = 0; i <= 36; i++) {
+          const t = TAU * i / 36, s = at([CEREBELLUM.c[0] + CEREBELLUM.r[0] * Math.cos(t), CEREBELLUM.c[1] + CEREBELLUM.r[1] * Math.sin(t), 0]);
+          if (s) { if (i) ctx.lineTo(s.x, s.y); else ctx.moveTo(s.x, s.y); }
+        }
+        ctx.globalAlpha = 0.4; ctx.stroke();
+      } else {
+        const eye = this.camera.eye();
+        for (const mesh of MESHES) {
+          const screen = mesh.points.map(at);
+          const front = mesh.faces.map((f) => dot3(f.n, sub3(eye, f.mid.map((v) => v * k))) > 0 && f.quad.every((q) => screen[q]));
+          ctx.beginPath();
+          mesh.faces.forEach((f, i) => {
+            if (!front[i]) return;
+            let q = f.quad.map((j) => screen[j]);
+            const area = (q[2].x - q[0].x) * (q[3].y - q[1].y) - (q[3].x - q[1].x) * (q[2].y - q[0].y);
+            if (area < 0) q = q.slice().reverse(); // one winding, so nonzero fills the union
+            ctx.moveTo(q[0].x, q[0].y); for (let j = 1; j < 4; j++) ctx.lineTo(q[j].x, q[j].y); ctx.closePath();
+          });
+          ctx.globalAlpha = 0.05; ctx.fill("nonzero");
+          ctx.beginPath();
+          for (let i = 0; i < MESH_ACROSS; i++) for (let j = 0; j < MESH_AROUND; j++) {
+            const f = i * MESH_AROUND + j, right = i * MESH_AROUND + (j + 1) % MESH_AROUND, down = f + MESH_AROUND, quad = mesh.faces[f].quad;
+            const edge = (a, b) => { if (screen[a] && screen[b]) { ctx.moveTo(screen[a].x, screen[a].y); ctx.lineTo(screen[b].x, screen[b].y); } };
+            if (front[f] !== front[right]) edge(quad[1], quad[2]);
+            if (i + 1 < MESH_ACROSS && front[f] !== front[down]) edge(quad[3], quad[2]);
+          }
+          ctx.globalAlpha = 0.5; ctx.lineWidth = 1.4; ctx.stroke();
+        }
+        ctx.beginPath();
+        for (const line of SULCUS_LINES) {
+          let prev = null;
+          for (const q of line.points) {
+            // A sulcus point is drawn when its hemisphere's outer face looks at the eye.
+            const s = (eye[2] - q[2] * k) * line.side > 0 ? at(q) : null;
+            if (prev && s) { ctx.moveTo(prev.x, prev.y); ctx.lineTo(s.x, s.y); }
+            prev = s;
+          }
+        }
+        ctx.globalAlpha = 0.35; ctx.lineWidth = 1.2; ctx.stroke();
+        const stem = STEM.map(at);
+        if (stem[0] && stem[1]) { ctx.beginPath(); ctx.moveTo(stem[0].x, stem[0].y); ctx.lineTo(stem[1].x, stem[1].y); ctx.globalAlpha = 0.25; ctx.lineWidth = 10; ctx.stroke(); }
+      }
+      // Region names with loaded-sample counts, placed on the surface outside the
+      // nodes; a name that would cover another is skipped (the note lists all).
+      const counts = brainCounts(this.nodes), placed = [];
+      ctx.font = "12px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "center";
+      const regions = BRAIN_REGIONS.concat(counts.unknown ? [UNKNOWN_REGION] : []);
+      for (const region of regions) {
+        const sides = region.side === 0 ? [flat ? 1 : (this.camera.eye()[2] < 0 ? -1 : 1)] : [region.side || 0];
+        const anchor = region.cerebellum ? [CEREBELLUM.c[0] - 30, CEREBELLUM.c[1] - CEREBELLUM.r[1] - 22, 0]
+          : region.stem ? [STEM[1][0], STEM[1][1] - 18, 0]
+          : (() => { const p = liftOuter(sides[0], region.at, 1.35); return [p[0], p[1] + (region.at[1] > 0 ? 22 : -22), p[2]]; })();
+        const s = at(anchor); if (!s) continue;
+        const text = region.name + " · " + counts[region.kind || "unknown"];
+        const w = ctx.measureText ? ctx.measureText(text).width + 10 : 7 * text.length + 10;
+        // A few places around the anchor; the first that fits the panel and
+        // covers no other region name wins.
+        const box = [[0, 0], [0, -20], [0, 20], [w * 0.6, 0], [-w * 0.6, 0]].map(([dx, dy]) => [s.x + dx - w / 2, s.y + dy - 9, w, 18])
+          .find((b) => b[0] >= 0 && b[1] >= 0 && b[0] + w <= frame.width && b[1] + 18 <= frame.height
+            && !placed.some((q) => q[0] < b[0] + b[2] && b[0] < q[0] + q[2] && q[1] < b[1] + b[3] && b[1] < q[1] + q[3]));
+        if (!box) continue;
+        placed.push(box);
+        ctx.globalAlpha = 0.85; ctx.fillStyle = rgb(style.bg); ctx.fillRect(box[0], box[1], w, 18);
+        ctx.globalAlpha = counts[region.kind || "unknown"] ? 1 : 0.55; ctx.fillStyle = ink; ctx.fillText(text, box[0] + w / 2, box[1] + 9);
+        this.regionLabels.push({ region: region.kind || "unknown", text, box });
+      }
+      ctx.globalAlpha = 1;
+    }
     /* Names only for what someone is looking at; the rest are in the lists. */
     drawLabels(frame) {
       const layer = this.host.labels, wanted = [];
@@ -691,6 +935,12 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
         if (!n) return;
         if (n.cluster) this.host.onCluster(n.cluster); else this.host.onSelect(n.id);
       });
+      // Leaving the stage ends the hover, so no tooltip stays over the legend.
+      wrap.addEventListener("pointerleave", () => {
+        if (drag) return;
+        if (this.hover !== null) { this.hover = null; this.dirty.colors = true; this.request(); }
+        if (this.host.onHoverText) this.host.onHoverText(null);
+      });
       wrap.addEventListener("pointercancel", (e) => {
         if (wrap.hasPointerCapture && wrap.hasPointerCapture(e.pointerId)) wrap.releasePointerCapture(e.pointerId);
         drag = null;
@@ -741,5 +991,7 @@ void main() { gl_Position = u_vp * vec4(a_pos, 1.0); v_color = a_color; }`;
   const cellKey = (p, cell) => `${Math.floor(p[0] / cell)},${Math.floor(p[1] / cell)},${Math.floor(p[2] / cell)}`;
   function monthOf(ts) { const d = new Date(ts * 1000); return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`; }
 
-  window.BrainGraph = { GraphView, project, Camera, hash32, ballOffset, anchorsFor, monthOf, INTERACTIVE_SELECTOR };
+  window.BrainGraph = { GraphView, project, Camera, hash32, ballOffset, anchorsFor, monthOf, INTERACTIVE_SELECTOR,
+    BRAIN_REGIONS, UNKNOWN_REGION, regionOf, brainPosition, brainCounts, brainScaleFor, hemisphereNorm, cerebellumNorm,
+    profileRadius, BRAIN_MESHES: MESHES };
 })();

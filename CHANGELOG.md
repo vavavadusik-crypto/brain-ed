@@ -3,6 +3,38 @@
 All notable changes are listed here. Versions follow semantic versioning;
 `0.x` releases may change formats and interfaces.
 
+## [0.1.1] — 2026-10-10 (early preview)
+
+### Added and improved
+- Opt-in TLS listeners and clients on numeric private LAN addresses. Loopback
+  remains the default; LAN needs explicit flags, an IP SAN certificate and
+  enrolled credentials. No discovery or firewall changes.
+- Five opt-in read-only remote MCP tools for one explicitly configured
+  coordinator per call. Private, bounded config; fixed tools; untrusted
+  provenance; whole newline-terminated replies capped at 16 KiB. No remote
+  writes, local-memory fallback or arbitrary MCP passthrough.
+- The memory explorer now places the loaded records in eight brain regions
+  by their stored node kind, with an unknown region. Responsive 3D/2D views,
+  bounded selection, stable placement, selection details and fit controls.
+- Conservative client integration preserves conflicting Codex tables and
+  malformed/ambiguous JSON or markers, with manual guidance. Duplicate and
+  escaped keys are checked; unsupported triple-quoted TOML values require
+  manual integration. Conflicting files are skipped; selected writes keep
+  backups and rollback on failure.
+
+### Correctness and limits
+- Remote replies distinguish application errors, malformed envelopes and
+  transport refusals. Local argument checks reuse the coordinator's project
+  rule; duplicate config fields are refused before parsing can overwrite them.
+- Remote truncation preserves object keys, counts omissions and bounds the
+  trimming work. `truncated: false` does not mean the source list is complete:
+  board/claims/facts currently expose only a first page.
+- `--offline` still forbids model downloads; it is not a network isolation
+  control. Remote reads require the separate `--remote-config` opt-in.
+- Linux source preview only. Real TLS and separate synthetic installations
+  were tested on one machine; physical LAN/fleet deployment, complete native
+  capture and enterprise isolation are not claimed. No binary download yet.
+
 ## [0.1.0] — 2026-10-09 (early preview)
 
 First public preview of Brain ED (`brain` CLI). Linux only, source install.

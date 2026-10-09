@@ -1,4 +1,4 @@
-# Installing Brain ED 0.1.0 (early preview)
+# Installing Brain ED 0.1.1 (early preview)
 
 Supported: **Linux (x86_64 glibc)** from source. macOS and Windows are not
 supported in this preview: the source uses Unix-only APIs and `/proc/self`
@@ -77,11 +77,95 @@ or put either on `PATH`.
 - **Embeddings:** `brain model install` (asks first; `--yes` approves
   non-interactively). `--offline` / `BRAIN_OFFLINE=1` forbids even that.
   Model licences are shown on the model page and are yours to accept.
-- **Agent integration:** `brain init --agents --dry-run` previews config diffs
-  for Claude Code, Codex and Cursor; `brain uninstall --dry-run` previews their
-  removal.
+- **Agent integration:** separate, explicit step; see
+  [Connecting agents](#connecting-agents-claude-code-codex-cursor) below.
 - **Archive collector:** off until `brain archive enable`; `brain archive timer
   install` adds a systemd user timer. Both are separate explicit steps.
+
+## Connecting agents (Claude Code, Codex, Cursor)
+
+Check the exact flags of your build first: `brain init --help`,
+`brain uninstall --help`, `brain serve --help`.
+
+1. **Preview.** `brain init --agents --dry-run` detects the user configs and
+   prints every proposed diff with its file path. It writes nothing.
+2. **Review** the diffs and the per-client paths. Save open work in the
+   agents you are about to reconnect.
+3. **Apply** only after review: `brain init --agents --yes` applies the
+   non-conflicting changes without prompts. The integration report is text:
+   read the diffs, file paths and `CONFLICT` diagnostics to see which files
+   were written or refused and why. Database initialization emits a separate
+   JSON record; it is not a per-client integration report.
+4. **Reconnect.** Restart or reconnect the MCP clients (e.g. reopen the
+   session) so they load Brain's tools. Do not kill running servers blindly.
+
+### What the integrator refuses instead of guessing
+
+It edits only what it can identify exactly, and leaves the rest to you:
+
+- **Codex (TOML).** An existing `[mcp_servers.brain]` table that Brain did not
+  write, or the same key spelled differently (dotted, literal `'…'`, basic
+  `"…"` or Unicode-escaped), is **refused** with a diagnostic asking for a
+  manual edit; it is never duplicated or silently adopted. A file containing
+  triple-quoted multi-line values (`"""` / `'''`) is also refused; a comment
+  that merely mentions triple quotes does not change that. This is a
+  conservative check, not a full TOML parser.
+- **Claude Code and Cursor (JSON).** Only the exact root `mcpServers` and
+  `hooks` entries are touched; unrelated fields are preserved. Valid JSONC
+  comments are accepted. Trailing commas are refused rather than rewritten.
+- **Any client.** Duplicate keys in the target object and ambiguous marker
+  text are refused. Unreadable or non-UTF-8 files are left unchanged.
+
+### Not all-or-nothing
+
+`brain init --agents` skips conflicting files and may still integrate other
+files, including other files for the same client. The selected writes use
+backups and rollback on a write failure; a detected conflict does not cancel
+those selections. Before retrying, run the dry run again, read the text
+report and check each file. Fix the conflict by hand; never chmod
+the originals and never delete personal configs or `~/.brain` data to "clear"
+a refusal.
+
+### Manual integration
+
+When a file is refused, add the entry yourself, pointing at the stable copy
+(not `target/`), with your real home directory instead of `/home/<you>`.
+TOML does not expand `~`:
+
+```toml
+# Codex
+[mcp_servers.brain]
+command = "/home/<you>/.brain/bin/brain"
+args = ["serve"]
+```
+
+```json
+{ "mcpServers": { "brain": { "command": "/home/<you>/.brain/bin/brain", "args": ["serve"] } } }
+```
+
+Merge the JSON fragment into the existing root object (Claude Code, Cursor);
+do not replace the file. Then reconnect the client. Manually added entries
+are not in Brain's integration manifest, so `brain uninstall` will not remove
+them; remove them by hand.
+
+### По-русски: конфликты и переподключение
+
+1. Сначала `brain init --agents --dry-run`: показывает все изменения и пути
+   файлов, ничего не пишет. Проверьте флаги через `brain init --help`.
+2. Только после проверки: `brain init --agents --yes`. Прочитайте текстовый отчёт, пути и сообщения `CONFLICT`
+   по каждому файлу: что записано, что отказано и почему.
+3. Отказ — это не ошибка, а защита: чужая или иначе записанная таблица
+   `[mcp_servers.brain]`, многострочные значения в тройных кавычках, висячие
+   запятые в JSON, повторяющиеся ключи, неоднозначные маркеры, нечитаемые или
+   не-UTF-8 файлы — такие файлы не меняются. Внесите запись вручную (пример
+   выше, путь `~/.brain/bin/brain serve` полностью).
+4. Конфликтные файлы пропускаются: остальные файлы, включая другие файлы
+   того же клиента, могут быть изменены. Для выбранных записей есть резервная
+   копия и откат при ошибке записи. Перед повтором снова сделайте `--dry-run` и проверьте
+   файлы каждого клиента.
+5. Сохраните работу и переподключите или перезапустите MCP-клиенты, чтобы они
+   увидели инструменты Brain. Не убивайте серверы вслепую, не меняйте права
+   на исходные файлы и не удаляйте личные конфиги и данные `~/.brain`.
 
 ## Uninstall
 

@@ -354,6 +354,7 @@ fn build_plans(home: &Path, binary: &Path, clients: &[AgentClient]) -> Vec<Plann
                     &instructions,
                     MD_BEGIN,
                     MD_END,
+                    None,
                 ));
             }
             AgentClient::Codex => {
@@ -370,6 +371,7 @@ fn build_plans(home: &Path, binary: &Path, clients: &[AgentClient]) -> Vec<Plann
                     &config_block,
                     CONFIG_BEGIN,
                     CONFIG_END,
+                    Some(codex_config_conflicts),
                 ));
                 plans.push(json_plan(
                     *client,
@@ -384,6 +386,7 @@ fn build_plans(home: &Path, binary: &Path, clients: &[AgentClient]) -> Vec<Plann
                     &instructions,
                     MD_BEGIN,
                     MD_END,
+                    None,
                 ));
             }
             AgentClient::Cursor => {
@@ -400,6 +403,7 @@ fn build_plans(home: &Path, binary: &Path, clients: &[AgentClient]) -> Vec<Plann
                     &instructions,
                     MD_BEGIN,
                     MD_END,
+                    None,
                 ));
             }
         }
@@ -463,6 +467,9 @@ where
     }
 }
 
+/// A text check run on the existing file before the marker block is planned.
+type MarkerCheck = fn(&str) -> Result<(), String>;
+
 fn marker_plan(
     client: AgentClient,
     path: PathBuf,
@@ -470,13 +477,36 @@ fn marker_plan(
     block: &str,
     begin: &str,
     end: &str,
+    check: Option<MarkerCheck>,
 ) -> PlannedChange {
-    let before = fs::read(&path).ok();
-    let original = before
-        .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .unwrap_or_default();
-    match upsert_marker(original, block, begin, end) {
+    let refuse = |before: Option<Vec<u8>>, conflict: &str| PlannedChange {
+        client,
+        path: path.clone(),
+        before: before.clone(),
+        after: before,
+        description: description.to_owned(),
+        conflict: Some(conflict.to_owned()),
+    };
+    // An unreadable or non-UTF-8 file is never treated as empty: appending a
+    // block to "" would replace its bytes.
+    let before = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return refuse(
+                None,
+                "existing file could not be read; refusing replacement",
+            );
+        }
+    };
+    let Ok(original) = before.as_deref().map(std::str::from_utf8).transpose() else {
+        return refuse(before, "existing file is not UTF-8; refusing replacement");
+    };
+    let original = original.unwrap_or_default();
+    let planned = check
+        .map_or(Ok(()), |check| check(original))
+        .and_then(|()| upsert_marker(original, block, begin, end));
+    match planned {
         Ok(after) => PlannedChange {
             client,
             path,
@@ -485,15 +515,284 @@ fn marker_plan(
             description: description.to_owned(),
             conflict: None,
         },
-        Err(conflict) => PlannedChange {
-            client,
-            path,
-            before: before.clone(),
-            after: before,
-            description: description.to_owned(),
-            conflict: Some(conflict),
-        },
+        Err(conflict) => refuse(before, &conflict),
     }
+}
+
+/// Refuses a Codex `config.toml` that already defines what the Brain block
+/// would add, outside the BRAIN_FOR_AI markers. Appending a second
+/// `[mcp_servers.brain]` or `[hooks.brain]` makes the whole file invalid TOML,
+/// and without a TOML parser the existing definition cannot be proven
+/// equivalent, so the user resolves it by hand.
+///
+/// Keys are decoded the way TOML defines them (quoted segments, basic-string
+/// escapes such as `\u0069`), so `[mcp_servers."bra\u0069n"]` is `brain`.
+/// Anything the scanner cannot classify with certainty fails closed: unknown
+/// escapes, malformed headers, unclassifiable lines, and marker text other
+/// than one whole-line begin/end pair outside any multi-line value. Any
+/// triple-quoted string value is refused outright (manual fix), rather than
+/// guessing where it ends.
+fn codex_config_conflicts(original: &str) -> Result<(), String> {
+    let mut table: Vec<String> = Vec::new();
+    let mut depth = 0_usize;
+    let mut in_block = false;
+    let mut had_block = false;
+    for raw in original.lines() {
+        let line = raw.trim();
+        if raw.contains(CONFIG_BEGIN) || raw.contains(CONFIG_END) {
+            if depth > 0 {
+                return Err(toml_ambiguous(
+                    "has a BRAIN_FOR_AI marker inside a multi-line value",
+                ));
+            }
+            if line == CONFIG_BEGIN && !in_block && !had_block {
+                in_block = true;
+                had_block = true;
+                continue;
+            }
+            if line == CONFIG_END && in_block {
+                in_block = false;
+                continue;
+            }
+            return Err(toml_ambiguous(
+                "mentions a BRAIN_FOR_AI marker other than one whole-line begin/end pair",
+            ));
+        }
+        if in_block {
+            // Only Brain's exact block may sit here: upsert_marker refuses
+            // any content that differs from it.
+            continue;
+        }
+        if depth > 0 {
+            depth = toml_value_depth(line, depth)?;
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let found = if let Some(rest) = line.strip_prefix("[[") {
+            // Any array of tables named mcp_servers/hooks cannot take a
+            // [mcp_servers.brain] table beside it.
+            let path = toml_header(rest, "]]")?;
+            table.clone_from(&path);
+            matches!(
+                path.first().map(String::as_str),
+                Some("mcp_servers" | "hooks")
+            )
+            .then_some(path)
+        } else if let Some(rest) = line.strip_prefix('[') {
+            let path = toml_header(rest, "]")?;
+            table.clone_from(&path);
+            (path.len() >= 2 && reserved_brain_path(&path)).then_some(path)
+        } else if let Some(equals) = unquoted_index(line, '=') {
+            let mut path = table.clone();
+            path.extend(toml_key_path(&line[..equals])?);
+            let value = line[equals + 1..].trim_start();
+            // Triple-quoted strings are never delimited by guesswork: a `"""`
+            // in a comment or an escape would hide or reveal headers. Refuse.
+            if value.starts_with("\u{22}\u{22}\u{22}") || value.starts_with("\u{27}\u{27}\u{27}") {
+                return Err(toml_ambiguous(
+                    "has a triple-quoted (multi-line) string value, which Brain does not delimit",
+                ));
+            }
+            depth = toml_value_depth(value, 0)?;
+            reserved_brain_path(&path).then_some(path)
+        } else {
+            return Err(toml_ambiguous(
+                "has a line that is not a comment, table header or key/value pair",
+            ));
+        };
+        if let Some(path) = found {
+            return Err(format!(
+                "`{}` is already defined outside the BRAIN_FOR_AI markers; adding the Brain \
+                 block would duplicate it and make config.toml invalid. Remove that definition, \
+                 or wrap an identical Brain block in `{CONFIG_BEGIN}` / `{CONFIG_END}` yourself, \
+                 then rerun",
+                path.join(".")
+            ));
+        }
+    }
+    if in_block || depth > 0 {
+        return Err(toml_ambiguous(
+            "ends inside an unterminated marker block or multi-line value",
+        ));
+    }
+    Ok(())
+}
+
+/// A key path the Brain block would collide with.
+fn reserved_brain_path(path: &[String]) -> bool {
+    matches!(
+        path.first().map(String::as_str),
+        Some("mcp_servers" | "hooks")
+    ) && path.get(1).is_none_or(|second| second == "brain")
+}
+
+fn toml_ambiguous(why: &str) -> String {
+    format!(
+        "config.toml {why}; Brain cannot prove that adding its block would not duplicate \
+         `mcp_servers.brain` or `hooks.brain`. Simplify that part by hand, then rerun"
+    )
+}
+
+/// Parses the key inside a `[..]` / `[[..]]` header; only a comment may follow.
+fn toml_header(rest: &str, close: &str) -> Result<Vec<String>, String> {
+    let end = unquoted_index(rest, ']')
+        .ok_or_else(|| toml_ambiguous("has an unterminated table header"))?;
+    let tail = rest[end..]
+        .strip_prefix(close)
+        .ok_or_else(|| toml_ambiguous("has a malformed table header"))?
+        .trim_start();
+    if !(tail.is_empty() || tail.starts_with('#')) {
+        return Err(toml_ambiguous("has text after a table header"));
+    }
+    toml_key_path(&rest[..end])
+}
+
+/// Decodes a TOML key (`a."b\u0063".'d'`) into its segments, exactly as TOML
+/// defines them. Anything outside the spec is refused rather than guessed.
+fn toml_key_path(key: &str) -> Result<Vec<String>, String> {
+    let undecodable = || toml_ambiguous("has a key Brain cannot decode");
+    let chars = key.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut segments = Vec::new();
+    let skip_blank = |index: &mut usize| {
+        while chars.get(*index).is_some_and(|c| *c == ' ' || *c == '\t') {
+            *index += 1;
+        }
+    };
+    loop {
+        skip_blank(&mut index);
+        let mut segment = String::new();
+        match chars.get(index).copied() {
+            Some('"') => {
+                index += 1;
+                loop {
+                    let character = *chars.get(index).ok_or_else(undecodable)?;
+                    index += 1;
+                    match character {
+                        '"' => break,
+                        '\\' => {
+                            let escape = *chars.get(index).ok_or_else(undecodable)?;
+                            index += 1;
+                            let hex = |count: usize, index: &mut usize| {
+                                let digits = chars.get(*index..*index + count)?;
+                                *index += count;
+                                u32::from_str_radix(&digits.iter().collect::<String>(), 16)
+                                    .ok()
+                                    .and_then(char::from_u32)
+                            };
+                            segment.push(match escape {
+                                'b' => '\u{8}',
+                                't' => '\t',
+                                'n' => '\n',
+                                'f' => '\u{c}',
+                                'r' => '\r',
+                                'e' => '\u{1b}',
+                                '"' => '"',
+                                '\\' => '\\',
+                                'u' => hex(4, &mut index).ok_or_else(undecodable)?,
+                                'U' => hex(8, &mut index).ok_or_else(undecodable)?,
+                                'x' => hex(2, &mut index).ok_or_else(undecodable)?,
+                                _ => return Err(undecodable()),
+                            });
+                        }
+                        other => segment.push(other),
+                    }
+                }
+            }
+            Some('\u{27}') => {
+                index += 1;
+                loop {
+                    let character = *chars.get(index).ok_or_else(undecodable)?;
+                    index += 1;
+                    if character == '\u{27}' {
+                        break;
+                    }
+                    segment.push(character);
+                }
+            }
+            _ => {
+                while let Some(character) = chars
+                    .get(index)
+                    .filter(|c| c.is_ascii_alphanumeric() || **c == '_' || **c == '-')
+                {
+                    segment.push(*character);
+                    index += 1;
+                }
+                if segment.is_empty() {
+                    return Err(undecodable());
+                }
+            }
+        }
+        segments.push(segment);
+        skip_blank(&mut index);
+        match chars.get(index) {
+            None => return Ok(segments),
+            Some('.') => index += 1,
+            Some(_) => return Err(undecodable()),
+        }
+    }
+}
+
+/// Byte index of the first `needle` outside a TOML string; `#` outside a
+/// string starts a comment and ends the search.
+fn unquoted_index(line: &str, needle: char) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None if character == '"' || character == '\u{27}' => quote = Some(character),
+            None if character == '#' => return None,
+            None if character == needle => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Bracket depth after `text`, starting from `depth`, for values that span
+/// lines (arrays, inline tables). Strings and comments are skipped.
+fn toml_value_depth(text: &str, mut depth: usize) -> Result<usize, String> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, &character) in chars.iter().enumerate() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if character == '\\' => escaped = true,
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None => match character {
+                '"' | '\u{27}' => {
+                    if chars.get(index + 1) == Some(&character)
+                        && chars.get(index + 2) == Some(&character)
+                    {
+                        return Err(toml_ambiguous(
+                            "has a multi-line string inside a multi-line value",
+                        ));
+                    }
+                    quote = Some(character);
+                }
+                '#' => break,
+                '[' | '{' => depth += 1,
+                ']' | '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| toml_ambiguous("has an unbalanced bracket"))?;
+                }
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() {
+        return Err(toml_ambiguous("has an unterminated string"));
+    }
+    Ok(depth)
 }
 
 fn upsert_marker(original: &str, block: &str, begin: &str, end: &str) -> Result<String, String> {
@@ -527,44 +826,116 @@ fn patch_mcp_json(original: &str, binary: &str) -> Result<String, String> {
         serde_json::to_string(binary).map_err(|error| error.to_string())?
     );
     let root = object_bounds(&text, 0)?;
-    if let Some((start, end)) = find_property_value(&text, root, "mcpServers") {
-        let servers = object_bounds(&text, start)?;
-        if let Some((brain_start, brain_end)) = find_property_value(&text, servers, "brain") {
-            let current = &text[brain_start..brain_end];
-            if current.contains(&serde_json::to_string(binary).unwrap_or_default())
-                && current.contains("\"serve\"")
-            {
-                return Ok(text);
-            }
-            return Err("mcpServers.brain already exists with different settings".to_owned());
+    // Only the root member counts: `projects.<dir>.mcpServers` is per-project
+    // configuration and must never be mistaken for the user-scoped entry.
+    if let Some((start, _)) = property_value(&text, root, "mcpServers")? {
+        if text.as_bytes().get(start) != Some(&b'{') {
+            return Err("mcpServers is not a JSON object; refusing to edit it".to_owned());
         }
-        text = insert_object_member(&text, servers, &entry);
-        let _ = end;
+        let servers = object_bounds(&text, start)?;
+        if let Some((brain_start, brain_end)) = property_value(&text, servers, "brain")? {
+            let current = parse_jsonc(&text[brain_start..brain_end]).map_err(|_| {
+                "mcpServers.brain is not valid JSON; refusing to edit it".to_owned()
+            })?;
+            if !brain_entry_compatible(&current, binary) {
+                return Err(format!(
+                    "mcpServers.brain already exists with different settings; expected command \
+                     {} with args [\"serve\"] (or [\"--agent\", <name>, \"serve\"]) and no other \
+                     keys. Edit or remove it manually",
+                    serde_json::to_string(binary).unwrap_or_default()
+                ));
+            }
+        } else {
+            text = insert_object_member(&text, servers, &entry);
+        }
     } else {
         let value = format!("\"mcpServers\": {{{entry}}}");
         text = insert_object_member(&text, root, &value);
     }
+    let planned =
+        parse_jsonc(&text).map_err(|error| format!("planned JSON is invalid: {error}"))?;
+    if !planned
+        .pointer("/mcpServers/brain")
+        .is_some_and(|value| brain_entry_compatible(value, binary))
+    {
+        return Err("planned JSON does not carry the Brain entry at the root; refusing".to_owned());
+    }
     Ok(text)
 }
+
+/// Whether an existing `mcpServers.brain` value is this binary's stdio server.
+///
+/// Compared on parsed values, never by substring: a command that merely
+/// contains the path, or the path appearing in another field, is different.
+fn brain_entry_compatible(value: &serde_json::Value, binary: &str) -> bool {
+    let Some(entry) = value.as_object() else {
+        return false;
+    };
+    if entry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "command" | "args" | "type"))
+        || entry.get("type").is_some_and(|kind| kind != "stdio")
+        || entry.get("command").and_then(serde_json::Value::as_str) != Some(binary)
+    {
+        return false;
+    }
+    let args = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| {
+            args.iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    match args.as_deref() {
+        Some(["serve"]) => true,
+        Some(["--agent", agent, "serve"]) => !agent.is_empty() && !agent.starts_with('-'),
+        _ => false,
+    }
+}
+
+/// Whether an event's hook array already runs exactly `command`.
+fn hook_registered(groups: &serde_json::Value, command: &str) -> bool {
+    groups.as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("type").and_then(serde_json::Value::as_str) == Some("command")
+                            && hook.get("command").and_then(serde_json::Value::as_str)
+                                == Some(command)
+                    })
+                })
+        })
+    })
+}
+
+const HOOK_EVENTS: [&str; 7] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "Stop",
+    "SessionEnd",
+];
 
 fn patch_hooks_json(original: &str, binary: &str, client: &str) -> Result<String, String> {
     let mut text = ensure_json_object(original)?;
     let hook_binary = shell_quote(binary);
     let root = object_bounds(&text, 0)?;
-    if find_property_value(&text, root, "hooks").is_none() {
-        text = insert_object_member(&text, root, "\"hooks\": {}");
+    match property_value(&text, root, "hooks")? {
+        None => text = insert_object_member(&text, root, "\"hooks\": {}"),
+        Some((start, _)) if text.as_bytes().get(start) != Some(&b'{') => {
+            return Err("hooks is not a JSON object; refusing to edit it".to_owned());
+        }
+        Some(_) => {}
     }
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "PreCompact",
-        "Stop",
-        "SessionEnd",
-    ] {
+    for event in HOOK_EVENTS {
         let root = object_bounds(&text, 0)?;
-        let (hooks_start, _) = find_property_value(&text, root, "hooks")
+        let (hooks_start, _) = property_value(&text, root, "hooks")?
             .ok_or_else(|| "hooks object insertion failed".to_owned())?;
         let hooks = object_bounds(&text, hooks_start)?;
         let command = format!("{hook_binary} hook --event {event} --client {client}");
@@ -572,9 +943,15 @@ fn patch_hooks_json(original: &str, binary: &str, client: &str) -> Result<String
             "{{\"hooks\":[{{\"type\":\"command\",\"command\":{}}}]}}",
             serde_json::to_string(&command).map_err(|error| error.to_string())?
         );
-        if let Some((event_start, event_end)) = find_property_value(&text, hooks, event) {
-            let current = &text[event_start..event_end];
-            if current.contains(&serde_json::to_string(&command).unwrap_or_default()) {
+        if let Some((event_start, event_end)) = property_value(&text, hooks, event)? {
+            if text.as_bytes().get(event_start) != Some(&b'[') {
+                return Err(format!(
+                    "hooks.{event} is not a JSON array; refusing to edit it"
+                ));
+            }
+            let current = parse_jsonc(&text[event_start..event_end])
+                .map_err(|_| format!("hooks.{event} is not valid JSON; refusing to edit it"))?;
+            if hook_registered(&current, &command) {
                 continue;
             }
             let array = array_bounds(&text, event_start)?;
@@ -590,12 +967,77 @@ fn patch_hooks_json(original: &str, binary: &str, client: &str) -> Result<String
             );
         }
     }
+    let planned =
+        parse_jsonc(&text).map_err(|error| format!("planned JSON is invalid: {error}"))?;
+    for event in HOOK_EVENTS {
+        let command = format!("{hook_binary} hook --event {event} --client {client}");
+        if !planned
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .is_some_and(|groups| hook_registered(groups, &command))
+        {
+            return Err(format!(
+                "planned JSON lacks the hooks.{event} entry; refusing"
+            ));
+        }
+    }
     Ok(text)
+}
+
+/// Parses JSON that may carry `//` and `/* */` comments (nothing else beyond
+/// strict JSON). Comments become spaces, so byte positions are kept.
+fn parse_jsonc(text: &str) -> Result<serde_json::Value, String> {
+    let bytes = text.as_bytes();
+    let mut stripped = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                stripped.push(b' ');
+                index += 1;
+            }
+            continue;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let close = text[index + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+            stripped.extend(
+                bytes[index..close]
+                    .iter()
+                    .map(|&byte| if byte == b'\n' { b'\n' } else { b' ' }),
+            );
+            index = close;
+            continue;
+        }
+        stripped.push(byte);
+        index += 1;
+    }
+    serde_json::from_slice(&stripped).map_err(|error| error.to_string())
 }
 
 fn ensure_json_object(original: &str) -> Result<String, String> {
     if original.trim().is_empty() {
         return Ok("{}\n".to_owned());
+    }
+    // The whole file must already be one JSON object (comments allowed): a
+    // byte-level edit of anything else could not be proven valid.
+    if !parse_jsonc(original).is_ok_and(|value| value.is_object()) {
+        return Err(
+            "existing configuration is not a valid JSON object; refusing to edit it".to_owned(),
+        );
     }
     let text = original.to_owned();
     object_bounds(&text, 0)?;
@@ -603,19 +1045,21 @@ fn ensure_json_object(original: &str) -> Result<String, String> {
 }
 
 fn object_bounds(text: &str, start_at: usize) -> Result<(usize, usize), String> {
-    let start = text[start_at..]
-        .find('{')
-        .map(|offset| start_at + offset)
-        .ok_or_else(|| "expected JSON object".to_owned())?;
+    // The value must START here (after whitespace/comments): a `{` found
+    // further on, e.g. inside a comment, is not this value.
+    let start = skip_insignificant(text.as_bytes(), start_at, text.len());
+    if text.as_bytes().get(start) != Some(&b'{') {
+        return Err("expected JSON object".to_owned());
+    }
     let end = matching_delimiter(text, start, b'{', b'}')?;
     Ok((start, end))
 }
 
 fn array_bounds(text: &str, start_at: usize) -> Result<(usize, usize), String> {
-    let start = text[start_at..]
-        .find('[')
-        .map(|offset| start_at + offset)
-        .ok_or_else(|| "expected JSON array".to_owned())?;
+    let start = skip_insignificant(text.as_bytes(), start_at, text.len());
+    if text.as_bytes().get(start) != Some(&b'[') {
+        return Err("expected JSON array".to_owned());
+    }
     let end = matching_delimiter(text, start, b'[', b']')?;
     Ok((start, end))
 }
@@ -664,37 +1108,107 @@ fn matching_delimiter(text: &str, start: usize, open: u8, close: u8) -> Result<u
     Err("unbalanced JSON delimiters".to_owned())
 }
 
-fn find_property_value(text: &str, bounds: (usize, usize), key: &str) -> Option<(usize, usize)> {
-    let needle = format!("\"{key}\"");
-    let relative = text[bounds.0 + 1..bounds.1].find(&needle)?;
-    let key_start = bounds.0 + 1 + relative;
-    let colon = text[key_start + needle.len()..bounds.1].find(':')? + key_start + needle.len();
-    let start =
-        text[colon + 1..bounds.1].find(|character: char| !character.is_whitespace())? + colon + 1;
-    let end = match text.as_bytes().get(start) {
-        Some(b'{') => matching_delimiter(text, start, b'{', b'}').ok()? + 1,
-        Some(b'[') => matching_delimiter(text, start, b'[', b']').ok()? + 1,
-        Some(b'"') => {
-            let mut index = start + 1;
-            let bytes = text.as_bytes();
-            let mut escaped = false;
-            while index < bounds.1 {
-                if escaped {
-                    escaped = false;
-                } else if bytes[index] == b'\\' {
-                    escaped = true;
-                } else if bytes[index] == b'"' {
-                    break;
+/// Skips whitespace and comments from `index`, never past `limit`.
+fn skip_insignificant(bytes: &[u8], mut index: usize, limit: usize) -> usize {
+    while index < limit {
+        match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' => index += 1,
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < limit && bytes[index] != b'\n' {
+                    index += 1;
                 }
-                index += 1;
             }
-            index + 1
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < limit && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                    index += 1;
+                }
+                index = (index + 2).min(limit);
+            }
+            _ => break,
         }
-        _ => text[start..bounds.1]
-            .find([',', '}'])
-            .map_or(bounds.1, |offset| start + offset),
-    };
-    Some((start, end))
+    }
+    index
+}
+
+/// Index just past the string literal opening at `start`.
+fn string_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < limit {
+        if escaped {
+            escaped = false;
+        } else if bytes[index] == b'\\' {
+            escaped = true;
+        } else if bytes[index] == b'"' {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Finds the value of the DIRECT member `key` of the object spanning
+/// `bounds` (`{` .. `}`). Members of nested objects, and `"key"` text inside
+/// string values, are skipped: the scan walks member by member and compares
+/// decoded key names. A key that appears twice is refused, because
+/// serde_json (and the agent) would use the LAST copy while an edit might
+/// look at the first.
+fn property_value(
+    text: &str,
+    bounds: (usize, usize),
+    key: &str,
+) -> Result<Option<(usize, usize)>, String> {
+    let malformed = || format!("could not scan the object holding `{key}`; refusing to edit");
+    let bytes = text.as_bytes();
+    let limit = bounds.1;
+    let mut found = None;
+    let mut index = skip_insignificant(bytes, bounds.0 + 1, limit);
+    while index < limit {
+        if bytes[index] != b'"' {
+            return Err(malformed());
+        }
+        let key_end = string_end(bytes, index, limit).ok_or_else(malformed)?;
+        let name: String = serde_json::from_str(&text[index..key_end]).map_err(|_| malformed())?;
+        index = skip_insignificant(bytes, key_end, limit);
+        if bytes.get(index) != Some(&b':') {
+            return Err(malformed());
+        }
+        let start = skip_insignificant(bytes, index + 1, limit);
+        let end = match bytes.get(start).ok_or_else(malformed)? {
+            b'{' => matching_delimiter(text, start, b'{', b'}').map_err(|_| malformed())? + 1,
+            b'[' => matching_delimiter(text, start, b'[', b']').map_err(|_| malformed())? + 1,
+            b'"' => string_end(bytes, start, limit).ok_or_else(malformed)?,
+            _ => {
+                let mut end = start;
+                while end < limit && !b",}] \t\r\n/".contains(&bytes[end]) {
+                    end += 1;
+                }
+                end
+            }
+        };
+        if end > limit {
+            return Err(malformed());
+        }
+        if name == key {
+            if found.is_some() {
+                return Err(format!(
+                    "`{key}` appears more than once in the same JSON object; refusing to edit \
+                     an ambiguous file"
+                ));
+            }
+            found = Some((start, end));
+        }
+        index = skip_insignificant(bytes, end, limit);
+        if index >= limit {
+            break;
+        }
+        if bytes[index] != b',' {
+            return Err(malformed());
+        }
+        index = skip_insignificant(bytes, index + 1, limit);
+    }
+    Ok(found)
 }
 
 fn insert_object_member(text: &str, bounds: (usize, usize), member: &str) -> String {
@@ -1144,6 +1658,426 @@ fn set_file_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compat_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "brain-compat-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    /// Nested `projects.*.mcpServers`, a decoy string and a comment come
+    /// before the real user-scoped root entry.
+    const NESTED_BEFORE_ROOT: &str = r#"{
+  "projects": {
+    "/work/a": {"mcpServers": {"other": {"command": "x"}}, "deep": {"a": [{"b": {"mcpServers": {"brain": 1}}}]}}
+  },
+  "note": "\"mcpServers\": {\"brain\": /opt/brain serve",
+  // user comment
+  "mcpServers": {
+    "zeta": {"command": "z"},
+    "brain": {"command": "/opt/brain", "args": ["--agent", "claude-code", "serve"]}
+  }
+}
+"#;
+
+    #[test]
+    fn root_brain_after_nested_projects_is_found_and_left_byte_identical() {
+        assert_eq!(
+            patch_mcp_json(NESTED_BEFORE_ROOT, "/opt/brain").as_deref(),
+            Ok(NESTED_BEFORE_ROOT)
+        );
+        let plain =
+            NESTED_BEFORE_ROOT.replace(r#"["--agent", "claude-code", "serve"]"#, r#"["serve"]"#);
+        assert_eq!(
+            patch_mcp_json(&plain, "/opt/brain").as_deref(),
+            Ok(plain.as_str())
+        );
+    }
+
+    #[test]
+    fn nested_project_servers_never_receive_the_user_entry() {
+        let text = "{\n  \"projects\": {\"/w\": {\"mcpServers\": {\"brain\": {\"command\": \"/elsewhere\"}}}},\n  \"theme\": \"dark\"\n}\n";
+        let after = patch_mcp_json(text, "/opt/brain").expect("root insert");
+        let before: serde_json::Value = serde_json::from_str(text).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["projects"], before["projects"],
+            "nested object untouched"
+        );
+        assert_eq!(parsed["theme"], "dark");
+        assert_eq!(parsed["mcpServers"]["brain"]["command"], "/opt/brain");
+        assert_eq!(
+            parsed["mcpServers"]["brain"]["args"],
+            serde_json::json!(["serve"])
+        );
+        assert!(
+            after.contains(
+                r#""projects": {"/w": {"mcpServers": {"brain": {"command": "/elsewhere"}}}}"#
+            ),
+            "nested bytes kept verbatim"
+        );
+        assert_eq!(
+            patch_mcp_json(&after, "/opt/brain").unwrap(),
+            after,
+            "repeat is a no-op"
+        );
+    }
+
+    #[test]
+    fn incompatible_or_unparseable_entries_fail_closed() {
+        for brain in [
+            r#"{"command": "/opt/brain-evil", "args": ["serve"]}"#,
+            r#"{"command": "/usr/bin/other", "args": ["serve"], "note": "/opt/brain"}"#,
+            r#"{"command": "/opt/brain", "args": ["serve", "--unsafe"]}"#,
+            r#"{"command": "/opt/brain", "args": ["--agent", "--x", "serve"]}"#,
+            r#"{"command": "/opt/brain", "args": ["serve"], "env": {"A": "1"}}"#,
+            r#"{"type": "http", "command": "/opt/brain", "args": ["serve"]}"#,
+            r#""/opt/brain serve""#,
+        ] {
+            let text = format!("{{\"mcpServers\": {{\"brain\": {brain}}}}}\n");
+            assert!(patch_mcp_json(&text, "/opt/brain").is_err(), "{brain}");
+        }
+        for text in [
+            "{\"mcpServers\": []}",
+            "[1]",
+            "{\"a\": 1,}",
+            "{\"hooks\": 3}",
+        ] {
+            assert!(
+                patch_mcp_json(text, "/opt/brain").is_err() || text.contains("hooks"),
+                "{text}"
+            );
+            assert!(
+                patch_hooks_json(text, "/opt/brain", "claude").is_err()
+                    || text.contains("mcpServers"),
+                "{text}"
+            );
+        }
+
+        let root = compat_root("refuse");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let bytes = b"{\"mcpServers\": {\"brain\": {\"command\": \"/usr/bin/other\", \"note\": \"/opt/brain serve\"}}}\n";
+        fs::write(home.join(".claude.json"), bytes).unwrap();
+        let plans = build_plans(&home, Path::new("/opt/brain"), &[AgentClient::Claude]);
+        let plan = plans
+            .iter()
+            .find(|plan| plan.path == home.join(".claude.json"))
+            .unwrap();
+        assert!(plan.conflict.is_some());
+        assert_eq!(plan.after.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(fs::read(home.join(".claude.json")).unwrap(), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hooks_are_matched_on_the_exact_command_field() {
+        let ours = format!(
+            "{} hook --event SessionStart --client claude",
+            shell_quote("/opt/brain")
+        );
+        let decoy = serde_json::json!({
+            "projects": {"/w": {"hooks": {}}},
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "logger", "note": ours}]}]}
+        });
+        let text = serde_json::to_string_pretty(&decoy).unwrap();
+        let after = patch_hooks_json(&text, "/opt/brain", "claude").expect("patch");
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2,
+            "decoy kept, ours added"
+        );
+        assert!(hook_registered(&parsed["hooks"]["SessionStart"], &ours));
+        assert_eq!(parsed["projects"], decoy["projects"]);
+        assert_eq!(
+            patch_hooks_json(&after, "/opt/brain", "claude").unwrap(),
+            after
+        );
+    }
+
+    #[test]
+    fn unmarked_codex_registrations_are_never_duplicated() {
+        for existing in [
+            "[mcp_servers.brain]\ncommand = \"/opt/brain\"\nargs = [\"serve\"]\n",
+            "[mcp_servers]\nbrain = { command = \"/opt/brain\" }\n",
+            "[ hooks . \"brain\" ]\nconfig = \"x\"\n",
+            "[hooks.brain] # trailing comment\nconfig = \"x\"\n",
+            "mcp_servers.brain.command = \"x\"\n",
+            "mcp_servers = { other = { command = \"y\" } }\n",
+            "[[mcp_servers]]\nname = \"y\"\n",
+            "[mcp_servers.'brain'.env]\nA = \"1\"\n",
+        ] {
+            assert!(codex_config_conflicts(existing).is_err(), "{existing}");
+        }
+        for fine in [
+            "# [mcp_servers.brain]\nmodel = \"gpt\"\n",
+            "note = \"[mcp_servers.brain]\"\n[mcp_servers.other]\ncommand = \"y\"\n",
+        ] {
+            assert!(codex_config_conflicts(fine).is_ok(), "{fine}");
+        }
+
+        let root = compat_root("toml");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let bytes =
+            b"# mine\n[mcp_servers.brain]\ncommand = \"/somewhere/brain\"\nargs = [\"serve\"]\n";
+        fs::write(home.join(".codex/config.toml"), bytes).unwrap();
+        let plans = build_plans(&home, Path::new("/opt/brain"), &[AgentClient::Codex]);
+        let plan = plans
+            .iter()
+            .find(|plan| plan.path == home.join(".codex/config.toml"))
+            .unwrap();
+        assert!(
+            plan.conflict
+                .as_deref()
+                .is_some_and(|text| text.contains("mcp_servers.brain"))
+        );
+        assert_eq!(plan.after.as_deref(), Some(bytes.as_slice()));
+        // A file Brain already owns (marker block present, nothing unmarked) stays planned.
+        let owned = upsert_marker(
+            "model = \"gpt\"\n",
+            "# BRAIN_FOR_AI_BEGIN\n[mcp_servers.brain]\n# BRAIN_FOR_AI_END\n",
+            CONFIG_BEGIN,
+            CONFIG_END,
+        )
+        .unwrap();
+        assert!(codex_config_conflicts(&owned).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn escaped_or_ambiguous_toml_keys_fail_closed() {
+        for existing in [
+            "[mcp_servers.\"bra\\u0069n\"]\ncommand = \"x\"\n",
+            "[mcp_servers.\"bra\\U00000069n\"]\ncommand = \"x\"\n",
+            "[hooks.\"\\x62rain\"]\nconfig = \"x\"\n",
+            "\"mcp_servers\".\"b\\u0072ain\".command = \"x\"\n",
+            "[mcp_servers]\n\"br\\u0061in\" = { command = \"x\" }\n",
+            "[mcp_servers.\"br\\qain\"]\n",
+            "[mcp_servers.brain]] \n",
+            "[mcp_servers.other] trailing\n",
+            "model = \"gpt\"\nthis is not toml\n",
+            "args = [\n  \"x\",\n",
+        ] {
+            assert!(codex_config_conflicts(existing).is_err(), "{existing}");
+        }
+        for fine in [
+            "[mcp_servers.\" brain\"]\ncommand = \"x\"\n",
+            "[mcp_servers.\"brains\"]\ncommand = \"x\"\n",
+            "[projects.\"/home/u/x\"]\ntrust_level = \"trusted\"\n",
+            "args = [\n  \"--flag=x\",\n  { brain = 1 },\n]\nmodel = \"gpt\" # note = 1\n",
+        ] {
+            assert!(codex_config_conflicts(fine).is_ok(), "{fine}");
+        }
+    }
+
+    #[test]
+    fn marker_text_cannot_hide_an_unmarked_registration() {
+        for existing in [
+            "a = \"# BRAIN_FOR_AI_BEGIN\"\n[mcp_servers.brain]\ncommand = \"x\"\nb = \"# BRAIN_FOR_AI_END\"\n",
+            "# BRAIN_FOR_AI_BEGIN trailing\n[mcp_servers.brain]\n# BRAIN_FOR_AI_END\n",
+            "text = \"\"\"\n# BRAIN_FOR_AI_BEGIN\n\"\"\"\n[mcp_servers.brain]\n",
+            "# BRAIN_FOR_AI_BEGIN\n# BRAIN_FOR_AI_END\n# BRAIN_FOR_AI_BEGIN\n# BRAIN_FOR_AI_END\n",
+            "# BRAIN_FOR_AI_END\n",
+            "# BRAIN_FOR_AI_BEGIN\n[mcp_servers.brain]\n",
+        ] {
+            assert!(codex_config_conflicts(existing).is_err(), "{existing}");
+        }
+    }
+
+    #[test]
+    fn duplicate_json_keys_cannot_hide_an_incompatible_effective_entry() {
+        let compatible = r#"{"command": "/opt/brain", "args": ["serve"]}"#;
+        let evil = r#"{"command": "/tmp/evil", "args": ["serve"]}"#;
+        for text in [
+            format!("{{\"mcpServers\": {{\"brain\": {compatible}, \"brain\": {evil}}}}}"),
+            format!(
+                "{{\"mcpServers\": {{\"brain\": {compatible}}}, \"mcpServers\": {{\"brain\": {evil}}}}}"
+            ),
+            format!("{{\"mcpServers\": {{\"brain\": {compatible}, \"\\u0062rain\": {evil}}}}}"),
+            "{\"mcpServers\": {\"brain\": {\"command\": \"/opt/brain\", \"args\": [\"serve\"], \"command\": \"/tmp/evil\"}}}"
+                .to_owned(),
+        ] {
+            assert!(patch_mcp_json(&text, "/opt/brain").is_err(), "{text}");
+        }
+        assert!(
+            patch_hooks_json("{\"hooks\": {}, \"hooks\": {}}", "/opt/brain", "claude").is_err()
+        );
+        let commented = "// a stray { in a comment\n{\"theme\": \"dark\"}\n";
+        let after = patch_mcp_json(commented, "/opt/brain").expect("comment before root");
+        assert!(after.starts_with("// a stray { in a comment\n{"));
+
+        let root = compat_root("dup");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let json = format!("{{\"mcpServers\": {{\"brain\": {compatible}, \"brain\": {evil}}}}}\n");
+        fs::write(home.join(".claude.json"), &json).unwrap();
+        let toml = b"[mcp_servers.\"bra\\u0069n\"]\ncommand = \"/somewhere\"\n";
+        fs::write(home.join(".codex/config.toml"), toml).unwrap();
+        let plans = build_plans(
+            &home,
+            Path::new("/opt/brain"),
+            &[AgentClient::Claude, AgentClient::Codex],
+        );
+        for (path, bytes) in [
+            (home.join(".claude.json"), json.as_bytes()),
+            (home.join(".codex/config.toml"), toml.as_slice()),
+        ] {
+            let plan = plans.iter().find(|plan| plan.path == path).unwrap();
+            assert!(plan.conflict.is_some(), "{}", path.display());
+            assert_eq!(plan.after.as_deref(), Some(bytes));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_install_never_touches_refused_files() {
+        let root = compat_root("refused-install");
+        let home = root.join("home");
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let toml = b"# mine\n[mcp_servers.\"bra\\u0069n\"]\ncommand = \"/somewhere\"\n";
+        fs::write(home.join(".codex/config.toml"), toml).unwrap();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let binary = build.join("brain");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        install(&home, &brain_home, &binary, true, true).expect("dry run");
+        assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
+        assert!(
+            !home.join(".codex/hooks.json").exists(),
+            "dry run writes nothing"
+        );
+        install(&home, &brain_home, &binary, false, true).expect("install");
+        let first = (
+            fs::read(home.join(".codex/hooks.json")).ok(),
+            fs::read(home.join(".codex/AGENTS.md")).ok(),
+        );
+        assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
+        install(&home, &brain_home, &binary, false, true).expect("repeat");
+        assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
+        assert_eq!(
+            (
+                fs::read(home.join(".codex/hooks.json")).ok(),
+                fs::read(home.join(".codex/AGENTS.md")).ok(),
+            ),
+            first
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn triple_quoted_values_fail_closed_and_cannot_hide_headers() {
+        // Valid TOML (tomllib: mcp_servers.brain exists); a delimiter counter
+        // that also counted the comment's `"""` skipped the header.
+        let exact = "note = \"\"\"hello\"\"\" # \"\"\"\n[mcp_servers.brain]\ncommand = \"brain\"\n# \"\"\"\n";
+        for existing in [
+            exact,
+            "note = \u{27}\u{27}\u{27}hello\u{27}\u{27}\u{27} # \u{27}\u{27}\u{27}\n[hooks.brain]\nconfig = \"x\"\n# \u{27}\u{27}\u{27}\n",
+            "note = \"\"\"a\\\"\"\"\"\n[mcp_servers.other]\n",
+            "note = \"\"\"\n# \"\"\"\n\"\"\"\n[mcp_servers.other]\n",
+            "text = \"\"\"\n[mcp_servers.brain]\n\"\"\"\n",
+            "plain = \"x\"\nnote = \u{27}\u{27}\u{27}single line\u{27}\u{27}\u{27}\n",
+            "[mcp_servers.other]\nenv = \"\"\"\nmulti\n\"\"\"\n",
+            "note = \"a \\\"\\\"\\\" b\"\n[mcp_servers.brain]\n",
+            "# \"\"\"\n[mcp_servers.brain]\n# \"\"\"\n",
+        ] {
+            assert!(codex_config_conflicts(existing).is_err(), "{existing}");
+        }
+        for fine in [
+            "note = \"hello # not a comment \\\"\\\"\\\"\"\n[mcp_servers.other]\n",
+            "args = [\n  \"a\",\n  \"b\", # \"\"\"\n]\n",
+            "x = \"\" # \"\"\"\nmodel = \"gpt\"\n",
+        ] {
+            assert!(codex_config_conflicts(fine).is_ok(), "{fine}");
+        }
+
+        let root = compat_root("triple");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(home.join(".codex/config.toml"), exact).unwrap();
+        let plans = build_plans(&home, Path::new("/opt/brain"), &[AgentClient::Codex]);
+        let plan = plans
+            .iter()
+            .find(|plan| plan.path == home.join(".codex/config.toml"))
+            .unwrap();
+        assert!(plan.conflict.is_some());
+        assert_eq!(plan.after.as_deref(), Some(exact.as_bytes()));
+        assert_eq!(
+            fs::read(home.join(".codex/config.toml")).unwrap(),
+            exact.as_bytes()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dry_run_writes_nothing_and_repeated_install_keeps_compatible_bytes() {
+        let root = compat_root("install");
+        let home = root.join("home");
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let stable = stable_copy_path(&brain_home);
+        let claude_json = format!(
+            "{{\n  \"projects\": {{\"/w\": {{\"mcpServers\": {{}}}}}},\n  \"mcpServers\": {{\"brain\": {{\"command\": {}, \"args\": [\"--agent\", \"claude-code\", \"serve\"]}}}}\n}}\n",
+            serde_json::to_string(&stable.to_string_lossy()).unwrap()
+        );
+        fs::write(home.join(".claude.json"), &claude_json).unwrap();
+        fs::write(
+            home.join(".claude/settings.json"),
+            "{\n  \"theme\": \"dark\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "# mine\n[mcp_servers.brain]\ncommand = \"/somewhere/brain\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let binary = build.join("brain");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        let files = [
+            home.join(".claude.json"),
+            home.join(".claude/settings.json"),
+            home.join(".claude/CLAUDE.md"),
+            home.join(".codex/config.toml"),
+            home.join(".codex/hooks.json"),
+            home.join(".codex/AGENTS.md"),
+        ];
+        let snapshot = || {
+            files
+                .iter()
+                .map(|path| fs::read(path).ok())
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+
+        install(&home, &brain_home, &binary, true, true).expect("dry run");
+        assert_eq!(snapshot(), before, "dry run writes nothing");
+        assert!(!brain_home.join("install-manifest.json").exists());
+        assert!(!stable.exists());
+
+        install(&home, &brain_home, &binary, false, true).expect("install");
+        let first = snapshot();
+        assert_eq!(first[0], before[0], "compatible root entry byte-identical");
+        assert_eq!(first[3], before[3], "conflicting TOML untouched");
+        assert_ne!(first[1], before[1], "hooks were added");
+        let settings: serde_json::Value =
+            serde_json::from_slice(first[1].as_ref().unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+
+        install(&home, &brain_home, &binary, false, true).expect("repeat");
+        assert_eq!(snapshot(), first, "repeated install changes nothing");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn claude_user_config_is_planned_even_when_absent() {

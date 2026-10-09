@@ -39,6 +39,7 @@ mod mcp;
 mod net;
 mod private_fs;
 mod reindex;
+mod remote_mcp;
 mod settings;
 mod ui;
 mod work;
@@ -178,8 +179,14 @@ enum Command {
         command: MemoryCommand,
     },
 
-    /// Run the twenty-three-tool MCP server over newline-delimited stdio JSON-RPC.
-    Serve,
+    /// Run the MCP server over newline-delimited stdio JSON-RPC.
+    Serve {
+        /// Opt-in: an owner-only JSON file naming remote coordinators (absolute path).
+        /// Adds five read-only remote_* tools; without it the tool list is unchanged.
+        /// Remote tool calls use TLS even with --offline (model downloads only).
+        #[arg(long, value_name = "FILE")]
+        remote_config: Option<PathBuf>,
+    },
 
     /// Read the private conversation archive, or switch and run its collector.
     Archive {
@@ -661,7 +668,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             now_unix_seconds(),
         )),
         Command::Memory { command } => command_memory(&config, command),
-        Command::Serve => mcp::run_stdio(&config),
+        Command::Serve { remote_config } => {
+            if let Some(path) = remote_config {
+                remote_mcp::install(&path)?;
+            }
+            mcp::run_stdio(&config)
+        }
         Command::Archive { command } => command_archive(command),
         Command::Work { command } => work::run(&config, command),
         Command::Map { command } => map::run(&config, command),

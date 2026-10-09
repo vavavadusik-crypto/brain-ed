@@ -25,8 +25,8 @@ use brain_core::network::auth::{DEFAULT_CREDENTIAL_TTL_SECS, MIN_CREDENTIAL_TTL_
 use brain_core::network::tls::{MAX_DEADLINE, MIN_DEADLINE};
 use brain_core::network::{
     AuthStore, KeySource, NetError, TcpDialer, TlsCallResult, TlsClientConfig, TlsCoordClient,
-    TlsCoordServer, TlsError, TlsServerConfig, allowed_tools, parse_dial_target, tools_for_role,
-    write_credential_file,
+    TlsCoordServer, TlsError, TlsServerConfig, allowed_tools, parse_dial_target_lan,
+    tools_for_role, write_credential_file,
 };
 use clap::{Args, Subcommand};
 use serde_json::{Map, Value, json};
@@ -56,10 +56,10 @@ enum Exit {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum NetCommand {
-    /// Serve the coordinator over TLS on 127.0.0.1 until standard input closes.
+    /// Serve the coordinator over TLS (127.0.0.1 by default) until standard input closes.
     ///
     /// Prints one JSON line with the actual bound address once it accepts.
-    /// Loopback only: there is no option to bind another interface.
+    /// A private LAN address needs both --listen and the explicit --allow-lan.
     Serve(ServeArgs),
     /// Trusted local admin: create/refresh a principal and write a new credential file (0600).
     ///
@@ -110,9 +110,16 @@ pub(crate) struct ServeArgs {
     /// Inherited descriptor (>= 3) holding the private key; same checks as --key.
     #[arg(long, value_name = "N")]
     key_fd: Option<i32>,
-    /// Port on 127.0.0.1; 0 picks a free one (the JSON line says which).
+    /// Port; 0 picks a free one (the JSON line says which).
     #[arg(long, default_value_t = 0)]
     port: u16,
+    /// Numeric listen IP (default 127.0.0.1). Hostnames are refused, never resolved.
+    #[arg(long, value_name = "IP", default_value = "127.0.0.1")]
+    listen: String,
+    /// Opt in to listening on a private unicast LAN address (RFC 1918 or fc00::/7).
+    /// Wildcard, multicast, broadcast, link-local and public addresses are always refused.
+    #[arg(long)]
+    allow_lan: bool,
     /// Absolute per-connection deadline in milliseconds (50..=5000).
     #[arg(long, default_value_t = 5000)]
     deadline_ms: u64,
@@ -159,9 +166,12 @@ pub(crate) struct RevokeArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ConnectArgs {
-    /// Numeric loopback dial target, e.g. 127.0.0.1:7443. Hostnames are refused, never resolved.
+    /// Numeric dial target, e.g. 127.0.0.1:7443. Hostnames are refused, never resolved.
     #[arg(long, value_name = "IP:PORT")]
     dial: String,
+    /// Opt in to dialing a private unicast LAN address (same policy as --allow-lan).
+    #[arg(long)]
+    allow_lan_dial: bool,
     /// Name the server certificate must carry (SAN), e.g. localhost.
     #[arg(long, value_name = "NAME")]
     server_name: String,
@@ -407,10 +417,18 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
             );
         }
     };
+    let Ok(listen) = args.listen.parse::<std::net::IpAddr>() else {
+        return finish(
+            Exit::InvalidConfig,
+            &invalid("--listen must be a numeric IP; hostnames are never resolved").1,
+        );
+    };
     let mut config =
         TlsServerConfig::new(&args.state.state_dir, args.port, &args.cert, PathBuf::new());
     config.key = key;
     config.deadline = deadline;
+    config.listen = listen;
+    config.allow_lan = args.allow_lan;
     let server = match TlsCoordServer::start(&config) {
         Ok(server) => server,
         Err(error) => {
@@ -439,8 +457,8 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         "status": "serving",
         "protocol": PROTOCOL,
         "transport": "tls (rustls; TLS 1.2/1.3)",
-        "bind": format!("127.0.0.1:{}", handle.port()),
-        "lan": false,
+        "bind": std::net::SocketAddr::new(listen, handle.port()).to_string(),
+        "lan": !listen.is_loopback(),
         "state_dir": args.state.state_dir,
         "deadline_ms": deadline.as_millis() as u64,
         "stop": "close standard input",
@@ -615,7 +633,8 @@ fn principals(args: &StateDirArg) -> (Exit, Value) {
 
 fn client(connect: &ConnectArgs) -> Result<TlsCoordClient, (Exit, Value)> {
     let deadline = deadline(connect.deadline_ms)?;
-    let dial = parse_dial_target(&connect.dial).map_err(|error| invalid(tls_message(&error)))?;
+    let dial = parse_dial_target_lan(&connect.dial, connect.allow_lan_dial)
+        .map_err(|error| invalid(tls_message(&error)))?;
     let credential = match (&connect.credential, connect.credential_fd) {
         (Some(path), None) => KeySource::File(path.clone()),
         (None, Some(fd)) => KeySource::Fd(fd),
@@ -623,6 +642,7 @@ fn client(connect: &ConnectArgs) -> Result<TlsCoordClient, (Exit, Value)> {
     };
     let mut config = TlsClientConfig::new(&connect.ca, &connect.server_name, dial);
     config.deadline = deadline;
+    config.allow_lan = connect.allow_lan_dial;
     TlsCoordClient::with_dialer(config, &credential, Arc::new(TcpDialer)).map_err(|error| {
         (
             Exit::InvalidConfig,

@@ -7,7 +7,7 @@ The image uses twelve synthetic projects. It illustrates the project map; it
 does not show a deployed fleet or complete conversation-history graph.
 [Русская версия](README.ru.md)
 
-**0.1.0 — early preview. Linux only.**
+**0.1.1 — early preview. Linux only.**
 
 Brain ED is a local-first personal memory and task-coordination engine for AI
 coding agents, written in Rust on SQLite. The command and package are named
@@ -43,8 +43,11 @@ the source.
 
 - **Tested locally, not a fleet.** Coordination and sharing are tested with
   local processes and loopback TLS. That is not evidence of a real distributed
-  fleet, LAN deployment or enterprise readiness. LAN binding is a separate,
-  unfinished gate.
+  fleet, LAN deployment or enterprise readiness. LAN listening exists only as
+  an experimental, TLS-only, explicit opt-in for one private IP
+  (`brain net serve --listen <IP> --allow-lan`, IP SAN = listen IP = client
+  `--server-name`, operator firewall required); see
+  `docs/network-transport.md`. It is not production-proven.
 - **Activity is agent-declared.** The activity view and "active work" show
   what agents reported through hooks and claims. Brain ED does not watch the
   screen, keystrokes or file system.
@@ -122,3 +125,5 @@ brain model install                          # optional: explicit embedding down
 
 Apache-2.0 (see [LICENSE](LICENSE)). Third-party components keep their own
 licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+[Memory brain explorer: controls, regions and limits](docs/graph-explorer.md) · [Experimental remote MCP reads](docs/remote-mcp.md)

@@ -64,6 +64,21 @@ section.center { display: flex; flex-direction: column; }
 #stage:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
 #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 #labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+#stage canvas#brainCanvas { pointer-events: none; }
+/* Phone width: one column, the graph first and tall enough to use, the
+   search list and the card below it; nothing wider than the screen. */
+@media (max-width: 760px) {
+  html, body { height: auto; min-height: 100%; overflow-x: hidden; }
+  header { flex-wrap: wrap; gap: 6px; padding: 8px 10px; }
+  header h1 { font-size: 15px; flex-basis: 100%; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  section.center { order: -1; overflow: visible; }
+  #graphPane { flex: none; }
+  #stage { flex: none; height: 62vh; min-height: 360px; }
+  aside.left, aside.right { border: 0; border-top: 1px solid var(--edge); overflow: visible; min-width: 0; }
+  #legend { max-width: 70%; }
+  details.metrics { max-width: 80%; }
+}
 #labels span { position: absolute; left: 0; top: 0; font-size: 11px; line-height: 18px; padding: 0 5px; border-radius: 4px; white-space: nowrap;
   max-width: 280px; overflow: hidden; text-overflow: ellipsis; background: color-mix(in srgb, var(--panel) 82%, transparent); color: var(--ink); }
 #labels span.strong { font-weight: 600; border: 1px solid var(--accent); }
@@ -158,6 +173,7 @@ dt { color: var(--dim); } dd { margin: 0; word-break: break-all; }
         </select>
         <label for="layout">Раскладка</label>
         <select id="layout">
+          <option value="brain" selected title="Восемь областей мозга по полю «тип» узла; числа — только по нарисованной выборке">мозг: по типу</option>
           <option value="group">по группам</option>
           <option value="links">по связям</option>
           <option value="time">по времени</option>
@@ -176,6 +192,7 @@ dt { color: var(--dim); } dd { margin: 0; word-break: break-all; }
            aria-label="Граф памяти. Стрелки — вращение, плюс и минус — масштаб, F — вписать, Enter — раскрыть выбранный узел. Тот же набор доступен списком слева.">
         <canvas id="glCanvas" aria-hidden="true"></canvas>
         <canvas id="flatCanvas" aria-hidden="true" hidden></canvas>
+        <canvas id="brainCanvas" aria-hidden="true"></canvas>
         <div id="labels" aria-hidden="true"></div>
         <div id="hoverText"></div>
         <div id="legend"></div>
@@ -272,13 +289,13 @@ function reloadButton() {
 let currentSpace = hashParams().get("space") || "";
 const linkedNode = hashParams().get("node"); // read before anything rewrites the address
 let selectedId = null, totalNodes = 0, totalEdges = 0;
-const view = { tab: "graph", dim: "3d", by: "group", layout: "group", budget: 400, selection: null };
+const view = { tab: "graph", dim: "3d", by: "group", layout: "brain", budget: 400, selection: null };
 {
   const h = hashParams();
   if (h.get("tab") === "summary") view.tab = "summary";
   if (h.get("dim") === "2d") view.dim = "2d";
   if (["group", "kind", "month"].includes(h.get("by"))) view.by = h.get("by");
-  if (["group", "links", "time"].includes(h.get("layout"))) view.layout = h.get("layout");
+  if (["brain", "group", "links", "time"].includes(h.get("layout"))) view.layout = h.get("layout");
   if (["300", "400", "600", "1000"].includes(h.get("n"))) view.budget = Number(h.get("n"));
   const sel = {}; for (const k of ["q", "kind", "group", "month"]) if (h.get("s" + k)) sel[k] = h.get("s" + k);
   if (Object.keys(sel).length) view.selection = sel;
@@ -291,7 +308,7 @@ function writeHash() {
   if (view.tab !== "graph") h.set("tab", "summary");
   if (view.dim !== "3d") h.set("dim", view.dim);
   if (view.by !== "group") h.set("by", view.by);
-  if (view.layout !== "group") h.set("layout", view.layout);
+  if (view.layout !== "brain") h.set("layout", view.layout);
   if (view.budget !== 400) h.set("n", view.budget);
   if (view.selection) for (const [k, v] of Object.entries(view.selection)) h.set("s" + k, v);
   history.replaceState(null, "", "#" + h);
@@ -530,7 +547,7 @@ async function select(id, keepOffset) {
 
 /* ---------- the graph ---------- */
 const graphView = new BrainGraph.GraphView({
-  wrap: $("stage"), glCanvas: $("glCanvas"), flatCanvas: $("flatCanvas"), labels: $("labels"),
+  wrap: $("stage"), glCanvas: $("glCanvas"), flatCanvas: $("flatCanvas"), brainCanvas: $("brainCanvas"), labels: $("labels"),
   onSelect: (id) => select(id),
   onExpand: (id) => expand(id),
   onCluster: (cluster) => drillCluster(cluster),
@@ -703,7 +720,15 @@ function describeNodes() {
     parts.push(`у «${e.label.slice(0, 40)}» соседей ${ru(e.total)}, добавлено ${e.added}` + (e.skipped ? `, ${e.skipped} не поместились в лимит` : "") +
       (e.total > e.shown ? `; все соседи — в карточке справа постранично` : ""));
   }
-  parts.push(view.layout === "links" ? "раскладка по связям: новые узлы досчитываются, прежние не двигаются"
+  if (view.layout === "brain") {
+    // Counts of the drawn sample only — never presented as the whole space.
+    const c = BrainGraph.brainCounts(graphView.nodes);
+    const regions = BrainGraph.BRAIN_REGIONS.map((r) => `${r.name} ${ru(c[r.kind])}`).concat(c.unknown ? [`тип неизвестен ${ru(c.unknown)}`] : []);
+    parts.push(`мозг: область — по полю «тип» узла, не по тексту; в этой выборке ${ru(shown)} из ${ru(totalNodes)}: ` + regions.join(", ") +
+      ". Это не весь мозг: остальные узлы — в поиске и списке слева");
+  }
+  parts.push(view.layout === "brain" ? "положение внутри области задано id узла и не меняется при раскрытии"
+    : view.layout === "links" ? "раскладка по связям: новые узлы досчитываются, прежние не двигаются"
     : view.layout === "time" ? "по горизонтали — время записи в Brain, по кругу — тип"
     : `раскладка по группам (${BY_RU[view.by]})`);
   note(parts.join(" · ") + ".");

@@ -4,7 +4,9 @@ Status: core slice (phase 17) plus the TLS wire slice (phase 25,
 2026-10-09, branch `codex/shared-product-transport`). Shared facts now
 travel between installations over `brain-coord/1` loopback TLS through two
 typed read tools and the `brain net share` CLI (see "Wire and CLI" below).
-Not wired: MCP tools, retrieval/search, automatic capture, LAN binding.
+Not wired: MCP tools, retrieval/search, automatic capture. LAN use is only the
+experimental TLS opt-in of `docs/network-transport.md` (`--allow-lan-dial`
+on `brain net share` pulls); grants stay host-local and default-deny.
 
 ## What it is
 
@@ -136,7 +138,7 @@ wrong-version file is `incompatible`. Nothing is migrated silently.
 
 Process evidence: `brain-cli/tests/share_tls_process.rs` (two synthetic
 installations, real loopback TLS, ten simultaneous pulling processes on one
-machine). Not ten computers, not LAN, not MCP.
+machine). Not ten computers, not tested over a LAN, not MCP.
 
 Root verification: `cargo test -p brain-core --lib sharing:: -- --test-threads=1`
 passed all 22 tests on 2026-10-09. The independent run found and fixed

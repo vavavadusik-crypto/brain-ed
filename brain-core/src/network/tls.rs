@@ -31,7 +31,7 @@
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,6 +72,11 @@ pub struct TlsServerConfig {
     pub key: KeySource,
     /// Absolute per-connection deadline, `MIN_DEADLINE..=MAX_DEADLINE`.
     pub deadline: Duration,
+    /// Numeric listen address; `127.0.0.1` by default.
+    pub listen: IpAddr,
+    /// Affirmative opt-in for a non-loopback `listen` (see
+    /// [`checked_listen_ip`](crate::network::server::checked_listen_ip)).
+    pub allow_lan: bool,
 }
 
 /// Where a private key (or credential) comes from: an owner-only file, or
@@ -98,6 +103,8 @@ impl TlsServerConfig {
             cert_file: cert_file.into(),
             key: KeySource::File(key_file.into()),
             deadline: MAX_DEADLINE,
+            listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            allow_lan: false,
         }
     }
 }
@@ -114,6 +121,8 @@ pub struct TlsClientConfig {
     pub dial: SocketAddr,
     /// Absolute deadline for connect + handshake + request + response.
     pub deadline: Duration,
+    /// Affirmative opt-in to dial a private unicast LAN address.
+    pub allow_lan: bool,
 }
 
 impl TlsClientConfig {
@@ -127,6 +136,7 @@ impl TlsClientConfig {
             server_name: server_name.into(),
             dial,
             deadline: MAX_DEADLINE,
+            allow_lan: false,
         }
     }
 }
@@ -144,19 +154,42 @@ pub fn parse_dial_target(text: &str) -> Result<SocketAddr, TlsError> {
             "dial target must be a numeric IP:PORT; hostnames are never resolved".into(),
         )
     })?;
-    checked_dial(address)
+    checked_dial(address, false)
 }
 
-fn checked_dial(address: SocketAddr) -> Result<SocketAddr, TlsError> {
+/// As [`parse_dial_target`], but with `allow_lan` a numeric private unicast
+/// LAN address passes the same policy as a LAN listener. Still never resolves.
+///
+/// # Errors
+/// [`TlsError::InvalidConfig`] as for [`parse_dial_target`], or for a
+/// non-LAN address even with the opt-in.
+pub fn parse_dial_target_lan(text: &str, allow_lan: bool) -> Result<SocketAddr, TlsError> {
+    let address: SocketAddr = text.parse().map_err(|_| {
+        TlsError::InvalidConfig(
+            "dial target must be a numeric IP:PORT; hostnames are never resolved".into(),
+        )
+    })?;
+    checked_dial(address, allow_lan)
+}
+
+fn checked_dial(address: SocketAddr, allow_lan: bool) -> Result<SocketAddr, TlsError> {
     if address.port() == 0 {
         return Err(TlsError::InvalidConfig(
             "dial target needs a non-zero port".into(),
         ));
     }
     if !address.ip().is_loopback() {
-        return Err(TlsError::InvalidConfig(
-            "only loopback dial targets are allowed at this stage".into(),
-        ));
+        if !allow_lan {
+            return Err(TlsError::InvalidConfig(
+                "only loopback dial targets are allowed without the explicit LAN opt-in".into(),
+            ));
+        }
+        crate::network::server::checked_listen_ip(address.ip(), true).map_err(|_| {
+            TlsError::InvalidConfig(format!(
+                "{} is not a private unicast LAN dial target",
+                address.ip()
+            ))
+        })?;
     }
     Ok(address)
 }
@@ -540,10 +573,15 @@ impl TlsCoordServer {
     /// [`NetError`] for a bad deadline, unusable material, a store that
     /// cannot open, or a bind failure. No plaintext listener is opened.
     pub fn start(config: &TlsServerConfig) -> Result<Self, NetError> {
+        // The binding policy is checked first: a refused address loads no
+        // key, opens no store and binds nothing.
+        let listen = crate::network::server::checked_listen_ip(config.listen, config.allow_lan)?;
         let deadline = checked_deadline(config.deadline).map_err(tls_to_net)?;
         let tls = server_config(config).map_err(tls_to_net)?;
-        let core = Inner::open(&config.state_dir)?;
-        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, config.port));
+        // `Host` must also accept the exact bound IP, so a client whose
+        // server name is that IP (the certificate's IP SAN) is not refused.
+        let core = Inner::open(&config.state_dir)?.with_bound_host(listen);
+        let address = SocketAddr::new(listen, config.port);
         let listener = TcpListener::bind(address)
             .map_err(|error| NetError::unavailable(format!("bind {address}: {error}")))?;
         listener
@@ -790,7 +828,7 @@ impl TlsCoordClient {
         dialer: Arc<dyn Dialer>,
     ) -> Result<Self, NetError> {
         let deadline = checked_deadline(tls.deadline).map_err(tls_to_net)?;
-        let dial = checked_dial(tls.dial).map_err(tls_to_net)?;
+        let dial = checked_dial(tls.dial, tls.allow_lan).map_err(tls_to_net)?;
         let server_name = ServerName::try_from(tls.server_name.clone())
             .map_err(|_| NetError::invalid("server name is not a valid DNS name or IP"))?;
         let config = client_config(&tls).map_err(tls_to_net)?;
@@ -1015,6 +1053,7 @@ mod tests {
                 openssl(&dir, &refs);
             };
             leaf("server", "IP:127.0.0.1,DNS:localhost", &["-days", "2"]);
+            leaf("ipalt", "IP:127.0.0.2,IP:::1", &["-days", "2"]);
             leaf("wronghost", "DNS:example.invalid", &["-days", "2"]);
             // Same SAN as the good server: only the validity window is wrong.
             leaf("expired", "IP:127.0.0.1,DNS:localhost", &["-days", "2"]);
@@ -1056,7 +1095,7 @@ mod tests {
                     "210101000000Z",
                 ],
             );
-            for key in ["ca", "other-ca", "server", "wronghost", "expired"] {
+            for key in ["ca", "other-ca", "server", "wronghost", "expired", "ipalt"] {
                 std::fs::set_permissions(
                     dir.join(format!("{key}.key")),
                     std::fs::Permissions::from_mode(0o600),
@@ -1839,5 +1878,101 @@ mod tests {
         assert_eq!(run(&core), "200", "served while running");
         core.stop();
         assert_eq!(run(&core), "503", "refused before dispatch after stop");
+    }
+
+    #[test]
+    fn lan_listen_and_dial_need_the_opt_in_and_refuse_wide_addresses() {
+        let dir = std::env::temp_dir().join(format!("brain-lan-start-{}", std::process::id()));
+        let refused = |listen: &str, allow_lan: bool| {
+            let mut config =
+                TlsServerConfig::new(&dir, 0, dir.join("absent.crt"), dir.join("absent.key"));
+            config.listen = listen.parse().expect("ip");
+            config.allow_lan = allow_lan;
+            let error = TlsCoordServer::start(&config).err().expect("refused");
+            assert_eq!(error.status(), 400, "{listen}");
+            error.body().to_string()
+        };
+        // Checked before any material or store: the error names the policy.
+        assert!(refused("192.168.77.10", false).contains("opt-in"));
+        for wide in ["0.0.0.0", "::", "224.0.0.1", "255.255.255.255", "8.8.8.8"] {
+            assert!(refused(wide, true).contains("private unicast"), "{wide}");
+        }
+        assert!(!dir.exists(), "no state was created for a refused bind");
+
+        assert!(parse_dial_target("192.168.77.10:7443").is_err());
+        assert!(parse_dial_target_lan("192.168.77.10:7443", false).is_err());
+        assert_eq!(
+            parse_dial_target_lan("192.168.77.10:7443", true).expect("lan"),
+            "192.168.77.10:7443".parse::<SocketAddr>().expect("addr")
+        );
+        assert!(parse_dial_target_lan("[fd00::17]:7443", true).is_ok());
+        for refused in [
+            "0.0.0.0:7443",
+            "[::]:7443",
+            "224.0.0.1:7443",
+            "8.8.8.8:7443",
+            "192.168.77.10:0",
+            "brain.lan:7443",
+        ] {
+            assert!(parse_dial_target_lan(refused, true).is_err(), "{refused}");
+        }
+        assert!(parse_dial_target_lan("127.0.0.1:7443", false).is_ok());
+    }
+
+    /// An explicit non-default loopback bind, an IP-only certificate and a
+    /// `--server-name` equal to the listen IP work end to end over real TLS;
+    /// credential, role and space rights are unchanged.
+    #[test]
+    fn explicit_bound_ip_works_with_matching_ip_san_and_server_name() {
+        for listen in ["127.0.0.2", "::1"] {
+            let ip: IpAddr = listen.parse().expect("ip");
+            let dir = temp_dir(&format!("bound-{}", listen.replace(':', "_")));
+            let mut config = TlsServerConfig::new(&dir, 0, file("ipalt.crt"), file("ipalt.key"));
+            config.listen = ip;
+            let server = match TlsCoordServer::start(&config) {
+                Ok(server) => server,
+                Err(error) if ip.is_ipv6() && error.status() != 400 => {
+                    eprintln!("skipping ::1: IPv6 loopback unavailable here ({error:?})");
+                    continue;
+                }
+                Err(error) => panic!("start on {listen}: {error:?}"),
+            };
+            let handle = server.serve().expect("serve");
+            let token = issue(&handle, "m-a", "alice", "reader", &["s"]);
+            let cred = dir.join("alice");
+            crate::network::client::write_credential_file(&cred, &token).expect("cred");
+            let dial = SocketAddr::new(ip, handle.port());
+            let client =
+                TlsCoordClient::new(TlsClientConfig::new(file("ca.crt"), listen, dial), &cred)
+                    .expect("client");
+            match client.call("work_whoami", "", serde_json::Map::new(), None) {
+                TlsCallResult::Ok(envelope) => {
+                    assert!(envelope.to_string().contains("alice"), "{envelope}");
+                }
+                other => panic!("{listen}: whoami failed: {other:?}"),
+            }
+            // Rights are unchanged: a reader cannot write, nor reach another space.
+            let add = args(&[
+                ("space", "other".into()),
+                ("project", "p".into()),
+                ("title", "t".into()),
+            ]);
+            assert!(
+                !matches!(client.call("work_add", "", add, None), TlsCallResult::Ok(_)),
+                "{listen}: reader write to an ungranted space must be refused"
+            );
+            // A name the certificate does not carry still fails the handshake.
+            let wrong = TlsCoordClient::new(
+                TlsClientConfig::new(file("ca.crt"), "localhost", dial),
+                &cred,
+            )
+            .expect("client");
+            assert!(matches!(
+                wrong.call("work_whoami", "", serde_json::Map::new(), None),
+                TlsCallResult::Tls(_)
+            ));
+            drop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

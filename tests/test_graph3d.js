@@ -27,7 +27,7 @@ const doc = { relations: ["calls"], nodes: Array.from({ length: 30 }, (_, i) => 
   edges: Array.from({ length: 29 }, (_, i) => [i, i + 1, 0]) };
 
 // Deterministic: the same data gives the same picture, in every layout.
-for (const layout of ["group", "links", "time"]) {
+for (const layout of ["group", "links", "time", "brain"]) {
   const one = bareView(layout), two = bareView(layout);
   one.setAnchors(clusterDoc); two.setAnchors(clusterDoc);
   one.showNodes(doc); two.showNodes(doc);
@@ -41,7 +41,7 @@ for (const layout of ["group", "links", "time"]) {
   assert.ok(Math.hypot(p[0] - rest[0], p[1] - rest[1], p[2] - rest[2]) <= v.anchors.get("\u0000rest").r + 1e-9);
 }
 // Expanding never moves what is already drawn, and respects the budget.
-for (const layout of ["group", "links"]) {
+for (const layout of ["group", "links", "brain"]) {
   const v = bareView(layout); v.setAnchors(clusterDoc); v.showNodes(doc);
   const before = v.nodes.map((n) => n.pos.slice());
   const rows = Array.from({ length: 12 }, (_, i) => ({ id: "m" + i, label: "m", kind: "memory", group: "b", degree: 1,
@@ -164,5 +164,146 @@ assert.strictEqual(anchorsFor(clusterDoc.clusters, "month").get("a").pos[1], 0);
   // Guard never rejects: INTERACTIVE_SELECTOR is the one the handlers use.
   assert.ok(INTERACTIVE_SELECTOR.includes("summary") && INTERACTIVE_SELECTOR.includes("details"),
     "overlay selector covers the metrics panel");
+}
+/* ---------- the brain layout: regions by stored kind only ---------- */
+{
+  const B = window.BrainGraph;
+  // Contract: the eight regions are exactly the kinds brain-core stores.
+  const model = fs.readFileSync(path.join(__dirname, "../brain-core/src/model.rs"), "utf8");
+  const stored = [...model.slice(model.indexOf("fn from_stored")).split("_ => None")[0].matchAll(/"([a-z_]+)" => Some/g)].map((m) => m[1]);
+  assert.deepStrictEqual(B.BRAIN_REGIONS.map((r) => r.kind).sort(), stored.slice().sort(), "regions = NodeKind::from_stored kinds");
+  assert.strictEqual(new Set(B.BRAIN_REGIONS.map((r) => r.name)).size, 8, "eight distinct region names");
+  // Only the exact kind decides; text never does, odd kinds are unknown.
+  assert.strictEqual(B.regionOf("code").kind, "code");
+  for (const odd of ["", undefined, null, "Decision", "decision ", "__proto__", "constructor", "<img src=x onerror=alert(1)>", 7]) {
+    assert.strictEqual(B.regionOf(odd), B.UNKNOWN_REGION, "unknown kind " + String(odd));
+  }
+  const errorWords = { id: "t1", kind: "code", label: "ошибка решение память error decision" };
+  const plain = { id: "t1", kind: "code", label: "x" };
+  assert.deepStrictEqual(B.brainPosition(errorWords, 1), B.brainPosition(plain, 1), "the label does not move a node");
+  assert.deepStrictEqual(B.brainCounts([errorWords, { id: "u", kind: "mystery" }, { id: "e", kind: "error" }]),
+    { decision: 0, concept: 0, memory: 0, session: 0, entity: 0, code: 1, document: 0, error: 1, unknown: 1 }, "counts are of the given rows only");
+  // Geometry: every node is inside the solid of its region, at every scale.
+  const kinds = B.BRAIN_REGIONS.map((r) => r.kind).concat(["mystery"]);
+  for (const n of [9, 400, 1000]) {
+    const k = B.brainScaleFor(n);
+    for (let i = 0; i < n; i++) {
+      const node = { id: "id" + i, kind: kinds[i % kinds.length] }, p = B.brainPosition(node, k), r = B.regionOf(node.kind);
+      assert.ok(p.every(Number.isFinite));
+      if (r.cerebellum) assert.ok(B.cerebellumNorm(p, k) <= 0.861, "error node inside the cerebellum");
+      else if (!r.stem) {
+        assert.ok(B.hemisphereNorm(p, k) <= 0.901, node.kind + " node inside a hemisphere");
+        if (r.side) assert.strictEqual(Math.sign(p[2]), r.side, node.kind + " node on its own side");
+        // The side view (2D) keeps it inside the profile too.
+        assert.ok(Math.hypot(p[0], p[1]) / k <= B.profileRadius(Math.atan2(p[1], p[0])), node.kind + " inside the side profile");
+      } else assert.ok(p[1] < -58 * k, "unknown kinds sit on the stem, below the hemispheres");
+    }
+  }
+  // Frontal regions are in front (+x), the cerebellum behind and below.
+  const at = (kind) => B.brainPosition({ id: "probe", kind }, 1);
+  assert.ok(at("decision")[0] > 60 && at("concept")[0] > 60 && at("error")[0] < -60 && at("error")[1] < -30);
+  // Meshes: bounded and closed with outward normals.
+  for (const m of B.BRAIN_MESHES) {
+    assert.ok(m.points.length <= 400 && m.faces.length <= 400, "bounded mesh");
+    assert.ok(m.faces.every((f) => (f.mid[0] - m.centre[0]) * f.n[0] + (f.mid[1] - m.centre[1]) * f.n[1] + (f.mid[2] - m.centre[2]) * f.n[2] > 0));
+  }
+
+  // Picking and the overlay through a view with stubbed surfaces.
+  const brainView = (count, labelOf, kindOf) => {
+    const v = bareView("brain");
+    v.host = { wrap: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 900, height: 600 }) } };
+    v.size = { width: 900, height: 600, ratio: 1 };
+    v.showNodes({ relations: [], edges: [], nodes: Array.from({ length: count }, (_, i) => ({ id: "b" + i, label: labelOf(i), kind: kindOf(i), links: i % 5 })) });
+    delete v.fit; GraphView.prototype.fit.call(v, false);
+    v.frame = v.camera.frame(900, 600);
+    return v;
+  };
+  {
+    const v = brainView(40, (i) => "n" + i, (i) => kinds[i % kinds.length]);
+    const projected = v.nodes.map((n) => [n, project(v.frame, ...n.pos, n.size)]).filter(([, p]) => p);
+    let checked = 0;
+    for (const [n, p] of projected) {
+      // A node with no other node within reach on screen is exactly what is picked.
+      const alone = projected.every(([m, q]) => m === n || Math.hypot(q.x - p.x, q.y - p.y) > 2 * Math.max(7, q.r + 3));
+      if (!alone) continue;
+      assert.strictEqual(v.pick(p.x, p.y).id, n.id, "pick hits " + n.id); checked++;
+    }
+    assert.ok(checked >= 5, "several isolated nodes were pick-tested: " + checked);
+    const all = v.nodes.map((n) => project(v.frame, ...n.pos, 0));
+    assert.ok(all.every((p) => p && p.x >= 0 && p.x <= 900 && p.y >= 0 && p.y <= 600), "fit frames every node of the brain");
+  }
+  const recorder = () => {
+    const log = { texts: [], ops: 0 }, ctx = { measureText: (t) => ({ width: 7 * t.length }) };
+    for (const m of ["setTransform", "clearRect", "beginPath", "closePath", "fill", "stroke", "fillRect"]) ctx[m] = () => {};
+    ctx.moveTo = ctx.lineTo = () => { log.ops++; };
+    ctx.fillText = (t) => log.texts.push(t);
+    return { log, canvas: { getContext: () => ctx } };
+  };
+  const style = { bg: [1, 1, 1], ink: [0, 0, 0] };
+  const evil = "<img src=x onerror=alert(1)>";
+  const opsFor = (count, flat) => {
+    const v = brainView(count, () => evil, (i) => (i % 9 === 8 ? evil : kinds[i % 8])), rec = recorder();
+    v.host.brainCanvas = rec.canvas; v.camera.flat = !!flat; v.frame = v.camera.frame(900, 600);
+    v.drawBrain(v.frame, style);
+    return { v, log: rec.log };
+  };
+  for (const flat of [false, true]) {
+    const small = opsFor(12, flat), big = opsFor(1000, flat);
+    for (const { log, v } of [small, big]) {
+      assert.ok(log.texts.length >= 1 && log.texts.length <= 9, "at most nine region names, got " + log.texts.length);
+      for (const t of log.texts) assert.ok(/^(решения|понятия|память|сессии|сущности|код|документы|ошибки|тип неизвестен) · \d+$/.test(t), "fixed words and a count only: " + t);
+      assert.ok(!log.texts.some((t) => t.includes("<") || t.includes("onerror")), "stored text never reaches the overlay");
+      assert.strictEqual(v.regionLabels.length, log.texts.length);
+    }
+    assert.ok(big.log.ops <= small.log.ops * 1.05 + 50, "overlay cost does not grow with nodes (" + flat + "): " + small.log.ops + " vs " + big.log.ops);
+    assert.ok(big.log.ops < 6000, "overlay path ops bounded: " + big.log.ops);
+  }
+  // Portrait panel: after fit, and after a resize from desktop to phone, every
+  // node and every brain-outline point is inside the panel, in 3D and in 2D.
+  {
+    const B2 = window.BrainGraph;
+    let rect = { left: 0, top: 0, width: 1280, height: 800 };
+    const v = bareView("brain");
+    v.host = { wrap: { getBoundingClientRect: () => rect }, glCanvas: {}, flatCanvas: {} };
+    v.showNodes({ relations: [], edges: [], nodes: Array.from({ length: 400 }, (_, i) => ({ id: "p" + i, label: "p", kind: kinds[i % kinds.length], links: i % 7 })) });
+    delete v.fit;
+    const outside = () => {
+      const f = v.camera.frame(rect.width, rect.height), k = v.brainScale;
+      const pts = v.nodes.map((n) => v.drawnPos(n)).concat(B2.BRAIN_MESHES.flatMap((m) => m.points.map((q) => v.drawnPos({ pos: q.map((x) => x * k) }))));
+      return pts.filter((p) => { const s = project(f, p[0], p[1], p[2], 0); return !s || s.x < 0 || s.y < 0 || s.x > rect.width || s.y > rect.height; }).length;
+    };
+    v.resize(); assert.strictEqual(outside(), 0, "desktop fit keeps everything inside");
+    rect = { left: 0, top: 0, width: 390, height: 520 }; v.resize();
+    assert.strictEqual(outside(), 0, "resize to 390x520 refits: nodes and brain outline inside");
+    v.camera.dist = 5; v.fit(false); assert.strictEqual(outside(), 0, "fit from a zoomed-in camera, portrait");
+    v.camera.flat = true; v.fit(false); assert.strictEqual(outside(), 0, "flat (2D) fit, portrait");
+    v.camera.flat = false; v.zoom(1e-6); assert.strictEqual(v.camera.dist, 20, "zoom limits unchanged");
+    // The old vertical-only fit would clip this panel: the regression is real.
+    const half = FOV_CHECK => Math.atan(Math.tan(FOV_CHECK / 2) * (390 / 520));
+    assert.ok(half(50 * Math.PI / 180) < 25 * Math.PI / 180, "portrait horizontal half-angle is the narrower one");
+  }
+  // Leaving the stage clears the hover text.
+  {
+    const listeners = {}, texts = [];
+    const v = bareView("brain");
+    v.host = { wrap: { addEventListener: (t, fn) => { listeners[t] = fn; }, style: {} }, onHoverText: (n) => texts.push(n) };
+    v.bindInput(); v.hover = "n1"; listeners.pointerleave({});
+    assert.strictEqual(v.hover, null); assert.deepStrictEqual(texts, [null], "hover text cleared on pointerleave");
+  }
+  // Other layouts and the cluster overview draw no brain.
+  {
+    const rec = recorder(), v = bareView("group"); v.host = { brainCanvas: rec.canvas }; v.size = { width: 900, height: 600, ratio: 1 };
+    v.showNodes(doc); v.drawBrain(v.camera.frame(900, 600), style);
+    assert.strictEqual(rec.log.texts.length + rec.log.ops, 0, "no brain outside the brain layout");
+  }
+  // The page: nothing injected as HTML, no remote code, brain is a real option.
+  const html = fs.readFileSync(path.join(__dirname, "../brain-cli/assets/explorer.html"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "../brain-cli/assets/graph3d.js"), "utf8");
+  for (const text of [html, js]) for (const marker of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "<script src=\"http"]) {
+    assert.ok(!text.includes(marker), "no " + marker);
+  }
+  assert.ok(/<option value="brain"/.test(html) && /id="brainCanvas"/.test(html) && /brainCanvas \{ pointer-events: none/.test(html));
+  assert.ok(/Это не весь мозг/.test(html), "the page says the counts are of the drawn sample");
+  assert.ok(!/requestAnimationFrame\(\s*\(\)\s*=>\s*this\.render|setInterval/.test(js), "no idle animation loop");
 }
 console.log("graph3d tests: ok");

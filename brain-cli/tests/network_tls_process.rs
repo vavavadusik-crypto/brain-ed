@@ -946,3 +946,87 @@ fn expired_certificate_and_key_descriptor_negatives() {
     assert!(!output.status.success());
     let _ = fs::remove_dir_all(root);
 }
+
+/// LAN binding is opt-in and validated before anything is bound; this test
+/// never binds a non-loopback interface.
+#[test]
+fn lan_listen_and_dial_are_refused_without_opt_in_or_for_wide_addresses() {
+    let root = std::env::temp_dir().join(format!("brain-lan-cli-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("root");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("home");
+    let state = root.join("state");
+    let run = |args: &[&str]| -> (i32, Value) {
+        let output = brain(&home).args(args).output().expect("spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let document =
+            serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("not JSON: {stdout:?}"));
+        (output.status.code().unwrap_or(-1), document)
+    };
+    let state_arg = state.to_str().expect("utf8");
+    let serve = |listen: &str, allow: bool| {
+        let mut args = vec![
+            "net",
+            "serve",
+            "--state-dir",
+            state_arg,
+            "--cert",
+            "absent.crt",
+            "--key",
+            "absent.key",
+            "--listen",
+            listen,
+        ];
+        if allow {
+            args.push("--allow-lan");
+        }
+        run(&args)
+    };
+    let (code, document) = serve("192.168.77.10", false);
+    assert_eq!(code, 2, "{document}");
+    assert!(document.to_string().contains("opt-in"), "{document}");
+    for wide in [
+        "0.0.0.0",
+        "::",
+        "224.0.0.1",
+        "255.255.255.255",
+        "169.254.1.1",
+        "8.8.8.8",
+    ] {
+        let (code, document) = serve(wide, true);
+        assert_eq!(code, 2, "{wide}: {document}");
+        assert!(
+            document.to_string().contains("private unicast"),
+            "{document}"
+        );
+    }
+    let (code, document) = serve("brain.lan", true);
+    assert_eq!(code, 2, "{document}");
+    assert!(!state.exists(), "a refused bind creates no state");
+
+    let status = |dial: &str, allow: bool| {
+        let mut args = vec![
+            "net",
+            "status",
+            "--dial",
+            dial,
+            "--server-name",
+            "192.168.77.10",
+            "--ca",
+            "absent-ca.pem",
+            "--credential",
+            "absent.cred",
+        ];
+        if allow {
+            args.push("--allow-lan-dial");
+        }
+        run(&args)
+    };
+    let (code, document) = status("192.168.77.10:7443", false);
+    assert_eq!(code, 2, "{document}");
+    assert!(document.to_string().contains("loopback"), "{document}");
+    let (code, document) = status("0.0.0.0:7443", true);
+    assert_eq!(code, 2, "{document}");
+    let _ = fs::remove_dir_all(root);
+}

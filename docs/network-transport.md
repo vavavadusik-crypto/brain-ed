@@ -1,6 +1,6 @@
 # brain-coord/1 network transport
 
-Status: loopback core stage (phase 6). Date: 2026-10-09.
+Status: loopback core stage (phase 6), LAN opt-in gate (TLS only). Date: 2026-10-09.
 
 ## What this is — and is not
 
@@ -70,9 +70,10 @@ Identity comes from the credential, never from the request body:
 
 * Binds `127.0.0.1` only. A loopback `Host` header is required; `Origin` is
   refused; a token in the query string is refused before parsing.
-* Remote binding without TLS is refused by design. The TLS listener
-  (below) also binds `127.0.0.1` only; a LAN listener is a separate,
-  explicit host-admin deployment gate that no command offers yet.
+* Remote binding without TLS is refused by design: the plaintext server is
+  hard-wired to `127.0.0.1`. The TLS listener (below) binds `127.0.0.1` by
+  default; a private LAN address needs the explicit opt-in described in
+  "LAN opt-in".
 * Bounds: 8 KiB header block, 64 KiB body, 64 concurrent connections, 5 s
   read timeout, chunked transfer refused. Oversize answers 413/431 or the
   connection is closed — never a fabricated success.
@@ -99,7 +100,8 @@ Identity comes from the credential, never from the request body:
   `--ca` file ONLY — no system roots, no trust-all, no plaintext fallback —
   and checks the certificate SAN against `--server-name`.
 * The client **never resolves names**. `--dial` is a numeric loopback
-  `IP:PORT` (hostnames, LAN and unspecified addresses are `invalid_config`);
+  `IP:PORT` by default (hostnames and unspecified addresses are always
+  `invalid_config`; a LAN address only with `--allow-lan-dial`);
   the certificate name is a separate argument. One absolute deadline
   (`--deadline-ms`, 50..=5000) bounds connect + handshake + request +
   response; every socket operation gets only the time left.
@@ -139,9 +141,48 @@ brain [--space S] net call <same connection flags> whoami|board|show|claims|add|
   `release`, `depend` carry none; their `unknown_outcome` says to query
   (`verify`/`show`) first. Nothing retries automatically.
 
+## LAN opt-in (TLS only)
+
+Loopback stays the default. `brain net serve --listen <IP> --allow-lan`
+binds the TLS listener on one numeric address; `status`/`call` dial it with
+`--allow-lan-dial`. Both sides use the same validator (`checked_listen_ip`):
+
+* Loopback (`127.0.0.0/8`, `::1`) is always allowed and needs no flag.
+* Any other address needs the affirmative opt-in AND must be private
+  unicast: IPv4 RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) or IPv6
+  unique-local (`fc00::/7`).
+* Always refused, even with the opt-in: unspecified/wildcard (`0.0.0.0`,
+  `::`), multicast, broadcast, link-local (`169.254/16`, `fe80::/10`),
+  IPv4-mapped IPv6, CGNAT `100.64/10`, documentation ranges and every public
+  address. Hostnames are never resolved. The check runs before any key is
+  loaded, store opened or socket bound.
+* "Broadcast" here means the limited broadcast `255.255.255.255` only. A
+  subnet-directed broadcast or network address (e.g. `192.168.1.255`,
+  `192.168.1.0`) cannot be classified without the netmask and is NOT caught
+  by the validator; the operator must pass the host's own unicast address.
+* Nothing else changes: mandatory TLS with a pinned owner CA, certificate
+  name verification, owner-only key/credential files, enrolled
+  machine/agent credentials, the space allowlist, default-deny sharing
+  grants, `Origin` refusal and the absolute deadline.
+* Required for any explicit `--listen` IP (LAN, `::1` or an alternate
+  `127.x.y.z`): the server certificate MUST carry an IP SAN equal to the
+  listen IP, and clients MUST pass exactly that IP as `--server-name`. The
+  listener accepts `Host` equal to its exact bound IP (bare, `[v6]` or with
+  port) besides the loopback names; any other Host is 403. A DNS-name SAN
+  is not supported for LAN (there is no name registry).
+* Not provided: name registry, discovery, RBAC beyond the existing roles,
+  remote archive access, unauthenticated endpoints. The opt-in has been
+  validated with simulated addresses and loopback sockets only; no claim
+  is made about fleet or production LAN deployment.
+* Experimental. There is no rate limiting: the 64-connection global cap,
+  header/body bounds and the absolute deadline also apply to
+  unauthenticated peers, so any host that can reach the port can exhaust
+  the 64 slots (deny of service, not a bypass). An operator firewall that
+  admits only the intended hosts is REQUIRED for LAN use.
+
 ## Not in this stage
 
-LAN binding, MCP forwarding to a remote coordinator, memory/archive
+MCP forwarding to a remote coordinator, memory/archive
 sharing (a separate sharing core; not routed through brain-coord/1),
 credential rotation UI, hooks, benchmarks.
 
