@@ -1,5 +1,56 @@
 # Validation of the Linux previews
 
+## 0.1.2 source preparation — local checks observed by the maintainer
+
+The 0.1.2 source preparation raises the workspace version and adds the Linux
+x86_64 bundle module (`tools/package-linux.py`, `packaging/install-linux.sh`,
+`tests/test_linux_bundle.py`, the manual build-only
+`.github/workflows/linux-bundle.yml`; see
+[linux-download.md](linux-download.md)). At the time of writing this source
+preparation was not published when these checks were recorded. The maintainer observed these local checks
+(phase 77) on the combined 0.1.2 source; this file records the reported
+results and does not reproduce them:
+
+| Check | Observed result |
+|---|---|
+| All 13 local gates | passed |
+| Rust workspace, all features | 473 passed |
+| Rust workspace, no default features | 468 passed |
+| Clippy, both feature sets, `-D warnings` | passed |
+| `cargo fmt --check` | passed |
+| Node suites | 2 passed |
+| Licence check (247 crates) and parser self-test | passed |
+| Release build | passed |
+| Python suites | 116 passed |
+| Collector on tmpfs | 29 passed |
+| Linux bundle suite (31 tests) against the actual 0.1.2 binary, normal user uid 1000 | 30 passed, 1 skipped (the root-refusal test runs only as root) |
+
+The bundle suite covers: SHA256SUMS with a NUL byte refused
+before the binary runs; existing outputs and symlinks never overwritten (O1);
+strict repository URLs and scanned generated metadata (S1); extraction with
+real GNU tar; two desktop and two menu launchers in a synthetic HOME; and
+uninstall keeping the database and settings.
+
+Source secret scan: Gitleaks reported 26 findings. All are byte-identical to
+synthetic test fixtures and API identifiers already in the public a9c7134
+source, and were reviewed; no actual secret was found in the checked source.
+This is not a formal or global security audit.
+
+Not verified: the bundle workflow on GitHub (it has no recorded CI run), the
+bundle's ABI and portability beyond its build system, any CI run of this
+preparation, and any provenance. Known workflow issue: with the pinned
+`actions/checkout`, disabling sparse checkout and then unsetting
+`extensions.worktreeConfig` leaves `.git/config.worktree` behind. This was
+confirmed locally with git 2.53, and the packager refuses that source as
+intended. The workflow now builds, packages and tests from an ordinary clone
+of that checked-out commit; a local regression passed, but the real runner
+has not been tested. Other git versions were not checked. Bundle checksums
+come from the same download, are not signed and
+do not authenticate it. Brain ED remains a standalone preview: no enterprise,
+complete-capture or fleet claims. The 0.1.1 results below were measured on
+0.1.1 and are kept as dated historical evidence; they were not rerun for
+0.1.2.
+
 ## 0.1.1 local release checks — 2026-10-10
 
 The combined LAN, remote MCP, memory explorer and installer candidate was

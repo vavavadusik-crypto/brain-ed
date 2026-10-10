@@ -1,8 +1,10 @@
-# Installing Brain ED 0.1.1 (early preview)
+# Installing Brain ED 0.1.2 (early preview)
 
 Supported: **Linux (x86_64 glibc)** from source. macOS and Windows are not
 supported in this preview: the source uses Unix-only APIs and `/proc/self`
-ownership checks, and CI runs only on Linux. No binary releases exist yet.
+ownership checks, and CI runs only on Linux. No binary release has been
+published yet; see [Prebuilt bundle](#prebuilt-bundle-only-when-a-release-lists-one)
+for when one can be used.
 
 ## Prerequisites
 
@@ -71,6 +73,21 @@ target/release/brain ui --install-shortcut
 
 Without launchers, run `~/.brain/bin/brain` or `target/release/brain` directly
 or put either on `PATH`.
+
+## Prebuilt bundle (only when a release lists one)
+
+Use a Linux x86_64 bundle only if the GitHub release page lists
+`brain-ed-<version>-linux-x86_64.tar.gz`; otherwise install from source as
+above. After unpacking, run `./install-linux.sh --dry-run`, then
+`./install-linux.sh`. The installer checks the unpacked files against their
+checksums before it runs the bundled binary, refuses root, and then runs
+the same `brain ui --install-shortcut` step, producing the same two
+launchers. `./install-linux.sh --uninstall` removes the launchers and the desktop binary
+copy when no managed agent installation owns it; databases and settings are kept.
+The binary is a dynamic glibc build; distributions other than the one it
+was built on are untested. The checksums detect damage only; they are not
+provenance. Format, checks and limits:
+[docs/linux-download.md](linux-download.md).
 
 ## Optional components
 

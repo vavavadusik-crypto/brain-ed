@@ -1,0 +1,76 @@
+name: Linux bundle (build only)
+
+# Started by hand only. Builds the release binary from a plain clone of the
+# checked-out commit, packages it with tools/package-linux.py, checks it and
+# runs the bundle tests,
+# then uploads the archive as a workflow artifact. It publishes nothing: no
+# release, no tag, no package registry, no OIDC token, read-only repository
+# access. The binary is a dynamic glibc build from the ubuntu-24.04 runner;
+# its portability to other distributions is not proven by this workflow.
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build and check Linux x86_64 bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.97.1
+      # The packager accepts only a plain clone: actions/checkout runs
+      # `git sparse-checkout disable`, which can leave .git/config.worktree
+      # behind, and the packager refuses that by design. So the trusted
+      # checkout is cloned once more, ordinarily, and everything below (build,
+      # package, tests) uses that clone at exactly GITHUB_SHA. Neither the
+      # checkout metadata nor the packager checks are changed.
+      - name: Make an ordinary clone of the checked-out commit
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-hardlinks -- "$GITHUB_WORKSPACE" "$RUNNER_TEMP/src"
+          git -C "$RUNNER_TEMP/src" checkout --quiet --detach "$GITHUB_SHA"
+          test "$(git -C "$RUNNER_TEMP/src" rev-parse --verify 'HEAD^{commit}')" = "$GITHUB_SHA"
+          test ! -e "$RUNNER_TEMP/src/.git/config.worktree"
+      # No build cache: a release input must not come from a shared cache.
+      # target/ and dist/ stay in RUNNER_TEMP, outside the clone.
+      - name: Build release binary with remapped paths
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+          # rustc and gcc give the LAST matching prefix map priority, so the
+          # more specific clone path comes after RUNNER_TEMP. Not yet proven on
+          # a real runner: the packager's path scan is the check.
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build/brain-ed --remap-path-prefix=$RUNNER_TEMP=/runner-temp --remap-path-prefix=$RUNNER_TEMP/src=/build/brain-ed --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
+          export CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/build/brain-ed -ffile-prefix-map=$RUNNER_TEMP=/runner-temp -ffile-prefix-map=$RUNNER_TEMP/src=/build/brain-ed -ffile-prefix-map=$HOME/.cargo=/cargo"
+          cargo build --locked --release -p brain-cli --target-dir "$RUNNER_TEMP/target"
+      - name: Package and verify
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+          python3 -B tools/package-linux.py build --binary "$RUNNER_TEMP/target/release/brain" \
+            --source "$RUNNER_TEMP/src" --commit "$GITHUB_SHA" --out "$RUNNER_TEMP/dist" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          python3 -B tools/package-linux.py verify "$RUNNER_TEMP"/dist/brain-ed-*-linux-x86_64.tar.gz
+          (cd "$RUNNER_TEMP/dist" && sha256sum ./*.tar.gz)
+      # Synthetic HOME only; the runner's real home and desktop are not touched.
+      - name: Bundle tests against the built binary
+        env:
+          BRAIN_BIN: ${{ runner.temp }}/target/release/brain
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/src"
+          python3 -B -m unittest -v tests.test_linux_bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: brain-ed-linux-x86_64-bundle
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

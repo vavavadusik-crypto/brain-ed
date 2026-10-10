@@ -3,6 +3,51 @@
 All notable changes are listed here. Versions follow semantic versioning;
 `0.x` releases may change formats and interfaces.
 
+## [0.1.2] — unreleased (early preview)
+
+### Added
+- Linux x86_64 download bundle module (this entry does not mean a bundle is
+  published; use one only if a release lists it):
+  `tools/package-linux.py build|verify`, `packaging/install-linux.sh`,
+  `docs/linux-download.md` and `tests/test_linux_bundle.py`, plus a manual,
+  build-only workflow (`.github/workflows/linux-bundle.yml`). The workflow is
+  started by hand, has read-only repository access, uploads a workflow
+  artifact and publishes no release.
+- The packager bundles an already built `brain` with LICENSE, notices and
+  docs read from one exact, clean commit. It refuses, before writing:
+  - a dirty or mismatched source;
+  - repository configuration that can run programs, worktree configs,
+    submodules or extensions, all checked before git runs;
+  - an unsafe or existing output;
+  - a malformed ELF;
+  - any bundled or generated file containing private paths or
+    secret-looking tokens.
+- `verify` (a packager/CI tool) checks bounded size, canonical unique paths,
+  the exact layout and plain file types, a strict `SHA256SUMS`, and a strict
+  manifest that agrees with the files and the bundled ELF.
+- The bundle installer refuses entries not owned by the user or
+  group/world-writable, refuses a `SHA256SUMS` containing NUL bytes or
+  changing size, checks every file against a single bounded snapshot of it,
+  and runs a private copy of the binary checked against that snapshot. It
+  never uses sudo, installs only the two launchers and keeps `~/.brain` data
+  on uninstall. It sets up no agents, collector, listener or model download.
+  Same-user tampering is not prevented.
+- The packager admits only a plain-clone `.git/config` (byte, line and key
+  checks) before any git command runs.
+
+### Limits
+- Checksums and the manifest detect damage only. The recorded source commit
+  is a packaging claim, not build provenance. Nothing is signed.
+- Portability is unproven: a dynamic glibc build. The manual workflow builds
+  on Ubuntu 24.04 (glibc 2.39) and the manifest records the highest glibc
+  symbol version. Other distributions, musl and non-x86_64 are untested or
+  unsupported. The workflow's behaviour on GitHub is not verified; as pinned,
+  `actions/checkout` can leave `.git/config.worktree`, which the packager
+  refuses; it now builds and packages from an ordinary clone of that
+  checkout. A real runner check is still needed.
+- Workspace version 0.1.2 (`brain-core`, `brain-cli`); no dependency changes.
+  Installing from source remains the supported path.
+
 ## [0.1.1] — 2026-10-10 (early preview)
 
 ### Added and improved

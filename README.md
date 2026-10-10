@@ -7,7 +7,7 @@ The image uses twelve synthetic projects. It illustrates the project map; it
 does not show a deployed fleet or complete conversation-history graph.
 [Русская версия](README.ru.md)
 
-**0.1.1 — early preview. Linux only.**
+**0.1.2 — early preview. Linux x86_64 only.**
 
 Brain ED is a local-first personal memory and task-coordination engine for AI
 coding agents, written in Rust on SQLite. The command and package are named
@@ -65,6 +65,49 @@ the source.
   below; there is no formal verification or external audit. See
   [SECURITY.md](SECURITY.md) and [docs/SECURITY.md](docs/SECURITY.md).
 
+## Install on Linux x86_64
+
+There are two ways in. Both install the same two launchers — **Brain ED
+Settings** and **Brain ED Graph** — in the application menu, and also on the
+desktop when an XDG desktop directory exists.
+
+1. **From source (works today).** Needs Rust and a C compiler; see
+   [Install from source](#install-from-source-linux) below.
+2. **Prebuilt bundle (only if the release you use lists one).** Check that
+   release on the repository's GitHub *Releases* page. If it lists an asset
+   named `brain-ed-<version>-linux-x86_64.tar.gz`, you can use it; if not,
+   build from source. A bundle needs no Rust or compiler:
+
+   ```console
+   tar -xzf brain-ed-<version>-linux-x86_64.tar.gz
+   cd brain-ed-<version>-linux-x86_64
+   ./install-linux.sh --dry-run    # checks the bundle, writes nothing
+   ./install-linux.sh              # checks again, then installs for this user
+   ./install-linux.sh --uninstall  # launchers out; ~/.brain data kept
+   ```
+
+   The bundle's binary is linked dynamically against glibc. If it was built by
+   the manual workflow, it was built on Ubuntu 24.04 (glibc 2.39), and its
+   `MANIFEST.json` records the highest glibc symbol version it needs. Older
+   glibc and other distributions are **untested**, so portability is not
+   proven. Windows, macOS and non-x86_64 machines are not supported. The
+   bundle's `SHA256SUMS` and manifest come from the same download and are not
+   signed: they detect a damaged or partial download, but they do not
+   authenticate the bundle or prove who built it. Details:
+   [docs/linux-download.md](docs/linux-download.md).
+
+Neither path sets up agent integration, the archive collector, a network
+listener or a model download. Each stays a separate explicit step: for
+example, MCP setup for Claude Code, Codex or Cursor is
+`brain init --agents --dry-run`, then `--yes` after review (see
+[Connecting agents](docs/INSTALL.md#connecting-agents-claude-code-codex-cursor)).
+
+Maintainers: `.github/workflows/linux-bundle.yml` is a manual, build-only
+workflow. It is started by hand, has read-only repository access, uploads the
+bundle as a workflow artifact and publishes nothing. Its behaviour on GitHub,
+the bundle's ABI on other systems and any provenance are not verified by
+these docs.
+
 ## Install from source (Linux)
 
 Prerequisites: a Rust toolchain via rustup (`rust-toolchain.toml` pins the
@@ -114,6 +157,7 @@ brain model install                          # optional: explicit embedding down
 
 - [docs/VALIDATION.md](docs/VALIDATION.md) — release checks and verification limits
 - [docs/INSTALL.md](docs/INSTALL.md) — install, launchers, uninstall
+- [docs/linux-download.md](docs/linux-download.md) — Linux x86_64 bundle format, checks and limits
 - [docs/SECURITY.md](docs/SECURITY.md) — threat model and data boundaries
 - [docs/coordination.md](docs/coordination.md), [docs/network-transport.md](docs/network-transport.md),
   [docs/shared-memory.md](docs/shared-memory.md) — coordination, TLS, sharing
