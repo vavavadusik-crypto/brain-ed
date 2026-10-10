@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use crate::client_home::ClientHomes;
+
 const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 
 fn bounded_text(path: &Path) -> Option<String> {
@@ -35,10 +37,36 @@ fn this_process() -> Value {
 }
 
 pub(crate) fn document(home: &Path, brain_home: &Path, now: i64) -> Value {
-    let claude = json_file(&home.join(".claude.json"));
-    let settings = json_file(&home.join(".claude/settings.json"));
-    let codex = bounded_text(&home.join(".codex/config.toml"));
-    let codex_hooks = bounded_text(&home.join(".codex/hooks.json"));
+    document_with(
+        home,
+        brain_home,
+        now,
+        &crate::client_home::from_process_env(home),
+    )
+}
+
+/// A relocated client's default files are not read: a stale marker there says
+/// nothing about the configuration the client actually uses.
+pub(crate) fn document_with(
+    home: &Path,
+    brain_home: &Path,
+    now: i64,
+    homes: &ClientHomes,
+) -> Value {
+    let claude_relocated = homes.claude.state.relocated();
+    let codex_relocated = homes.codex.state.relocated();
+    let claude = (!claude_relocated)
+        .then(|| json_file(&home.join(".claude.json")))
+        .flatten();
+    let settings = (!claude_relocated)
+        .then(|| json_file(&home.join(".claude/settings.json")))
+        .flatten();
+    let codex = (!codex_relocated)
+        .then(|| bounded_text(&home.join(".codex/config.toml")))
+        .flatten();
+    let codex_hooks = (!codex_relocated)
+        .then(|| bounded_text(&home.join(".codex/hooks.json")))
+        .flatten();
     let activity = crate::activity::document(brain_home, now);
     let damaged = activity["invalid_records"].as_u64().unwrap_or(0) > 0
         || activity["future_records"].as_u64().unwrap_or(0) > 0;
@@ -62,10 +90,23 @@ pub(crate) fn document(home: &Path, brain_home: &Path, now: i64) -> Value {
             ),
             _ => (None, None),
         };
+        let (location, support) = match client {
+            "claude" => (homes.claude, "supported"),
+            "codex" => (homes.codex, "supported"),
+            _ => (homes.hermes, "unsupported"),
+        };
+        let support = if support == "supported" && location.state.relocated() {
+            "relocated_not_followed"
+        } else {
+            support
+        };
         json!({
             "client": client,
             "mcp_config_entry_present": mcp,
             "hook_config_marker_present": hooks,
+            "config_location": location.location(),
+            "mcp_support": support,
+            "hook_support": support,
             "runtime_handshake": "not_checked",
             "last_observed_event": observed,
             "transcript_capture": crate::archive::collector_switch(brain_home),
@@ -85,6 +126,7 @@ pub(crate) fn document(home: &Path, brain_home: &Path, now: i64) -> Value {
             "Configuration markers do not prove a successful client handshake.",
             "Activity is a bounded journal tail, not a complete conversation archive.",
             "Missing, invalid or oversized configuration is reported as unknown.",
+            "A client whose home variable points elsewhere is reported as unknown; its relocated home is never read.",
             "No database, model, network or external process is opened by this command.",
             "Hermes operational-graph import is not Hermes conversation capture.",
             "this_process describes only this doctor run; already running `brain serve` processes keep the binary they started with until their client reconnects them."
@@ -95,6 +137,85 @@ pub(crate) fn document(home: &Path, brain_home: &Path, now: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn relocated_clients_report_unknown_markers_and_no_override_value() {
+        let root =
+            std::env::temp_dir().join(format!("brain-doctor-relocated-{}", std::process::id()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        // Stale markers in the default locations.
+        std::fs::write(home.join(".claude.json"), r#"{"mcpServers":{"brain":{}}}"#).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"hooks":"brain hook"}"#,
+        )
+        .unwrap();
+        std::fs::write(home.join(".codex/config.toml"), "[mcp_servers.brain]\n").unwrap();
+        std::fs::write(home.join(".codex/hooks.json"), "brain hook").unwrap();
+        let brain_home = home.join(".brain");
+        let unset = crate::client_home::classify_all(&home, None, None, None);
+        let legacy = document_with(&home, &brain_home, 1000, &unset);
+        for index in [0, 1] {
+            assert_eq!(legacy["clients"][index]["mcp_config_entry_present"], true);
+            assert_eq!(legacy["clients"][index]["hook_config_marker_present"], true);
+            assert_eq!(legacy["clients"][index]["mcp_support"], "supported");
+            assert_eq!(
+                legacy["clients"][index]["config_location"]["state"],
+                "unset"
+            );
+        }
+        assert_eq!(
+            legacy["clients"][2]["mcp_config_entry_present"],
+            Value::Null
+        );
+        assert_eq!(legacy["clients"][2]["hook_support"], "unsupported");
+
+        let forbidden = root.join("forbidden-override");
+        let relocated = crate::client_home::classify_all(
+            &home,
+            Some(OsStr::new("/synthetic/forbidden-override")),
+            Some(OsStr::new("private/codex-profile")),
+            Some(OsStr::new("/private/hermes-profile")),
+        );
+        let result = document_with(&home, &brain_home, 1000, &relocated);
+        for (index, variable, state) in [
+            (0, "CLAUDE_CONFIG_DIR", "unsupported_override"),
+            (1, "CODEX_HOME", "unresolved_override"),
+        ] {
+            let client = &result["clients"][index];
+            assert_eq!(client["mcp_config_entry_present"], Value::Null);
+            assert_eq!(client["hook_config_marker_present"], Value::Null);
+            assert_eq!(client["config_location"]["variable"], variable);
+            assert_eq!(client["config_location"]["state"], state);
+            assert_eq!(client["mcp_support"], "relocated_not_followed");
+            assert_eq!(client["hook_support"], "relocated_not_followed");
+            assert_eq!(client["runtime_handshake"], "not_checked");
+        }
+        assert_eq!(
+            result["clients"][2]["config_location"]["state"],
+            "unsupported_override"
+        );
+        assert_eq!(result["clients"][2]["mcp_support"], "unsupported");
+        assert_eq!(result["misplaced_claude_mcp_entry"], false);
+        let text = result.to_string();
+        for leaked in ["forbidden", "private/", "profile", home.to_str().unwrap()] {
+            assert!(!text.contains(leaked), "{leaked}");
+        }
+        for client in result["clients"].as_array().unwrap() {
+            for key in ["mcp_config_entry_present", "hook_config_marker_present"] {
+                assert!(
+                    client[key].is_boolean() || client[key].is_null(),
+                    "{key} type"
+                );
+            }
+        }
+        assert!(!forbidden.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn missing_installation_is_not_created_or_called_healthy() {
         let root = std::env::temp_dir().join(format!("brain-doctor-absent-{}", std::process::id()));

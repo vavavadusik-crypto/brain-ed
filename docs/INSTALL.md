@@ -1,10 +1,12 @@
-# Installing Brain ED 0.1.2 (early preview)
+# Installing Brain ED 0.1.3 (early preview source)
 
 Supported: **Linux (x86_64 glibc)** from source. macOS and Windows are not
 supported in this preview: the source uses Unix-only APIs and `/proc/self`
-ownership checks, and CI runs only on Linux. No binary release has been
-published yet; see [Prebuilt bundle](#prebuilt-bundle-only-when-a-release-lists-one)
-for when one can be used.
+ownership checks, and CI runs only on Linux. Use a matching prebuilt bundle
+only when that release lists one; otherwise build from source. A bundle
+installs the version it was built from. See
+[Prebuilt bundle](#prebuilt-bundle-only-when-a-release-lists-one).
+
 
 ## Prerequisites
 
@@ -78,7 +80,9 @@ or put either on `PATH`.
 
 Use a Linux x86_64 bundle only if the GitHub release page lists
 `brain-ed-<version>-linux-x86_64.tar.gz`; otherwise install from source as
-above. After unpacking, run `./install-linux.sh --dry-run`, then
+above. A bundle installs the version it was built from; at this stage the
+release page lists the available versions. After unpacking, run
+`./install-linux.sh --dry-run`, then
 `./install-linux.sh`. The installer checks the unpacked files against their
 checksums before it runs the bundled binary, refuses root, and then runs
 the same `brain ui --install-shortcut` step, producing the same two
@@ -115,6 +119,14 @@ Check the exact flags of your build first: `brain init --help`,
    JSON record; it is not a per-client integration report.
 4. **Reconnect.** Restart or reconnect the MCP clients (e.g. reopen the
    session) so they load Brain's tools. Do not kill running servers blindly.
+
+If `CLAUDE_CONFIG_DIR` or `CODEX_HOME` points somewhere other than the default
+`~/.claude` or `~/.codex`, `brain init --agents` leaves that client alone. It
+does not read or write that client's default files, and it prints one
+`CONFLICT` line naming the variable and its state, never its value. Other
+clients are set up as usual. Relocated homes are not supported: Brain
+neither installs into them nor reads them. Hermes has no MCP or hook
+integration. Details: [mcp-and-hooks.md](mcp-and-hooks.md).
 
 ### What the integrator refuses instead of guessing
 
@@ -196,6 +208,12 @@ ownership marker. It deletes `~/.brain/bin/brain` only when no agent
 integration manifest still needs it. Databases, settings, archives and models
 under `~/.brain` are never removed; delete that directory yourself if you want
 the data gone.
+
+`brain uninstall` skips the entries of a client whose home variable points
+elsewhere and keeps the manifest, backups and binary. Running it again with
+the variable unset completes the uninstall. Files already restored are
+recognised and left as they are, and files you edited stay conflicts.
+Entries are matched against paths under the current `HOME`.
 
 ## Data locations
 

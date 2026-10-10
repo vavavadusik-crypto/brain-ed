@@ -7,11 +7,20 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::client_home::{ClientHome, ClientHomes};
+
 const MD_BEGIN: &str = "<!-- BRAIN_FOR_AI_BEGIN -->";
 const MD_END: &str = "<!-- BRAIN_FOR_AI_END -->";
 const CONFIG_BEGIN: &str = "# BRAIN_FOR_AI_BEGIN";
 const CONFIG_END: &str = "# BRAIN_FOR_AI_END";
 const DESKTOP_COPY_OWNER: &str = "desktop-shortcut-owner";
+/// Bounds for the files `brain uninstall` reads. The manifest Brain writes is
+/// a few KiB; client configuration files (and so their backups) can be large.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_CLIENT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// `O_NOFOLLOW` where its value is known without a new dependency.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+const O_NOFOLLOW: i32 = 0o400000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentClient {
@@ -41,12 +50,14 @@ struct PlannedChange {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct InstallManifest {
     version: u32,
     entries: Vec<ManifestEntry>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestEntry {
     path: PathBuf,
     existed: bool,
@@ -63,10 +74,30 @@ pub(crate) fn install(
     dry_run: bool,
     yes: bool,
 ) -> Result<usize, Box<dyn Error>> {
+    let homes = crate::client_home::from_process_env(home);
+    install_with(home, brain_home, binary, dry_run, yes, &homes)
+}
+
+fn install_with(
+    home: &Path,
+    brain_home: &Path,
+    binary: &Path,
+    dry_run: bool,
+    yes: bool,
+    homes: &ClientHomes,
+) -> Result<usize, Box<dyn Error>> {
     validate_versionless_binary(binary)?;
-    let clients = detect_clients(home);
+    let skipped = relocated_clients(homes);
+    for (client, location) in &skipped {
+        println!("{}", relocation_conflict(*client, *location, "install"));
+    }
+    let clients = detect_clients(home, homes);
     if clients.is_empty() {
-        println!("No supported agents detected; nothing to change.");
+        if skipped.is_empty() {
+            println!("No supported agents detected; nothing to change.");
+        } else {
+            println!("No other supported agents detected; nothing to change.");
+        }
         return Ok(0);
     }
     println!(
@@ -214,22 +245,105 @@ fn rollback_plans(prepared: &[(&PlannedChange, ManifestEntry)]) {
 }
 
 pub(crate) fn uninstall(
+    home: &Path,
     brain_home: &Path,
     dry_run: bool,
     yes: bool,
 ) -> Result<usize, Box<dyn Error>> {
+    let homes = crate::client_home::from_process_env(home);
+    uninstall_with(home, brain_home, dry_run, yes, &homes)
+}
+
+fn uninstall_with(
+    home: &Path,
+    brain_home: &Path,
+    dry_run: bool,
+    yes: bool,
+    homes: &ClientHomes,
+) -> Result<usize, Box<dyn Error>> {
     let manifest_path = brain_home.join("install-manifest.json");
-    if !manifest_path.exists() {
+    // The whole manifest is checked before any client file or backup is read
+    // or changed: its location, its file, and every entry against the exact
+    // paths and backup names Brain itself writes.
+    let refuse = |what: String| -> Box<dyn Error> {
+        format!("refusing to uninstall: {what}; nothing was changed").into()
+    };
+    if !private_dir(brain_home).map_err(|error| refuse(format!("Brain home: {error}")))? {
         println!("No Brain agent installation manifest found; nothing to remove.");
         return Ok(0);
     }
-    let manifest: InstallManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let Some(bytes) = read_no_follow(&manifest_path, MAX_MANIFEST_BYTES, true)
+        .map_err(|error| refuse(format!("install manifest: {error}")))?
+    else {
+        println!("No Brain agent installation manifest found; nothing to remove.");
+        return Ok(0);
+    };
+    let manifest: InstallManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| refuse(format!("install manifest is not valid: {error}")))?;
+    validate_manifest(home, &manifest)
+        .map_err(|error| refuse(format!("install manifest: {error}")))?;
     let backup_dir = brain_home.join("install-backups");
-    let mut restored = 0_usize;
+    let backups_present =
+        private_dir(&backup_dir).map_err(|error| refuse(format!("install-backups: {error}")))?;
+    // Entries for a relocated client are matched on the exact default paths
+    // only and skipped before their current file or backup is read; the
+    // manifest, backups and stable binary are then kept.
+    let relocated = relocated_clients(homes);
+    let guarded = relocated
+        .iter()
+        .flat_map(|(client, _)| default_client_paths(home, *client))
+        .collect::<Vec<_>>();
+    for (client, location) in &relocated {
+        if manifest
+            .entries
+            .iter()
+            .any(|entry| default_client_paths(home, *client).contains(&entry.path))
+        {
+            println!("{}", relocation_conflict(*client, *location, "restore"));
+        }
+    }
+    // Pass 1 reads and classifies every eligible entry and verifies each
+    // needed backup before anything is changed.
     let mut skipped = false;
+    let mut completed = 0_usize;
+    let mut planned = Vec::new();
     for entry in &manifest.entries {
-        let current = fs::read(&entry.path).ok();
-        if current.as_deref().map(sha256).as_deref() != Some(entry.after_sha256.as_str()) {
+        if guarded.contains(&entry.path) {
+            skipped = true;
+            continue;
+        }
+        if let Err(reason) = symlink_free(home, &entry.path) {
+            println!(
+                "CONFLICT {}: {reason}; leaving it and its backup untouched",
+                entry.path.display()
+            );
+            skipped = true;
+            continue;
+        }
+        let current = match read_no_follow(&entry.path, MAX_CLIENT_FILE_BYTES, false) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                println!(
+                    "CONFLICT {}: file cannot be read; leaving it and its backup untouched",
+                    entry.path.display()
+                );
+                skipped = true;
+                continue;
+            }
+        };
+        let current_sha = current.as_deref().map(sha256);
+        // Restored by an earlier, partial uninstall: the original bytes are
+        // back, or a file Brain created is gone. Nothing is rewritten.
+        let already_restored = if entry.existed {
+            current_sha.is_some() && current_sha == entry.before_sha256
+        } else {
+            current.is_none()
+        };
+        if already_restored {
+            completed += 1;
+            continue;
+        }
+        if current_sha.as_deref() != Some(entry.after_sha256.as_str()) {
             println!(
                 "CONFLICT {}: file changed after installation; leaving it and its backup untouched",
                 entry.path.display()
@@ -237,11 +351,30 @@ pub(crate) fn uninstall(
             skipped = true;
             continue;
         }
-        let original = entry
-            .backup
-            .as_ref()
-            .map(|relative| fs::read(backup_dir.join(relative)))
-            .transpose()?;
+        let original = if entry.existed {
+            let relative = entry.backup.as_ref().ok_or("missing installation backup")?;
+            if !backups_present {
+                return Err("missing installation backup directory".into());
+            }
+            let bytes = read_no_follow(&backup_dir.join(relative), MAX_CLIENT_FILE_BYTES, true)
+                .map_err(|error| format!("installation backup: {error}"))?
+                .ok_or("missing installation backup")?;
+            if entry.before_sha256.as_deref() != Some(sha256(&bytes).as_str()) {
+                return Err(
+                    format!("backup checksum mismatch for {}", entry.path.display()).into(),
+                );
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        planned.push((entry, current, original));
+    }
+    if completed > 0 {
+        println!("{completed} file(s) were already restored by an earlier uninstall.");
+    }
+    let mut restored = 0_usize;
+    for (entry, current, original) in &planned {
         print!(
             "{}",
             render_diff(&entry.path, current.as_deref(), original.as_deref())
@@ -253,27 +386,20 @@ pub(crate) fn uninstall(
             skipped = true;
             continue;
         }
-        if entry.existed {
-            let bytes = original.as_deref().ok_or("missing installation backup")?;
-            atomic_write(&entry.path, bytes, entry.mode)?;
-            if entry.before_sha256.as_deref() != Some(sha256(bytes).as_str()) {
-                return Err(
-                    format!("backup checksum mismatch for {}", entry.path.display()).into(),
-                );
-            }
-        } else if entry.path.exists() {
-            fs::remove_file(&entry.path)?;
+        match original {
+            Some(bytes) => atomic_write(&entry.path, bytes, entry.mode)?,
+            None => fs::remove_file(&entry.path)?,
         }
         restored += 1;
     }
     if dry_run {
         println!(
             "Dry run: {} file(s) would be restored; no files written.",
-            manifest.entries.len()
+            planned.len()
         );
-        return Ok(0);
+        return Ok(planned.len());
     }
-    if !skipped && restored == manifest.entries.len() {
+    if !skipped && restored + completed == manifest.entries.len() {
         for entry in &manifest.entries {
             if let Some(relative) = &entry.backup {
                 let path = backup_dir.join(relative);
@@ -305,12 +431,238 @@ pub(crate) fn uninstall(
     Ok(restored)
 }
 
-fn detect_clients(home: &Path) -> Vec<AgentClient> {
+/// Clients whose home variable points away from the default location. They
+/// are left out of detection and planning entirely; only the variable name and
+/// state are reported, never its value.
+fn relocated_clients(homes: &ClientHomes) -> Vec<(AgentClient, ClientHome)> {
+    [
+        (AgentClient::Claude, homes.claude),
+        (AgentClient::Codex, homes.codex),
+    ]
+    .into_iter()
+    .filter(|(_, location)| location.state.relocated())
+    .collect()
+}
+
+/// Names the client, variable and state only; never the variable's value or
+/// a path.
+fn relocation_conflict(client: AgentClient, location: ClientHome, action: &str) -> String {
+    format!(
+        "CONFLICT {}: {} is {}; Brain does not follow relocated client homes, so this client's configuration was neither read nor written ({action} skipped).",
+        client.name(),
+        location.variable,
+        location.state.as_str()
+    )
+}
+
+/// The exact default files `build_plans` writes for a client.
+fn default_client_paths(home: &Path, client: AgentClient) -> Vec<PathBuf> {
+    match client {
+        AgentClient::Claude => vec![
+            home.join(".claude.json"),
+            home.join(".claude/settings.json"),
+            home.join(".claude/CLAUDE.md"),
+        ],
+        AgentClient::Codex => vec![
+            home.join(".codex/config.toml"),
+            home.join(".codex/hooks.json"),
+            home.join(".codex/AGENTS.md"),
+        ],
+        AgentClient::Cursor => vec![
+            home.join(".cursor/mcp_config.json"),
+            home.join(".cursor/rules/brain-for-ai.mdc"),
+        ],
+    }
+}
+
+/// Every path a valid manifest may name: the exact default files of the
+/// clients Brain integrates, under the current `HOME`.
+fn managed_paths(home: &Path) -> Vec<PathBuf> {
+    [AgentClient::Claude, AgentClient::Codex, AgentClient::Cursor]
+        .into_iter()
+        .flat_map(|client| default_client_paths(home, client))
+        .collect()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Structural check of a parsed manifest, before anything it names is read.
+fn validate_manifest(home: &Path, manifest: &InstallManifest) -> Result<(), String> {
+    if manifest.version != 1 {
+        return Err(format!("unsupported version {}", manifest.version));
+    }
+    let allowed = managed_paths(home);
+    if manifest.entries.len() > allowed.len() {
+        return Err("too many entries".into());
+    }
+    let mut paths = Vec::new();
+    let mut backups = Vec::new();
+    for (index, entry) in manifest.entries.iter().enumerate() {
+        let at = |why: &str| format!("entry {index}: {why}");
+        if !allowed.contains(&entry.path) {
+            return Err(at("not a file Brain manages"));
+        }
+        if paths.contains(&&entry.path) {
+            return Err(at("duplicate path"));
+        }
+        paths.push(&entry.path);
+        if !is_sha256(&entry.after_sha256) {
+            return Err(at("invalid after_sha256"));
+        }
+        match (entry.existed, &entry.before_sha256, &entry.backup) {
+            (true, Some(before), Some(backup)) => {
+                if !is_sha256(before) {
+                    return Err(at("invalid before_sha256"));
+                }
+                // Exactly what `install` writes: `{index:03}.bak`, with an
+                // index below the number of managed files.
+                let name = backup.to_str().filter(|name| {
+                    name.len() == 7
+                        && name.ends_with(".bak")
+                        && name[..3].bytes().all(|b| b.is_ascii_digit())
+                        && name[..3].parse::<usize>().is_ok_and(|n| n < allowed.len())
+                });
+                let Some(name) = name else {
+                    return Err(at("invalid backup name"));
+                };
+                if backups.contains(&name) {
+                    return Err(at("duplicate backup"));
+                }
+                backups.push(name);
+            }
+            (false, None, None) => {}
+            _ => return Err(at("existed, before_sha256 and backup disagree")),
+        }
+        // A plain file's mode: no setuid, setgid or sticky bits.
+        if let Some(mode) = entry.mode {
+            let kind = mode & !0o7777;
+            if (kind != 0 && kind != 0o100000) || mode & 0o7000 != 0 {
+                return Err(at("invalid mode"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `Ok(false)` only for an exact `NotFound`. An existing path must be a real
+/// directory (not a symlink) owned by this user with no group or other
+/// access. Nothing is chmodded here.
+fn private_dir(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(invalid("not a real directory"));
+            }
+            owner_only(&metadata)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn owner_only(metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match crate::private_fs::current_uid() {
+        Some(uid) if uid == metadata.uid() => {}
+        Some(_) => return Err(invalid("owned by another user")),
+        None => return Err(invalid("cannot determine the current user")),
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(invalid("accessible by group or others"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn owner_only(_metadata: &fs::Metadata) -> io::Result<()> {
+    Ok(())
+}
+
+fn invalid(why: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, why.to_string())
+}
+
+/// Reads a regular file through one bounded handle. `Ok(None)` only for an
+/// exact `NotFound`; a symlink, special file, oversize file or (with
+/// `private`) a file that is not owner-only is an error. The opened handle
+/// must be the inode that was checked.
+fn read_no_follow(path: &Path, limit: u64, private: bool) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(invalid("not a regular file"));
+    }
+    if private {
+        owner_only(&metadata)?;
+    }
+    if metadata.len() > limit {
+        return Err(invalid("too large"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err(invalid("changed while it was opened"));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(invalid("too large"));
+    }
+    Ok(Some(bytes))
+}
+
+/// No symlink between `HOME` (which may itself be an alias) and the target,
+/// target included. A missing component ends the walk; any other metadata
+/// error is a reason to leave the entry alone, never absence.
+fn symlink_free(home: &Path, path: &Path) -> Result<(), &'static str> {
+    let relative = path.strip_prefix(home).map_err(|_| "outside HOME")?;
+    let mut current = home.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("a symlink is in its path");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("its path cannot be inspected"),
+        }
+    }
+    Ok(())
+}
+
+fn detect_clients(home: &Path, homes: &ClientHomes) -> Vec<AgentClient> {
     let mut clients = Vec::new();
-    if home.join(".claude").exists() || executable_on_path("claude") {
+    if !homes.claude.state.relocated()
+        && (home.join(".claude").exists() || executable_on_path("claude"))
+    {
         clients.push(AgentClient::Claude);
     }
-    if home.join(".codex").exists() || executable_on_path("codex") {
+    if !homes.codex.state.relocated()
+        && (home.join(".codex").exists() || executable_on_path("codex"))
+    {
         clients.push(AgentClient::Codex);
     }
     if home.join(".cursor").exists() || executable_on_path("cursor") {
@@ -1658,6 +2010,790 @@ fn set_file_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    /// Tests inject client-home variables instead of reading or mutating the
+    /// process environment, so parallel tests cannot race on it.
+    fn unset_homes() -> ClientHomes {
+        crate::client_home::classify_all(Path::new("/synthetic/home"), None, None, None)
+    }
+
+    fn guard_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = compat_root(label);
+        let home = root.join("home");
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        // Stale default-location files with Brain markers already present.
+        fs::write(home.join(".claude.json"), b"{\"mcpServers\": {}}\n").unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            b"# stale\n# BRAIN_FOR_AI_BEGIN\n[mcp_servers.brain]\ncommand = \"/old/brain\"\n# BRAIN_FOR_AI_END\n",
+        )
+        .unwrap();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let binary = build.join("brain");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        (root, home, brain_home, binary)
+    }
+
+    fn snapshot(home: &Path, files: &[&str]) -> Vec<Option<Vec<u8>>> {
+        files.iter().map(|f| fs::read(home.join(f)).ok()).collect()
+    }
+
+    const CODEX_FILES: [&str; 3] = [
+        ".codex/config.toml",
+        ".codex/hooks.json",
+        ".codex/AGENTS.md",
+    ];
+    const CLAUDE_FILES: [&str; 3] = [".claude.json", ".claude/settings.json", ".claude/CLAUDE.md"];
+
+    #[test]
+    fn relocated_codex_is_skipped_even_with_yes_and_claude_still_installs() {
+        let (root, home, brain_home, binary) = guard_fixture("guard-codex");
+        let forbidden = root.join("forbidden-codex-home");
+        for raw in [OsStr::new("relative/codex"), forbidden.as_os_str()] {
+            let homes = crate::client_home::classify_all(&home, None, Some(raw), None);
+            assert!(homes.codex.state.relocated());
+            assert_eq!(build_plans_for(&home, &homes), [AgentClient::Claude]);
+        }
+        let homes =
+            crate::client_home::classify_all(&home, None, Some(forbidden.as_os_str()), None);
+        let codex_before = snapshot(&home, &CODEX_FILES);
+        let claude_before = snapshot(&home, &CLAUDE_FILES);
+        let applied =
+            install_with(&home, &brain_home, &binary, false, true, &homes).expect("install");
+        assert!(applied > 0, "the unrelated client still installs");
+        assert_eq!(
+            snapshot(&home, &CODEX_FILES),
+            codex_before,
+            "guarded default left byte-identical"
+        );
+        assert_ne!(snapshot(&home, &CLAUDE_FILES), claude_before);
+        assert!(
+            stable_copy_path(&brain_home).exists(),
+            "core install continues"
+        );
+        let manifest = fs::read_to_string(brain_home.join("install-manifest.json")).unwrap();
+        assert!(
+            !manifest.contains(".codex"),
+            "no restoration entry for the relocated client"
+        );
+        assert!(!manifest.contains("forbidden"));
+        assert!(
+            !forbidden.exists(),
+            "the override location is never created"
+        );
+        let observed = crate::doctor::document_with(&home, &brain_home, 1, &homes);
+        assert_eq!(
+            observed["clients"][1]["mcp_config_entry_present"],
+            serde_json::Value::Null
+        );
+        assert_eq!(observed["clients"][0]["mcp_config_entry_present"], true);
+        assert!(!observed.to_string().contains("forbidden"));
+        assert!(!forbidden.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relocated_claude_leaves_every_default_claude_file_alone() {
+        let (root, home, brain_home, binary) = guard_fixture("guard-claude");
+        let homes = crate::client_home::classify_all(
+            &home,
+            Some(OsStr::new("/synthetic/claude-elsewhere")),
+            None,
+            None,
+        );
+        let claude_before = snapshot(&home, &CLAUDE_FILES);
+        install_with(&home, &brain_home, &binary, true, true, &homes).expect("dry run");
+        install_with(&home, &brain_home, &binary, false, true, &homes).expect("install");
+        assert_eq!(snapshot(&home, &CLAUDE_FILES), claude_before);
+        let manifest = fs::read_to_string(brain_home.join("install-manifest.json")).unwrap();
+        assert!(manifest.contains(".codex/hooks.json"), "Codex proceeds");
+        assert!(!manifest.contains(".claude"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_spellings_keep_the_legacy_plan() {
+        let (root, home, _, _) = guard_fixture("guard-default");
+        let claude_same = format!("{}//.claude/", home.display());
+        let codex_same = format!("{}/./.codex/", home.display());
+        for (claude, codex) in [
+            (None, None),
+            (Some(OsStr::new("")), Some(OsStr::new(""))),
+            (
+                Some(OsStr::new(&claude_same)),
+                Some(OsStr::new(&codex_same)),
+            ),
+        ] {
+            let homes = crate::client_home::classify_all(&home, claude, codex, None);
+            assert!(relocated_clients(&homes).is_empty());
+            assert_eq!(
+                build_plans_for(&home, &homes),
+                [AgentClient::Claude, AgentClient::Codex]
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_client_paths_match_the_install_plan() {
+        let (root, home, _, _) = guard_fixture("guard-paths");
+        for client in [AgentClient::Claude, AgentClient::Codex, AgentClient::Cursor] {
+            let planned = build_plans(&home, Path::new("/opt/brain"), &[client])
+                .into_iter()
+                .map(|plan| plan.path)
+                .collect::<Vec<_>>();
+            assert_eq!(planned, default_client_paths(&home, client));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn installed_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, home, brain_home, binary) = guard_fixture(label);
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(
+            home.join(".cursor/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
+        (root, home, brain_home)
+    }
+
+    fn brain_state(brain_home: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![brain_home.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push((path.clone(), fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn uninstall_skips_relocated_clients_and_keeps_manifest_backups_and_binary() {
+        let (root, home, brain_home) = installed_fixture("unguard-both");
+        let installed_claude = snapshot(&home, &CLAUDE_FILES);
+        let installed_codex = snapshot(&home, &CODEX_FILES);
+        let forbidden = root.join("forbidden-claude-home");
+        let homes = crate::client_home::classify_all(
+            &home,
+            Some(forbidden.as_os_str()),
+            Some(OsStr::new("relative/codex-secret")),
+            None,
+        );
+        let before = brain_state(&brain_home);
+
+        uninstall_with(&home, &brain_home, true, true, &homes).expect("dry run");
+        assert_eq!(brain_state(&brain_home), before, "dry run writes nothing");
+        assert_eq!(snapshot(&home, &CLAUDE_FILES), installed_claude);
+
+        let restored = uninstall_with(&home, &brain_home, false, true, &homes).expect("uninstall");
+        assert_eq!(restored, 2, "only the two Cursor entries are eligible");
+        assert_eq!(
+            snapshot(&home, &CLAUDE_FILES),
+            installed_claude,
+            "Claude untouched"
+        );
+        assert_eq!(
+            snapshot(&home, &CODEX_FILES),
+            installed_codex,
+            "Codex untouched"
+        );
+        assert_eq!(
+            fs::read(home.join(".cursor/mcp_config.json")).unwrap(),
+            b"{\"mcpServers\":{}}\n",
+            "Cursor restored byte for byte"
+        );
+        assert!(!home.join(".cursor/rules/brain-for-ai.mdc").exists());
+        let manifest = brain_home.join("install-manifest.json");
+        assert!(manifest.exists(), "manifest kept while entries are skipped");
+        let kept = brain_state(&brain_home);
+        for (path, bytes) in &before {
+            if path.starts_with(brain_home.join("install-backups")) || *path == manifest {
+                assert!(
+                    kept.contains(&(path.clone(), bytes.clone())),
+                    "{path:?} kept"
+                );
+            }
+        }
+        assert!(stable_copy_path(&brain_home).exists(), "stable binary kept");
+        assert!(!forbidden.exists());
+        for (client, location) in relocated_clients(&homes) {
+            let line = relocation_conflict(client, location, "restore");
+            assert!(!line.contains("forbidden") && !line.contains("secret") && !line.contains('/'));
+            assert!(line.contains(location.variable));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_with_only_claude_relocated_restores_codex_and_cursor() {
+        let (root, home, brain_home) = installed_fixture("unguard-claude");
+        let installed_claude = snapshot(&home, &CLAUDE_FILES);
+        let homes = crate::client_home::classify_all(
+            &home,
+            Some(OsStr::new("/synthetic/claude-elsewhere")),
+            None,
+            None,
+        );
+        let restored = uninstall_with(&home, &brain_home, false, true, &homes).expect("uninstall");
+        assert!(restored >= 3, "Codex and Cursor entries restored");
+        assert_eq!(snapshot(&home, &CLAUDE_FILES), installed_claude);
+        assert!(
+            !home.join(".codex/hooks.json").exists(),
+            "created Codex file removed"
+        );
+        assert!(brain_home.join("install-manifest.json").exists());
+        assert!(stable_copy_path(&brain_home).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    const CURSOR_BEFORE: &[u8] = b"{\"mcpServers\":{}}\n";
+
+    fn partially_uninstalled(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let (root, home, brain_home) = installed_fixture(label);
+        let relocated = crate::client_home::classify_all(
+            &home,
+            Some(OsStr::new("/synthetic/claude-elsewhere")),
+            Some(OsStr::new("relative/codex")),
+            None,
+        );
+        let manifest = fs::read(brain_home.join("install-manifest.json")).unwrap();
+        assert_eq!(
+            uninstall_with(&home, &brain_home, false, true, &relocated).unwrap(),
+            2
+        );
+        assert_eq!(
+            fs::read(brain_home.join("install-manifest.json")).unwrap(),
+            manifest,
+            "partial uninstall keeps the manifest byte-identical"
+        );
+        (root, home, brain_home)
+    }
+
+    fn all_client_files() -> Vec<&'static str> {
+        CLAUDE_FILES
+            .iter()
+            .chain(&CODEX_FILES)
+            .copied()
+            .chain([".cursor/mcp_config.json", ".cursor/rules/brain-for-ai.mdc"])
+            .collect()
+    }
+
+    #[test]
+    fn second_uninstall_after_a_partial_one_completes_and_cleans_up() {
+        let (root, home, brain_home, binary) = guard_fixture("partial-full");
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(home.join(".cursor/mcp_config.json"), CURSOR_BEFORE).unwrap();
+        let original = snapshot(&home, &all_client_files());
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).unwrap();
+        let manifest_path = brain_home.join("install-manifest.json");
+        let entries = serde_json::from_slice::<InstallManifest>(&fs::read(&manifest_path).unwrap())
+            .unwrap()
+            .entries
+            .len();
+        let relocated = crate::client_home::classify_all(
+            &home,
+            Some(OsStr::new("/synthetic/claude-elsewhere")),
+            Some(OsStr::new("relative/codex")),
+            None,
+        );
+        assert_eq!(
+            uninstall_with(&home, &brain_home, false, true, &relocated).unwrap(),
+            2
+        );
+        let state = brain_state(&brain_home);
+        let dry = uninstall_with(&home, &brain_home, true, true, &unset_homes()).unwrap();
+        assert_eq!(dry, entries - 2, "dry run counts only future restores");
+        assert_eq!(brain_state(&brain_home), state, "dry run writes nothing");
+        let second = uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap();
+        assert_eq!(
+            second,
+            entries - 2,
+            "already-restored Cursor entries are not restored again"
+        );
+        assert_eq!(
+            snapshot(&home, &all_client_files()),
+            original,
+            "pre-install bytes everywhere"
+        );
+        assert!(!manifest_path.exists(), "manifest removed");
+        assert!(
+            !brain_home.join("install-backups").exists(),
+            "backups removed"
+        );
+        assert!(
+            !stable_copy_path(&brain_home).exists(),
+            "stable binary removed"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drifted_or_unreadable_entries_still_block_cleanup_after_a_partial_uninstall() {
+        let (root, home, brain_home) = partially_uninstalled("partial-drift");
+        let edited = b"{\"user\":\"edit\"}\n";
+        fs::write(home.join(".cursor/mcp_config.json"), edited).unwrap();
+        // A file Brain created, now unreadable (a directory): never absence.
+        fs::remove_file(home.join(".codex/AGENTS.md")).unwrap();
+        fs::create_dir(home.join(".codex/AGENTS.md")).unwrap();
+        let manifest_path = brain_home.join("install-manifest.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        let backups = brain_state(&brain_home)
+            .into_iter()
+            .filter(|(path, _)| path.starts_with(brain_home.join("install-backups")))
+            .collect::<Vec<_>>();
+        assert!(!backups.is_empty());
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap();
+        assert_eq!(
+            fs::read(home.join(".cursor/mcp_config.json")).unwrap(),
+            edited,
+            "drift kept"
+        );
+        assert!(
+            home.join(".codex/AGENTS.md").is_dir(),
+            "unreadable entry not removed"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).unwrap(),
+            manifest,
+            "manifest kept byte-identical"
+        );
+        let kept = brain_state(&brain_home);
+        for backup in &backups {
+            assert!(kept.contains(backup), "{:?} kept", backup.0);
+        }
+        assert!(stable_copy_path(&brain_home).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tampered_backup_aborts_before_any_file_changes() {
+        let (root, home, brain_home) = partially_uninstalled("partial-tamper");
+        for (path, _) in brain_state(&brain_home) {
+            if path.starts_with(brain_home.join("install-backups")) {
+                fs::write(path, b"tampered").unwrap();
+            }
+        }
+        let files = all_client_files();
+        let before = snapshot(&home, &files);
+        let manifest = fs::read(brain_home.join("install-manifest.json")).unwrap();
+        let error = uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap_err();
+        assert!(
+            error.to_string().contains("backup checksum mismatch"),
+            "{error}"
+        );
+        assert_eq!(
+            snapshot(&home, &files),
+            before,
+            "nothing changed before verification"
+        );
+        assert_eq!(
+            fs::read(brain_home.join("install-manifest.json")).unwrap(),
+            manifest
+        );
+        assert!(stable_copy_path(&brain_home).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn desktop_owner_keeps_the_binary_after_a_completed_partial_uninstall() {
+        let (root, home, brain_home) = partially_uninstalled("partial-desktop");
+        fs::write(desktop_copy_owner_path(&brain_home), b"desktop\n").unwrap();
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap();
+        assert!(!brain_home.join("install-manifest.json").exists());
+        assert!(
+            stable_copy_path(&brain_home).exists(),
+            "desktop shortcut still uses it"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Rewrites the installed manifest (owner-only, as Brain writes it).
+    fn rewrite_manifest(brain_home: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = brain_home.join("install-manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut value);
+        crate::private_fs::write_private(&path, &serde_json::to_vec_pretty(&value).unwrap())
+            .unwrap();
+    }
+
+    type Everything = (Vec<Option<Vec<u8>>>, Vec<(PathBuf, Vec<u8>)>);
+
+    fn everything(home: &Path, brain_home: &Path) -> Everything {
+        (snapshot(home, &all_client_files()), brain_state(brain_home))
+    }
+
+    fn assert_refused_unchanged(home: &Path, brain_home: &Path, label: &str) {
+        let before = everything(home, brain_home);
+        for dry_run in [true, false] {
+            let error = uninstall_with(home, brain_home, dry_run, true, &unset_homes())
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains("refusing to uninstall"), "{label}: {error}");
+            assert_eq!(
+                everything(home, brain_home),
+                before,
+                "{label}: no partial change"
+            );
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn manifest_naming_a_victim_with_a_valid_sha_is_refused_before_any_read() {
+        let (root, home, brain_home) = installed_fixture("i2-victim");
+        let victim = home.join("victim.txt");
+        fs::write(&victim, b"precious\n").unwrap();
+        let victim_sha = sha256(b"precious\n");
+        for path in [
+            victim.clone(),
+            root.join("outside"),
+            home.join(".codex/../victim.txt"),
+        ] {
+            let (path, sha) = (path.to_string_lossy().into_owned(), victim_sha.clone());
+            rewrite_manifest(&brain_home, |m| {
+                m["entries"][0]["path"] = path.clone().into();
+                m["entries"][0]["existed"] = false.into();
+                m["entries"][0]["before_sha256"] = serde_json::Value::Null;
+                m["entries"][0]["backup"] = serde_json::Value::Null;
+                m["entries"][0]["after_sha256"] = sha.into();
+            });
+            assert_refused_unchanged(&home, &brain_home, &path);
+            assert_eq!(fs::read(&victim).unwrap(), b"precious\n");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_backups_hashes_and_schema_are_refused_without_changes() {
+        let (root, home, brain_home) = installed_fixture("i2-schema");
+        let original = fs::read(brain_home.join("install-manifest.json")).unwrap();
+        let existed = serde_json::from_slice::<InstallManifest>(&original)
+            .unwrap()
+            .entries
+            .iter()
+            .position(|entry| entry.existed)
+            .expect("an entry with a backup");
+        type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+        let backup = |name: &'static str| -> Edit {
+            Box::new(move |m: &mut serde_json::Value| m["entries"][existed]["backup"] = name.into())
+        };
+        let mut cases: Vec<(&str, Edit)> = vec![
+            ("traversal backup", backup("../install-manifest.json")),
+            ("absolute backup", backup("/etc/hostname")),
+            ("nested backup", backup("001.bak/x")),
+            ("short backup", backup("1.bak")),
+            ("out-of-range backup", backup("999.bak")),
+            ("other extension", backup("001.txt")),
+            ("version", Box::new(|m| m["version"] = 2.into())),
+            ("unknown field", Box::new(|m| m["extra"] = true.into())),
+            (
+                "unknown entry field",
+                Box::new(move |m| m["entries"][existed]["client"] = "x".into()),
+            ),
+            (
+                "bad sha",
+                Box::new(move |m| m["entries"][existed]["after_sha256"] = "zz".into()),
+            ),
+            (
+                "upper sha",
+                Box::new(move |m| {
+                    let upper = m["entries"][existed]["after_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .to_uppercase();
+                    m["entries"][existed]["after_sha256"] = upper.into();
+                }),
+            ),
+            (
+                "bad before sha",
+                Box::new(move |m| m["entries"][existed]["before_sha256"] = "00".into()),
+            ),
+            (
+                "existed without backup",
+                Box::new(move |m| m["entries"][existed]["backup"] = serde_json::Value::Null),
+            ),
+            (
+                "setuid mode",
+                Box::new(move |m| m["entries"][existed]["mode"] = 0o104755.into()),
+            ),
+            (
+                "duplicate path",
+                Box::new(|m| {
+                    let first = m["entries"][0].clone();
+                    m["entries"].as_array_mut().unwrap().push(first);
+                }),
+            ),
+        ];
+        cases.push((
+            "duplicate backup",
+            Box::new(move |m| {
+                let entries = m["entries"].as_array_mut().unwrap();
+                let name = entries[existed]["backup"].clone();
+                let other = entries
+                    .iter()
+                    .position(|e| e["existed"] == true && e["backup"] != name);
+                if let Some(other) = other {
+                    entries[other]["backup"] = name;
+                } else {
+                    entries[existed]["path"] =
+                        entries[(existed + 1) % entries.len()]["path"].clone();
+                }
+            }),
+        ));
+        for (label, edit) in cases {
+            crate::private_fs::write_private(&brain_home.join("install-manifest.json"), &original)
+                .unwrap();
+            rewrite_manifest(&brain_home, |m| edit(m));
+            assert_refused_unchanged(&home, &brain_home, label);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsafe_manifest_and_backup_files_are_refused_without_changes() {
+        let (root, home, brain_home) = installed_fixture("i2-files");
+        let manifest = brain_home.join("install-manifest.json");
+        let original = fs::read(&manifest).unwrap();
+        let restore = || crate::private_fs::write_private(&manifest, &original).unwrap();
+
+        set_mode(&manifest, 0o644);
+        assert_refused_unchanged(&home, &brain_home, "permissive manifest");
+        restore();
+
+        let elsewhere = root.join("manifest-copy.json");
+        crate::private_fs::write_private(&elsewhere, &original).unwrap();
+        fs::remove_file(&manifest).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &manifest).unwrap();
+        assert_refused_unchanged(&home, &brain_home, "symlinked manifest");
+        fs::remove_file(&manifest).unwrap();
+        restore();
+
+        let mut padded = original.clone();
+        padded.resize(MAX_MANIFEST_BYTES as usize + 1, b' ');
+        crate::private_fs::write_private(&manifest, &padded).unwrap();
+        assert_refused_unchanged(&home, &brain_home, "oversize manifest");
+        restore();
+
+        fs::remove_file(&manifest).unwrap();
+        fs::create_dir(&manifest).unwrap();
+        assert_refused_unchanged(&home, &brain_home, "manifest directory");
+        fs::remove_dir(&manifest).unwrap();
+        restore();
+
+        set_mode(&brain_home, 0o755);
+        assert_refused_unchanged(&home, &brain_home, "permissive Brain home");
+        set_mode(&brain_home, 0o700);
+
+        let backups = brain_home.join("install-backups");
+        set_mode(&backups, 0o755);
+        assert_refused_unchanged(&home, &brain_home, "permissive backup directory");
+        set_mode(&backups, 0o700);
+
+        let moved = root.join("backups-elsewhere");
+        fs::rename(&backups, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &backups).unwrap();
+        assert_refused_unchanged(&home, &brain_home, "symlinked backup directory");
+        fs::remove_file(&backups).unwrap();
+        fs::rename(&moved, &backups).unwrap();
+
+        // Owned by someone else: possible to stage only as root.
+        if crate::private_fs::current_uid() == Some(0) {
+            std::os::unix::fs::chown(&manifest, Some(12345), None).unwrap();
+            assert_refused_unchanged(&home, &brain_home, "foreign manifest owner");
+            std::os::unix::fs::chown(&manifest, Some(0), None).unwrap();
+        }
+
+        // A permissive or symlinked backup file is refused at its read,
+        // before any file is changed.
+        let backup = fs::read_dir(&backups)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        set_mode(&backup, 0o644);
+        let before = everything(&home, &brain_home);
+        let error = uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap_err();
+        assert!(error.to_string().contains("installation backup"), "{error}");
+        assert_eq!(everything(&home, &brain_home), before);
+        set_mode(&backup, 0o600);
+        let bytes = fs::read(&backup).unwrap();
+        let target = root.join("backup-target");
+        crate::private_fs::write_private(&target, &bytes).unwrap();
+        fs::remove_file(&backup).unwrap();
+        std::os::unix::fs::symlink(&target, &backup).unwrap();
+        let before = everything(&home, &brain_home);
+        assert!(uninstall_with(&home, &brain_home, false, true, &unset_homes()).is_err());
+        assert_eq!(everything(&home, &brain_home), before);
+        fs::remove_file(&backup).unwrap();
+        crate::private_fs::write_private(&backup, &bytes).unwrap();
+
+        // The untouched canonical installation still uninstalls completely.
+        assert!(uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap() > 0);
+        assert!(!manifest.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_symlink_in_a_client_path_is_a_conflict_and_its_target_is_untouched() {
+        let (root, home, brain_home) = installed_fixture("i2-parent");
+        let real = root.join("real-codex");
+        fs::rename(home.join(".codex"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, home.join(".codex")).unwrap();
+        let before = snapshot(&real, &["config.toml", "hooks.json", "AGENTS.md"]);
+        let manifest = fs::read(brain_home.join("install-manifest.json")).unwrap();
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap();
+        assert_eq!(
+            snapshot(&real, &["config.toml", "hooks.json", "AGENTS.md"]),
+            before
+        );
+        assert_eq!(
+            fs::read(brain_home.join("install-manifest.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            fs::read(home.join(".cursor/mcp_config.json")).unwrap(),
+            CURSOR_BEFORE
+        );
+        assert!(stable_copy_path(&brain_home).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_backup_directory_is_fine_only_when_no_backup_is_needed() {
+        let (root, home, brain_home) = installed_fixture("i2-nobackups");
+        let backups = brain_home.join("install-backups");
+        let moved = root.join("kept-backups");
+        fs::rename(&backups, &moved).unwrap();
+        let before = everything(&home, &brain_home);
+        let error = uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap_err();
+        assert!(error.to_string().contains("backup"), "{error}");
+        assert_eq!(everything(&home, &brain_home), before, "no partial change");
+        let _ = fs::remove_dir_all(&root);
+
+        // Only created files: no backup is needed, so none must exist.
+        let root = compat_root("i2-created-only");
+        let home = root.join("home");
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        install_with(
+            &home,
+            &brain_home,
+            &build.join("brain"),
+            false,
+            true,
+            &unset_homes(),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(brain_home.join("install-backups"));
+        assert!(uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap() > 0);
+        assert!(!brain_home.join("install-manifest.json").exists());
+        assert!(!home.join(".cursor/mcp_config.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Backup names come from the index of a plan among all plans, so an
+    /// approved subset has gaps and does not match the entry ordinal.
+    #[test]
+    fn partial_selected_install_with_backup_index_gaps_uninstalls_completely() {
+        let root = compat_root("i2-gaps");
+        let home = root.join("home");
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let stable = stable_copy_path(&brain_home);
+        // Plan 0 is already up to date, so it is not selected.
+        let claude_json = format!(
+            "{{\n  \"mcpServers\": {{\"brain\": {{\"command\": {}, \"args\": [\"--agent\", \"claude-code\", \"serve\"]}}}}\n}}\n",
+            serde_json::to_string(&stable.to_string_lossy()).unwrap()
+        );
+        fs::write(home.join(".claude.json"), &claude_json).unwrap();
+        fs::write(
+            home.join(".claude/settings.json"),
+            b"{\n  \"theme\": \"dark\"\n}\n",
+        )
+        .unwrap();
+        let files = [".claude.json", ".claude/settings.json", ".claude/CLAUDE.md"];
+        let original = snapshot(&home, &files);
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        install_with(
+            &home,
+            &brain_home,
+            &build.join("brain"),
+            false,
+            true,
+            &unset_homes(),
+        )
+        .unwrap();
+        let manifest: InstallManifest =
+            serde_json::from_slice(&fs::read(brain_home.join("install-manifest.json")).unwrap())
+                .unwrap();
+        assert!(
+            !manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == home.join(".claude.json"))
+        );
+        assert_eq!(
+            manifest.entries[0].backup.as_deref(),
+            Some(Path::new("001.bak")),
+            "gap at 000"
+        );
+        assert!(uninstall_with(&home, &brain_home, true, true, &unset_homes()).unwrap() > 0);
+        assert!(uninstall_with(&home, &brain_home, false, true, &unset_homes()).unwrap() > 0);
+        assert_eq!(snapshot(&home, &files), original);
+        assert!(!brain_home.join("install-manifest.json").exists());
+        assert!(!brain_home.join("install-backups").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_brain_home_or_manifest_stays_a_no_op() {
+        let root = compat_root("i2-absent");
+        let home = root.join("home");
+        assert_eq!(
+            uninstall_with(&home, &home.join(".brain"), false, true, &unset_homes()).unwrap(),
+            0
+        );
+        fs::create_dir_all(&home).unwrap();
+        crate::private_fs::ensure_private_home(&home.join(".brain")).unwrap();
+        assert_eq!(
+            uninstall_with(&home, &home.join(".brain"), false, true, &unset_homes()).unwrap(),
+            0
+        );
+        assert!(!home.join(".brain/install-manifest.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Clients that would be planned, without Cursor, for compact assertions.
+    fn build_plans_for(home: &Path, homes: &ClientHomes) -> Vec<AgentClient> {
+        detect_clients(home, homes)
+            .into_iter()
+            .filter(|client| *client != AgentClient::Cursor)
+            .collect()
+    }
 
     fn compat_root(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1949,19 +3085,19 @@ mod tests {
         fs::create_dir_all(&build).unwrap();
         let binary = build.join("brain");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
-        install(&home, &brain_home, &binary, true, true).expect("dry run");
+        install_with(&home, &brain_home, &binary, true, true, &unset_homes()).expect("dry run");
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
         assert!(
             !home.join(".codex/hooks.json").exists(),
             "dry run writes nothing"
         );
-        install(&home, &brain_home, &binary, false, true).expect("install");
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
         let first = (
             fs::read(home.join(".codex/hooks.json")).ok(),
             fs::read(home.join(".codex/AGENTS.md")).ok(),
         );
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
-        install(&home, &brain_home, &binary, false, true).expect("repeat");
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("repeat");
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
         assert_eq!(
             (
@@ -2060,12 +3196,12 @@ mod tests {
         };
         let before = snapshot();
 
-        install(&home, &brain_home, &binary, true, true).expect("dry run");
+        install_with(&home, &brain_home, &binary, true, true, &unset_homes()).expect("dry run");
         assert_eq!(snapshot(), before, "dry run writes nothing");
         assert!(!brain_home.join("install-manifest.json").exists());
         assert!(!stable.exists());
 
-        install(&home, &brain_home, &binary, false, true).expect("install");
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
         let first = snapshot();
         assert_eq!(first[0], before[0], "compatible root entry byte-identical");
         assert_eq!(first[3], before[3], "conflicting TOML untouched");
@@ -2074,7 +3210,7 @@ mod tests {
             serde_json::from_slice(first[1].as_ref().unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
 
-        install(&home, &brain_home, &binary, false, true).expect("repeat");
+        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("repeat");
         assert_eq!(snapshot(), first, "repeated install changes nothing");
         let _ = fs::remove_dir_all(root);
     }
@@ -2163,7 +3299,8 @@ mod tests {
         let binary = source_dir.join("brain");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
 
-        let first = install(&home, &brain_home, &binary, false, true).expect("install");
+        let first = install_with(&home, &brain_home, &binary, false, true, &unset_homes())
+            .expect("install");
         assert!(first > 0);
         let user_config: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join(".claude.json")).unwrap()).unwrap();
@@ -2171,7 +3308,7 @@ mod tests {
             serde_json::from_slice(&fs::read(home.join(".claude/settings.json")).unwrap()).unwrap();
         assert!(user_config.pointer("/mcpServers/brain").is_some());
         assert!(hook_config.get("mcpServers").is_none());
-        let observed = crate::doctor::document(&home, &brain_home, 1);
+        let observed = crate::doctor::document_with(&home, &brain_home, 1, &unset_homes());
         assert_eq!(observed["clients"][0]["mcp_config_entry_present"], true);
         assert_eq!(observed["clients"][0]["hook_config_marker_present"], true);
         let copy = stable_copy_path(&brain_home);
@@ -2189,13 +3326,14 @@ mod tests {
             .iter()
             .map(|(path, _)| fs::read(path).expect("installed bytes"))
             .collect::<Vec<_>>();
-        let second = install(&home, &brain_home, &binary, false, true).expect("idempotent install");
+        let second = install_with(&home, &brain_home, &binary, false, true, &unset_homes())
+            .expect("idempotent install");
         assert_eq!(second, 0);
         for ((path, _), expected) in fixtures.iter().zip(installed) {
             assert_eq!(fs::read(path).expect("second install bytes"), expected);
         }
 
-        uninstall(&brain_home, false, true).expect("uninstall");
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).expect("uninstall");
         for (path, expected) in &fixtures {
             assert_eq!(fs::read(path).expect("restored bytes"), *expected);
         }
@@ -2231,7 +3369,7 @@ mod tests {
             b"brain-for-ai-settings-v1\n",
         )
         .expect("desktop owner marker");
-        uninstall(&brain_home, false, true).expect("remove agent hook");
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).expect("remove agent hook");
 
         let stable = stable_copy_path(&brain_home);
         assert!(stable.is_file(), "desktop ownership must retain the binary");

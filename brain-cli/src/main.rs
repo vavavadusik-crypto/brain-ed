@@ -26,6 +26,7 @@ mod activity;
 mod archive;
 mod background;
 mod brief;
+mod client_home;
 mod desktop;
 mod doctor;
 mod embedding_runtime;
@@ -687,7 +688,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Reindex(args) => reindex::run(&config, &args),
         Command::Import(args) => import::run(&config, &args),
         Command::Uninstall { dry_run, yes } => {
-            installer::uninstall(&brain_home(), dry_run, yes)?;
+            installer::uninstall(&user_home(), &brain_home(), dry_run, yes)?;
             Ok(())
         }
         Command::Worker => {

@@ -3,7 +3,64 @@
 All notable changes are listed here. Versions follow semantic versioning;
 `0.x` releases may change formats and interfaces.
 
-## [0.1.2] — unreleased (early preview)
+## [0.1.3] — 2026-10-10 (early preview)
+
+### Changed
+- Relocated agent-client homes are detected and not followed.
+  - **Variables:** `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `HERMES_HOME` are
+    classified from their raw value in the process environment only. Brain does
+    not open, stat or resolve the path, and never prints or logs the value.
+  - **States:** `unset`, `empty` and `default_equivalent` keep the old
+    behaviour. `unsupported_override` (another absolute path) and
+    `unresolved_override` (relative, non-UTF-8 or containing `..`) mark the
+    client as relocated.
+- `brain init --agents` skips a relocated Claude Code or Codex entirely.
+  - None of its default files are read or written, including `~/.claude.json`.
+  - It prints one `CONFLICT` line with the client, the variable and the state.
+  - Other clients and the stable binary copy are installed as before.
+- `brain uninstall` skips the install-manifest entries for a relocated
+  client's exact default files before reading anything.
+  - Other clients are restored.
+  - While anything is skipped, the manifest, backups and stable binary are kept.
+- `brain uninstall` can complete after a partial run.
+  - A later uninstall counts an entry as already restored when the file holds
+    its pre-install bytes again, or, for a file Brain created, is absent.
+    Absent means `NotFound` only; an unreadable file is a `CONFLICT`, never
+    absence.
+  - User edits stay conflicts.
+  - Every backup to be used is checked against its SHA-256 before any file is
+    changed.
+  - Once everything is restored or already restored, the manifest, backups
+    and binary are cleaned up. A desktop shortcut that uses the binary still
+    keeps it.
+  - The dry-run count includes only restores that would happen now.
+- `brain uninstall` validates the complete local manifest before acting.
+  Only exact managed client paths and bounded, owner-only regular manifest
+  and backup files are admitted. Invalid schemas, duplicate paths, unsafe
+  backup names and symlinks are refused; client-path symlinks are conflicts.
+  These checks restrict accidental or tampered manifests. They do not close
+  filesystem races with another process that can modify the same directories.
+- `brain doctor` gains three additive fields per client:
+  - `config_location` (`{variable, state}`);
+  - `mcp_support` and `hook_support`, set to `supported`,
+    `relocated_not_followed` or (Hermes) `unsupported`.
+  - For a relocated client the existing marker fields are `null`; their type
+    is still bool or null.
+
+### Limits
+- Matching uses the current spelling of `HOME`. If it changed since install,
+  old paths outside the current allowlist refuse the whole uninstall. There is no
+  migration, and Brain does not install into, read from or capture from a
+  relocated home or a new profile.
+- Hermes has no global MCP or hook integration (`unsupported`).
+- Configuration markers do not prove a client handshake. Running clients are
+  not reconnected. Full conversation capture is not claimed.
+- There are no fleet, provenance or signing claims. Linux x86_64 only, with
+  dynamic glibc (2.39 on the manual Ubuntu 24.04 workflow). Other distributions
+  are untested. Prebuilt availability is listed on the release page.
+- Workspace version 0.1.3 (`brain-core`, `brain-cli`). No dependency changes.
+
+## [0.1.2] — early preview (see its GitHub release)
 
 ### Added
 - Linux x86_64 download bundle module (this entry does not mean a bundle is
