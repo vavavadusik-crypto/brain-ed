@@ -45,8 +45,8 @@ jobs:
           set -euo pipefail
           cd "$RUNNER_TEMP/src"
           # rustc and gcc give the LAST matching prefix map priority, so the
-          # more specific clone path comes after RUNNER_TEMP. Not yet proven on
-          # a real runner: the packager's path scan is the check.
+          # more specific clone path comes after RUNNER_TEMP. The packager's
+          # path scan checks the binary produced by this runner.
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build/brain-ed --remap-path-prefix=$RUNNER_TEMP=/runner-temp --remap-path-prefix=$RUNNER_TEMP/src=/build/brain-ed --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
           export CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/build/brain-ed -ffile-prefix-map=$RUNNER_TEMP=/runner-temp -ffile-prefix-map=$RUNNER_TEMP/src=/build/brain-ed -ffile-prefix-map=$HOME/.cargo=/cargo"
           cargo build --locked --release -p brain-cli --target-dir "$RUNNER_TEMP/target"

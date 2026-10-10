@@ -2,8 +2,10 @@
 
 A bundle is a `.tar.gz` holding an already built `brain` executable, a small
 installer and the licence files, so the two desktop icons can be set up
-without Rust or a C compiler. **No bundle is published yet.** This page
-describes the format and how to build and check one.
+without Rust or a C compiler. Available prebuilt versions are listed on the
+[GitHub releases page](https://github.com/vavavadusik-crypto/brain-ed/releases).
+A bundle installs the version named in that bundle. This page describes the
+format and how to install, build and check one.
 
 ## What is in a bundle
 
