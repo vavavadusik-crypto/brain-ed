@@ -133,9 +133,11 @@ impl Layout {
 
 /// Writes both launcher entries, their icons, and copies on the desktop.
 pub(crate) fn install(dry_run: bool) -> Result<(), Box<dyn Error>> {
-    let running_binary = crate::stable_brain_binary()?;
     let home = crate::user_home();
     let brain_home = crate::brain_home();
+    // Before the running image or `user-dirs.dirs` is looked at.
+    crate::private_fs::require_safe_homes(&home, &brain_home)?;
+    let running_binary = crate::stable_brain_binary()?;
     let layout = Layout::from_environment(&home);
     let report = if dry_run {
         plan_install(&running_binary, &brain_home, &layout)?
@@ -146,12 +148,28 @@ pub(crate) fn install(dry_run: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Every path a launcher operation may touch must pass the shared HOME guard.
+/// XDG values are only required to be absolute by `Layout::resolve`, so a
+/// control character arriving through them is refused here too.
+fn check_layout(brain_home: &Path, layout: &Layout) -> Result<(), Box<dyn Error>> {
+    let mut paths = vec![
+        brain_home,
+        layout.applications.as_path(),
+        layout.icons.as_path(),
+    ];
+    if let Some(desktop) = &layout.desktop {
+        paths.push(desktop.as_path());
+    }
+    crate::private_fs::require_safe_paths(&paths)
+}
+
 /// What `install` would write, computed without touching the filesystem.
 fn plan_install(
     running_binary: &Path,
     brain_home: &Path,
     layout: &Layout,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    check_layout(brain_home, layout)?;
     let binary = installer::stable_copy_path(brain_home);
     // Rendering validates the path, so a dry run fails exactly where a real
     // install would.
@@ -180,6 +198,7 @@ fn install_from(
     brain_home: &Path,
     layout: &Layout,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    check_layout(brain_home, layout)?;
     let binary = installer::stable_copy_path(brain_home);
     installer::install_stable_copy(running_binary, &binary)?;
     probe_brain_binary(&binary)?;
@@ -245,6 +264,7 @@ fn install_from(
 pub(crate) fn remove(dry_run: bool) -> Result<(), Box<dyn Error>> {
     let home = crate::user_home();
     let brain_home = crate::brain_home();
+    crate::private_fs::require_safe_homes(&home, &brain_home)?;
     let layout = Layout::from_environment(&home);
     let report = remove_from(&brain_home, &layout, dry_run)?;
     crate::print_json(&report)?;
@@ -256,6 +276,7 @@ fn remove_from(
     layout: &Layout,
     dry_run: bool,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    check_layout(brain_home, layout)?;
     let mut candidates = layout.menu_entries().to_vec();
     candidates.push(layout.settings_icon());
     candidates.push(layout.graph_icon());
@@ -490,6 +511,91 @@ fn mark_trusted(path: &Path) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(all(test, unix))]
+mod home_guard_tests {
+    use super::*;
+    use crate::private_fs::UNSAFE_HOME;
+    use crate::private_fs::tests::{snapshot, unsafe_home_pairs};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Built directly: `Layout::resolve` would look for a desktop folder,
+    /// which for a relative HOME means the current directory.
+    fn layout_for(home: &Path) -> Layout {
+        Layout {
+            applications: home.join(".local/share/applications"),
+            icons: home.join(".local/share/icons/hicolor/scalable/apps"),
+            desktop: Some(home.join("Desktop")),
+        }
+    }
+
+    #[test]
+    fn unusable_homes_refuse_every_launcher_operation_before_any_io() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "brain-desktop-guard-{}-{nonce}",
+            std::process::id()
+        ));
+        let good = root.join("ok");
+        let good_brain = good.join(".brain");
+        fs::create_dir_all(good.join("Desktop")).unwrap();
+        fs::create_dir_all(good_brain.join("bin")).unwrap();
+        fs::write(good_brain.join("brain.sqlite"), b"user data").unwrap();
+        fs::write(good_brain.join("bin/brain"), b"#!/bin/sh\n").unwrap();
+        fs::write(
+            good.join(format!("Desktop/{ENTRY_NAME}.desktop")),
+            b"[Desktop Entry]\n",
+        )
+        .unwrap();
+        let source = root.join("build/brain");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = snapshot(&root);
+
+        let mut cases = unsafe_home_pairs(&root)
+            .into_iter()
+            .map(|(home, brain_home)| (brain_home, layout_for(&home)))
+            .collect::<Vec<_>>();
+        // A healthy HOME whose absolute XDG locations carry control characters.
+        let mut data = layout_for(&good);
+        data.applications = root.join("data\u{7f}/applications");
+        cases.push((good_brain.clone(), data));
+        let mut desktop = layout_for(&good);
+        desktop.desktop = Some(root.join("Desk\ntop"));
+        cases.push((good_brain.clone(), desktop));
+
+        for (brain_home, layout) in &cases {
+            for result in [
+                plan_install(&source, brain_home, layout),
+                install_from(&source, brain_home, layout),
+                remove_from(brain_home, layout, true),
+                remove_from(brain_home, layout, false),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    UNSAFE_HOME,
+                    "{brain_home:?}"
+                );
+            }
+        }
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "no stable copy, icon, menu entry, desktop launcher or data change"
+        );
+
+        // A Unicode HOME with spaces still plans normally (and writes nothing).
+        let unicode = root.join("дом ñ space");
+        let plan = plan_install(&source, &unicode.join(".brain"), &layout_for(&unicode)).unwrap();
+        assert_eq!(plan["status"], "dry_run");
+        assert_eq!(snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

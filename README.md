@@ -7,10 +7,10 @@ The image uses twelve synthetic projects. It illustrates the project map; it
 does not show a deployed fleet or complete conversation-history graph.
 [Русская версия](README.ru.md)
 
-**0.1.3 — early preview. Linux x86_64 only.** Use a matching prebuilt
+**0.1.4 — early preview. Linux x86_64 only.** Use a matching prebuilt
 bundle when it is listed on the [release page](https://github.com/vavavadusik-crypto/brain-ed/releases);
 a bundle installs the version it was built from. Otherwise build from source.
-[Verification and limits](docs/release-0.1.3-verification.md).
+[Verification and limits](docs/release-0.1.4-verification.md).
 
 
 Brain ED is a local-first personal memory and task-coordination engine for AI
@@ -42,6 +42,10 @@ the source.
 - **Conversation archive.** `brain archive …` keeps visible user/assistant text
   from Claude Code, Codex and Hermes, with opt-in collection.
 - **MCP server.** `brain serve` runs a stdio JSON-RPC MCP server.
+- **Explicit client profiles.** `brain clients register` records a client home.
+  A registered Codex home can opt into MCP with `brain clients configure`;
+  registration alone does not connect or capture. See [client profiles](docs/client-profiles.md)
+  and [Codex MCP setup](docs/registered-codex-mcp.md).
 
 ## Capability limits (read before relying on it)
 
@@ -160,7 +164,7 @@ brain model install                          # optional: explicit embedding down
 ## Documentation
 
 - [docs/VALIDATION.md](docs/VALIDATION.md) — release checks and verification limits
-- [docs/release-0.1.3-verification.md](docs/release-0.1.3-verification.md) — 0.1.3 source checks as reported, and their limits
+- [docs/release-0.1.4-verification.md](docs/release-0.1.4-verification.md) — 0.1.4 source checks as reported, and their limits
 - [docs/INSTALL.md](docs/INSTALL.md) — install, launchers, uninstall
 - [docs/linux-download.md](docs/linux-download.md) — Linux x86_64 bundle format, checks and limits
 - [docs/SECURITY.md](docs/SECURITY.md) — threat model and data boundaries

@@ -58,9 +58,69 @@ disabled so mutable memory cannot cross into a system-priority channel. Request
 `memory_brief` explicitly as a tool result instead. Sanitized events are appended below `~/.brain/`; raw user prompts,
 secret-like fields, high-entropy strings, and denylisted personal paths are not
 queued. The current journal captures event metadata, not conversation history.
-JSONL appends are serialized under an OS file lock; this prevents cooperating
-writers interleaving records. The fast path has no model/network work, but disk
-latency and lock contention mean a hard wall-clock deadline is not guaranteed.
+
+### Hook process contract
+
+Whatever stdin or the filesystem holds, the hook writes exactly `{}` followed by
+a newline to stdout, nothing to stderr, and exits 0. Command-line usage errors
+(an unknown `--client`, a missing `--event`) still fail as normal CLI errors.
+
+- Input is bytes. Only the first 256 KiB are kept and parsed. Empty input,
+  invalid UTF-8, JSON that is malformed or not an object, and input over
+  256 KiB all discard the metadata; nothing is journaled.
+- Stdin is read through a non-blocking descriptor under a 2 second deadline.
+  Oversized input is drained until it exceeds a 16 MiB threshold, so a client
+  writing a finite larger payload with `write_all` can finish without EPIPE.
+  Reads use 64 KiB chunks: the last chunk can cross that threshold by at most
+  64 KiB. Once exceeded, or after the deadline (an idle open pipe or socket,
+  for example), the hook stops reading and exits, and the writer may see
+  EPIPE. There is no "no EPIPE" promise past the threshold or deadline. No
+  helper thread is left waiting on stdin.
+- Supported stdin kinds (Linux only):
+  - a pipe or regular file is reopened through `/proc/self/fd/0` as a separate
+    open file description with its own `O_NONBLOCK`;
+  - a Unix **stream** socket (`SOCK_STREAM`, as Node.js `child_process.spawn`
+    with `stdio: 'pipe'` and `socketpair` launchers provide) cannot be
+    reopened that way (`ENXIO`). The hook duplicates fd 0 and reads it with
+    `recv(..., MSG_DONTWAIT)`. That flag applies per call: the hook never calls
+    `F_SETFL`, so the open file description it shares with the launcher keeps
+    exactly its flags. The same retention limit, drain threshold and deadline apply;
+  - anything else (closed stdin, datagram or other sockets, TTYs that cannot
+    be reopened) is treated as no input: `{}` is still returned and nothing is
+    journaled.
+  These launch shapes are verified with synthetic launchers (pipe and
+  `UnixStream::pair` in the contract tests). That is not proof that a given
+  agent client invokes hooks this way, nor that every event is captured.
+  Non-Linux platforms do not read hook input in this preview. On Linux,
+  reopening pipes and files requires `/proc`; the stream-socket fallback
+  uses only the inherited descriptor.
+- `HOME` must be absolute and control-free. When it is unset (the Brain home
+  becomes `./.brain`), empty (`.brain`), relative or contains a control
+  character, the hook writes no activity anywhere, in particular not into a
+  project's own `.brain` below the client's working directory. It still
+  answers `{}`. This check runs before any metadata of the Brain home is read.
+- Payload paths such as `transcript_path` and `cwd` are untrusted strings. They
+  are never opened. Client configuration, transcripts, auth files and history
+  are not read either.
+- `~/.brain` must already exist as a real directory owned by the current user,
+  with no group or other permission bits, inside a parent that is not group- or
+  world-writable. Otherwise the event is dropped. The hook never creates,
+  chmods or follows a Brain home. Run `brain init` to create one.
+- `hook-events.jsonl` and `hook-dedupe.json` are checked with `lstat` before
+  any content is opened. Each must be a regular file owned by the user, with
+  mode 0600 or tighter, a single hard link and a bounded size. They are then
+  opened with `O_NOFOLLOW|O_NONBLOCK` and re-checked by inode. Symlinks, FIFOs,
+  hard links and permissive modes are left exactly as found, and their targets
+  are never truncated or chmodded.
+- The journal holds one JSON event per line. Each line is at most 8 KiB and the
+  file at most 64 MiB. Appends take a non-blocking OS file lock, retried for at
+  most 1 second; if the lock stays held, the event is dropped instead of hanging
+  the agent. The dedupe state is a small hash and a timestamp, replaced
+  atomically through a private temporary file and a rename.
+
+Worst-case hook latency is therefore bounded by about 3 seconds plus process
+start-up and disk latency. This is a bounded best-effort journal, not complete
+capture. It is not evidence that any client actually invoked the hook.
 
 `brain doctor` reads only bounded configuration and journal snapshots. It reports
 malformed records, future timestamps, partial tails and configuration markers.
@@ -187,3 +247,41 @@ executable was replaced) for the doctor run only; it cannot see other servers,
 and a config entry or a deleted-path observation does not prove a client has
 refreshed. On non-Linux systems the worker is started by pathname and may fail
 or run the newer binary after a replacement.
+
+## An absolute, control-free `HOME` is required for integration commands
+
+The Brain home is `$HOME/.brain`. An unset `HOME` reaches Brain as `.` and an
+empty one as the empty path, so the paths it would plan were relative to the
+current directory; a control character (including DEL) cannot be written into
+hooks, JSON or TOML commands or desktop entries. The following commands now
+refuse, before any file is read, created or changed (dry runs included), when
+`HOME` or the Brain home derived from it is unset, empty, relative, not UTF-8
+or contains a control character:
+
+- `brain init --agents` (also `--dry-run`/`--yes`): refused before the
+  database is created and before any client file, backup, manifest or stable
+  copy is touched. Plain `brain init` without `--agents` is unchanged;
+- `brain uninstall` (also `--dry-run`): refused before the manifest, backups
+  or client files are read;
+- `brain ui --install-shortcut` / `--remove-shortcut` (also `--dry-run`):
+  refused before the running image or `user-dirs.dirs` is looked at; resolved
+  menu, icon and desktop destinations containing control characters are
+  refused before launcher writes;
+- every `brain clients` subcommand (register, list, forget, configure,
+  unconfigure).
+
+The message is fixed and never quotes the path. Paths are not canonicalized
+or followed, so an absolute `HOME` that is an alias (for example
+`/home -> /var/home`), and Unicode or space-containing absolute homes, work as
+before. Other commands are not covered by this check and no claim is made
+that every command validates `HOME`. The check is lexical: a same-user
+process that later replaces a directory on an accepted path is outside it.
+
+**If an earlier version already ran with a bad `HOME`.** Brain may have
+created `.brain`, client files or launchers relative to the directory it was
+started in. Brain does not search for or delete them. Set `HOME` explicitly to
+your real absolute home, then inspect only the specific paths you recognise
+(for example a stray `.brain` in that directory) and keep your own client
+profiles and originals; do not use wildcards or delete anything you cannot
+attribute. Run `brain uninstall --dry-run` and `brain ui --remove-shortcut
+--dry-run` with the correct `HOME` to see what Brain itself recorded there.

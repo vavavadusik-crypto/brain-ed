@@ -19,6 +19,40 @@ const PRIVATE_DIR: u32 = 0o700;
 #[cfg(unix)]
 const PRIVATE_FILE: u32 = 0o600;
 
+/// Fixed refusal for an unusable `HOME`; it never quotes the path.
+pub(crate) const UNSAFE_HOME: &str = "refusing: HOME and the Brain home must be absolute UTF-8 paths without control characters (set HOME to an absolute path); nothing was changed";
+
+/// Absolute, UTF-8 and free of control characters (DEL and C1 included).
+///
+/// Pure: no filesystem access, no canonicalization, no symlink following, so
+/// an existing alias such as `/home -> /var/home` stays acceptable. An unset
+/// `HOME` reaches Brain as `.` and an empty one as ``, which made relative
+/// paths resolve against the current directory; a control character cannot
+/// be written safely into TOML, JSON commands or desktop entries.
+pub(crate) fn is_safe_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .to_str()
+            .is_some_and(|text| !text.chars().any(char::is_control))
+}
+
+/// Refuses, before any I/O, when one of `paths` is not `is_safe_absolute`.
+pub(crate) fn require_safe_paths(paths: &[&Path]) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.iter().all(|path| is_safe_absolute(path)) {
+        Ok(())
+    } else {
+        Err(UNSAFE_HOME.into())
+    }
+}
+
+/// The guard every integration entry point runs first, dry runs included.
+pub(crate) fn require_safe_homes(
+    home: &Path,
+    brain_home: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_safe_paths(&[home, brain_home])
+}
+
 /// Creates `path` and any missing ancestors owner-only. Existing components
 /// are left exactly as they are.
 pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
@@ -109,6 +143,76 @@ pub(crate) mod tests {
 
     pub(crate) fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Every entry under `root` with its bytes (regular files only) and mode,
+    /// never following a symlink or opening a special file.
+    pub(crate) fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, u32)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let mode = metadata.permissions().mode();
+                if metadata.is_dir() {
+                    stack.push(path.clone());
+                    out.push((path, None, mode));
+                } else if metadata.is_file() {
+                    out.push((path.clone(), fs::read(&path).ok(), mode));
+                } else {
+                    out.push((path, None, mode));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Context pairs Brain derives from an unusable `HOME`: unset (`.`),
+    /// empty, relative, non-UTF-8 and control characters. `base` is an
+    /// absolute private fixture so the absolute cases stay inside it.
+    pub(crate) fn unsafe_home_pairs(base: &Path) -> Vec<(PathBuf, PathBuf)> {
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = base.join(std::ffi::OsStr::from_bytes(b"h\xffme"));
+        let del = base.join("h\u{7f}me");
+        let escape = base.join("h\u{1b}[31mme");
+        vec![
+            (PathBuf::from("."), PathBuf::from("./.brain")),
+            (PathBuf::from(""), PathBuf::from(".brain")),
+            (
+                PathBuf::from("relative-home"),
+                PathBuf::from("relative-home/.brain"),
+            ),
+            (base.join("ok"), PathBuf::from("relative/.brain")),
+            (non_utf8.clone(), non_utf8.join(".brain")),
+            (del.clone(), del.join(".brain")),
+            (escape.clone(), escape.join(".brain")),
+            (base.join("ok"), base.join("ok\n/.brain")),
+            (base.join("ok\u{85}"), base.join("ok/.brain")),
+        ]
+    }
+
+    #[test]
+    fn the_home_guard_is_pure_and_quotes_no_path() {
+        let base = Path::new("/nonexistent-brain-guard-base");
+        for (home, brain_home) in unsafe_home_pairs(base) {
+            let error = require_safe_homes(&home, &brain_home)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, UNSAFE_HOME, "{home:?}");
+        }
+        for good in ["/home/user", "/var/home/дом ñ space", "/a//b/"] {
+            let home = Path::new(good);
+            assert!(
+                require_safe_homes(home, &home.join(".brain")).is_ok(),
+                "{good}"
+            );
+        }
+        assert!(!base.exists(), "the guard performs no I/O");
     }
 
     fn scratch(tag: &str) -> PathBuf {

@@ -7,12 +7,12 @@
 а не подтверждение работы сети компьютеров или полного архива переписок.
 [English version](README.md)
 
-**0.1.3 — ранний предварительный выпуск. Только Linux x86_64.** Готовый
+**0.1.4 — ранний предварительный выпуск. Только Linux x86_64.** Готовый
 архив нужной версии можно использовать, если он указан на
 [странице выпусков](https://github.com/vavavadusik-crypto/brain-ed/releases).
 Архив устанавливает ту версию, из которой собран. Если подходящего архива
 нет, соберите программу из исходников.
-[Проверки и ограничения](docs/release-0.1.3-verification.md).
+[Проверки и ограничения](docs/release-0.1.4-verification.md).
 
 
 Brain ED — локальная личная память и координация задач для ИИ-агентов,
@@ -143,6 +143,13 @@ Apache-2.0 (см. [LICENSE](LICENSE)). Сторонние компоненты �
 лицензиями, см. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Проверки и точные ограничения версии 0.1.2: [docs/VALIDATION.md](docs/VALIDATION.md).
-Проверки исходников 0.1.3 и их границы: [docs/release-0.1.3-verification.md](docs/release-0.1.3-verification.md).
+Проверки исходников 0.1.4 и их границы: [docs/release-0.1.4-verification.md](docs/release-0.1.4-verification.md).
 
 [3D-граф памяти: управление, области и ограничения](docs/graph-explorer.md) · [Экспериментальное чтение удалённого MCP](docs/remote-mcp.md)
+
+
+Явные профили клиентов: `brain clients register` записывает каталог клиента.
+Для зарегистрированного Codex команда `brain clients configure` отдельно
+подключает MCP. Одна регистрация не подключает клиент и не включает захват.
+См. [профили клиентов](docs/client-profiles.md) и
+[подключение Codex MCP](docs/registered-codex-mcp.md).

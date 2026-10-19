@@ -122,11 +122,13 @@ pub(crate) fn document_with(
         "automatic_session_brief": "disabled_by_design",
         "this_process": this_process(),
         "misplaced_claude_mcp_entry": settings.as_ref().is_some_and(|v| v.pointer("/mcpServers/brain").is_some()),
+        "client_registry": crate::client_registry::doctor_report(home, brain_home, homes),
         "limitations": [
             "Configuration markers do not prove a successful client handshake.",
             "Activity is a bounded journal tail, not a complete conversation archive.",
             "Missing, invalid or oversized configuration is reported as unknown.",
-            "A client whose home variable points elsewhere is reported as unknown; its relocated home is never read.",
+            "Registering a home alone neither configures nor captures from it. Codex MCP configuration of a registered home is a separate explicit opt-in (`brain clients configure`); for it this command validates only Brain's own record, not the client's config.toml or a working connection. Registered homes are otherwise inspected using filesystem metadata only. Metadata on a remote mount may delay this command.",
+            "A relocated home variable is a diagnostic hint only. Its directory contents are not read; explicit registrations are inspected for metadata.",
             "No database, model, network or external process is opened by this command.",
             "Hermes operational-graph import is not Hermes conversation capture.",
             "this_process describes only this doctor run; already running `brain serve` processes keep the binary they started with until their client reconnects them."

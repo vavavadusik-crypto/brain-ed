@@ -74,6 +74,9 @@ pub(crate) fn install(
     dry_run: bool,
     yes: bool,
 ) -> Result<usize, Box<dyn Error>> {
+    // Before the client-home hints are classified: nothing runs on an
+    // unusable HOME.
+    crate::private_fs::require_safe_homes(home, brain_home)?;
     let homes = crate::client_home::from_process_env(home);
     install_with(home, brain_home, binary, dry_run, yes, &homes)
 }
@@ -86,6 +89,10 @@ fn install_with(
     yes: bool,
     homes: &ClientHomes,
 ) -> Result<usize, Box<dyn Error>> {
+    // First, dry runs included: an unset (`.`), empty, relative or
+    // control-character HOME would plan client files, hooks and the stable
+    // copy relative to the current directory or with unwritable bytes.
+    crate::private_fs::require_safe_homes(home, brain_home)?;
     validate_versionless_binary(binary)?;
     let skipped = relocated_clients(homes);
     for (client, location) in &skipped {
@@ -250,6 +257,7 @@ pub(crate) fn uninstall(
     dry_run: bool,
     yes: bool,
 ) -> Result<usize, Box<dyn Error>> {
+    crate::private_fs::require_safe_homes(home, brain_home)?;
     let homes = crate::client_home::from_process_env(home);
     uninstall_with(home, brain_home, dry_run, yes, &homes)
 }
@@ -261,6 +269,8 @@ fn uninstall_with(
     yes: bool,
     homes: &ClientHomes,
 ) -> Result<usize, Box<dyn Error>> {
+    // Before the manifest, backups or any client file is looked at.
+    crate::private_fs::require_safe_homes(home, brain_home)?;
     let manifest_path = brain_home.join("install-manifest.json");
     // The whole manifest is checked before any client file or backup is read
     // or changed: its location, its file, and every entry against the exact
@@ -884,7 +894,7 @@ fn marker_plan(
 /// than one whole-line begin/end pair outside any multi-line value. Any
 /// triple-quoted string value is refused outright (manual fix), rather than
 /// guessing where it ends.
-fn codex_config_conflicts(original: &str) -> Result<(), String> {
+pub(crate) fn codex_config_conflicts(original: &str) -> Result<(), String> {
     let mut table: Vec<String> = Vec::new();
     let mut depth = 0_usize;
     let mut in_block = false;
@@ -1663,6 +1673,79 @@ fn bounded_line(line: &str) -> String {
     }
 }
 
+#[cfg(all(test, unix))]
+mod home_guard_tests {
+    use super::*;
+    use crate::private_fs::UNSAFE_HOME;
+    use crate::private_fs::tests::{snapshot, unsafe_home_pairs};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "brain-installer-guard-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[test]
+    fn unusable_homes_refuse_install_and_uninstall_before_any_io() {
+        let root = scratch("refuse");
+        // A detectable client, an existing manifest and a source binary that a
+        // loose guard would read, back up, copy or restore.
+        let good_home = root.join("ok");
+        fs::create_dir_all(good_home.join(".codex")).unwrap();
+        fs::write(good_home.join(".codex/config.toml"), b"model = \"x\"\n").unwrap();
+        let source = root.join("build/brain");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let homes = crate::client_home::classify_all(&good_home, None, None, None);
+        let before = snapshot(&root);
+        for (home, brain_home) in unsafe_home_pairs(&root) {
+            for dry_run in [true, false] {
+                for result in [
+                    install_with(&home, &brain_home, &source, dry_run, true, &homes),
+                    uninstall_with(&home, &brain_home, dry_run, true, &homes),
+                    install(&home, &brain_home, &source, dry_run, true),
+                    uninstall(&home, &brain_home, dry_run, true),
+                ] {
+                    assert_eq!(result.unwrap_err().to_string(), UNSAFE_HOME, "{home:?}");
+                }
+            }
+        }
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "no manifest, backup, copy or client write"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_unicode_home_with_spaces_still_plans_normally() {
+        let root = scratch("unicode");
+        let home = root.join("дом ñ space");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let source = root.join("build/brain");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let homes = crate::client_home::classify_all(&home, None, None, None);
+        let before = snapshot(&root);
+        install_with(&home, &home.join(".brain"), &source, true, true, &homes).unwrap();
+        uninstall_with(&home, &home.join(".brain"), true, true, &homes).unwrap();
+        assert_eq!(snapshot(&root), before, "dry runs still write nothing");
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 /// Where the agent hooks are pointed: a copy Brain owns, inside its own home.
 pub(crate) fn stable_copy_path(brain_home: &Path) -> PathBuf {
     brain_home.join("bin").join("brain")
@@ -1818,7 +1901,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> 
     fs::rename(temporary, path)
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09_e667,
         0xbb67_ae85,
@@ -1965,7 +2048,7 @@ fn confirm(question: &str) -> io::Result<bool> {
     ))
 }
 
-fn toml_string(value: &str) -> String {
+pub(crate) fn toml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 

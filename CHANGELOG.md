@@ -3,6 +3,34 @@
 All notable changes are listed here. Versions follow semantic versioning;
 `0.x` releases may change formats and interfaces.
 
+## [0.1.4] — early preview
+
+### Added
+- Explicit registration of Codex, Claude Code and Hermes client homes, with bounded
+  owner-only registry state and metadata diagnostics. Registration does not read
+  client contents or enable capture.
+- Opt-in MCP setup for one registered Codex home (`clients configure` and
+  `clients unconfigure`), with dry runs, bounded configuration edits, hash-based
+  recovery, drift refusal and a retained integration binary. Claude and Hermes
+  registrations do not gain automatic global MCP/hook integration.
+
+### Security and reliability
+- Integration commands reject unset, empty, relative, non-UTF-8 or control-bearing
+  HOME before writes; `init --agents` checks before database creation. The rule
+  covers agent installation/removal, shortcuts and client-profile commands.
+- Hook state files reject symlinks, FIFOs, hardlinks and unsafe ownership/modes;
+  the handler no longer repairs permissions or truncates a symlink target.
+- Hook stdin is bounded by size/time, supports ordinary pipes and stream sockets
+  without changing shared descriptor flags, and keeps stdout exactly `{}`.
+  Unknown, malformed and oversized input is discarded. The journal remains
+  bounded and best-effort, with no complete-capture or real-client callback claim.
+
+### Limits
+- Linux x86_64 early preview; no new physical-fleet, enterprise ACL, portability,
+  signing/provenance or formal audit claim. Existing integration binaries are not
+  silently upgraded or automatically deleted. See the dedicated profile and
+  hook documentation for recovery and filesystem timing limits.
+
 ## [0.1.3] — 2026-10-10 (early preview)
 
 ### Changed

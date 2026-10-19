@@ -27,6 +27,8 @@ mod archive;
 mod background;
 mod brief;
 mod client_home;
+mod client_integration;
+mod client_registry;
 mod desktop;
 mod doctor;
 mod embedding_runtime;
@@ -248,6 +250,13 @@ enum Command {
 
     /// Refresh the imported part of the graph from a Graphify export.
     Import(import::ImportArgs),
+
+    /// Explicitly registered agent-client homes (registration only: no client
+    /// integration, discovery or capture).
+    Clients {
+        #[command(subcommand)]
+        action: client_registry::ClientsCommand,
+    },
 
     /// Remove every agent integration recorded by `brain init --agents`.
     Uninstall {
@@ -605,6 +614,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             dry_run,
             yes,
         } => {
+            // `--agents` refuses an unusable HOME before the database is
+            // created, not only inside the installer. Plain `init` is unchanged.
+            if agents {
+                private_fs::require_safe_homes(&user_home(), &brain_home())?;
+            }
             if !agents || !dry_run {
                 command_init(path.as_deref().unwrap_or(&config.database))?;
             }
@@ -687,6 +701,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Ui(args) => ui::run(&config, &args),
         Command::Reindex(args) => reindex::run(&config, &args),
         Command::Import(args) => import::run(&config, &args),
+        Command::Clients { action } => print_json(&client_registry::run(
+            &action,
+            &user_home(),
+            &brain_home(),
+            now_unix_seconds(),
+        )?),
         Command::Uninstall { dry_run, yes } => {
             installer::uninstall(&user_home(), &brain_home(), dry_run, yes)?;
             Ok(())
