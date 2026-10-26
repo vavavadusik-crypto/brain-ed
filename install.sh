@@ -77,4 +77,5 @@ chmod 755 "$staged"
 mv -f -- "$staged" "$binary"
 staged=''
 printf 'Installed %s (SHA-256 %s)\n' "$binary" "$actual"
+# shellcheck disable=SC2016 # literal $HOME/$PATH: a line for the user to paste
 printf 'Next: export PATH="$HOME/.local/bin:$PATH"\nbrain init --agents --dry-run\n'

@@ -207,6 +207,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Allowlist policy over parsed SPDX expressions (OR/AND/WITH/parens);
       # an unreviewed licence or an unpinned licence_file fails the job.
+      # check-licenses reads crate metadata offline; a fresh runner must fetch it first.
+      - run: cargo fetch --locked
       - run: python3 tools/check-licenses.py --self-test
       - run: python3 tools/check-licenses.py --check-notices
 
