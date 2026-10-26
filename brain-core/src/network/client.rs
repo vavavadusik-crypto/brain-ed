@@ -284,8 +284,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    fn temp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("brain-client-{tag}-{}", std::process::id()));
+    fn temp(_tag: &str) -> PathBuf {
+        let dir = crate::test_support::temp_path("brain-client");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir

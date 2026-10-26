@@ -2,6 +2,8 @@
 //! installation ids race on one isolated database. This proves the local
 //! concurrency semantics, not a network deployment on ten computers.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,15 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-fn isolated_home(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn isolated_home(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-coord-process-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-coord-process");
     fs::create_dir_all(root.join(".brain")).expect("create isolated home");
     root
 }

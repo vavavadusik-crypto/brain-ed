@@ -24,11 +24,13 @@ pub(crate) enum WorkCommand {
     Add {
         project: String,
         title: String,
+        /// Optional longer description of the task.
         #[arg(long, default_value = "")]
         detail: String,
         /// Task id that must be completed first (repeatable).
         #[arg(long = "depends-on")]
         depends_on: Vec<i64>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -36,15 +38,19 @@ pub(crate) enum WorkCommand {
     Depend { task: i64, on: i64 },
     /// One page of tasks with their live owners.
     Board {
+        /// Only tasks in this project.
         #[arg(long)]
         project: Option<String>,
+        /// Only tasks in this state (queued, active, paused, completed or failed).
         #[arg(long)]
         state: Option<String>,
         /// Only claimable tasks: queued/paused, dependencies done, no live owner.
         #[arg(long)]
         ready: bool,
+        /// Skip this many tasks before the page (default 0).
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Page size (default 50).
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
@@ -52,18 +58,23 @@ pub(crate) enum WorkCommand {
     Show { task: i64 },
     /// Live claims (tasks and paths).
     Claims {
+        /// Only claims in this project.
         #[arg(long)]
         project: Option<String>,
+        /// Skip this many claims before the page (default 0).
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Page size (default 50).
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
     /// Claim a task with a lease.
     Claim {
         task: i64,
+        /// Lease length in seconds (10-86400, default 900).
         #[arg(long, default_value_t = DEFAULT_TTL_SECS, allow_negative_numbers = true)]
         ttl: i64,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -71,10 +82,13 @@ pub(crate) enum WorkCommand {
     ClaimPath {
         project: String,
         path: String,
+        /// Link the path claim to this task id.
         #[arg(long)]
         task: Option<i64>,
+        /// Lease length in seconds (10-86400, default 900).
         #[arg(long, default_value_t = DEFAULT_TTL_SECS, allow_negative_numbers = true)]
         ttl: i64,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -89,6 +103,7 @@ pub(crate) enum WorkCommand {
         claim: i64,
         #[arg(allow_negative_numbers = true)]
         fence: i64,
+        /// New lease length in seconds (10-86400, default 900).
         #[arg(long, default_value_t = DEFAULT_TTL_SECS, allow_negative_numbers = true)]
         ttl: i64,
     },
@@ -97,6 +112,7 @@ pub(crate) enum WorkCommand {
         claim: i64,
         #[arg(allow_negative_numbers = true)]
         fence: i64,
+        /// Short reason recorded with the claim events.
         #[arg(long, default_value = "")]
         note: String,
     },
@@ -106,8 +122,10 @@ pub(crate) enum WorkCommand {
         #[arg(allow_negative_numbers = true)]
         fence: i64,
         state: String,
+        /// Short reason recorded with the claim events.
         #[arg(long, default_value = "")]
         note: String,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -116,14 +134,19 @@ pub(crate) enum WorkCommand {
         claim: i64,
         #[arg(allow_negative_numbers = true)]
         fence: i64,
+        /// Receiving agent name.
         #[arg(long)]
         to_agent: String,
+        /// Receiving installation id (its machine-id).
         #[arg(long)]
         to_machine: String,
+        /// Lease length for the receiver in seconds (10-86400, default 900).
         #[arg(long, default_value_t = DEFAULT_TTL_SECS, allow_negative_numbers = true)]
         ttl: i64,
+        /// Short reason recorded with the claim events.
         #[arg(long, default_value = "")]
         note: String,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },

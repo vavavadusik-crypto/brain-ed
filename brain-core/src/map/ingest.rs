@@ -1258,8 +1258,8 @@ mod tests {
             .unwrap();
     }
 
-    fn fx(tag: &str) -> Fx {
-        let dir = std::env::temp_dir().join(format!("brain-m2-{tag}-{}", std::process::id()));
+    fn fx(_tag: &str) -> Fx {
+        let dir = crate::test_support::temp_path("brain-m2");
         let _ = fs::remove_dir_all(&dir);
         private_dir(&dir);
         Fx {

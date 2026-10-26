@@ -798,8 +798,8 @@ mod tests {
         }
     }
 
-    fn dir(tag: &str) -> Dir {
-        let d = std::env::temp_dir().join(format!("brain-m3a-{tag}-{}", std::process::id()));
+    fn dir(_tag: &str) -> Dir {
+        let d = crate::test_support::temp_path("brain-m3a");
         let _ = std::fs::remove_dir_all(&d);
         Dir(d)
     }

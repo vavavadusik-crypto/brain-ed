@@ -1,0 +1,19 @@
+# Root-relative Python fnmatch patterns; directories end in /.
+# Internal agent workflow, not public contributor guidance.
+AGENTS.md
+# Workstation verification evidence and stage reports.
+docs/*-report*.md
+docs/*-validation*.md
+docs/e*-*.md
+docs/e45-viewer-benchmark.json
+docs/release-audit*
+docs/release-*-verification.md
+docs/reports/
+docs/plans/
+# Owner-only draft tied to an unpublished local plan.
+docs/adr/0002-team-facts.md
+# Measurements/questions derived from private live databases and station corpus.
+bench/retrieval/results/
+bench/retrieval/questions.jsonl
+docs/retrieval-bench.md
+docs/archive-rank.md

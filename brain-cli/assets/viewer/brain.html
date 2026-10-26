@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>New Generation Brain</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/brain-viewer/style.css">
+  <script>
+    /* Brain ED window key (task T2 of docs/e4-viewer-port-plan.md): the
+       address arrives as #k=<token>, is stamped into sessionStorage once and
+       wiped from the address bar; every request the viewer makes then carries
+       it as a header, exactly like the explorer page does. Without the key
+       the data routes answer 403 and the viewer says so instead of drawing. */
+    (function () {
+      var SLOT = "brain-ui-token";
+      var match = /^#k=([0-9a-f]{64})$/.exec(location.hash);
+      if (match) history.replaceState(null, "", location.pathname + location.search);
+      var token = "";
+      try {
+        if (match) sessionStorage.setItem(SLOT, match[1]);
+        token = sessionStorage.getItem(SLOT) || "";
+      } catch (error) {
+        token = match ? match[1] : "";
+      }
+      var original = window.fetch.bind(window);
+      window.fetch = function (input, init) {
+        init = Object.assign({}, init || {});
+        init.headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
+        init.headers.set("X-Brain-Token", token);
+        return original(input, init);
+      };
+    })();
+  </script>
+</head>
+<body>
+  <canvas id="brain"></canvas>
+  <div id="labelLayer"></div>
+  <div id="hoverCard" class="hover-card"></div>
+  <div id="loading" class="loading">Загружаю New Generation Brain...</div>
+  <div class="topbar">
+    <section class="brand">
+      <h1><strong>New Generation Brain</strong></h1>
+      <p id="stats"></p>
+    </section>
+    <section class="searchbox">
+      <input id="search" placeholder="Найти узел, файл, идею..." autocomplete="off" />
+      <select id="typeFilter">
+        <option value="all">Все типы</option>
+        <option value="code">Код</option>
+        <option value="document">Документы</option>
+        <option value="rationale">Решения</option>
+        <option value="concept">Концепты</option>
+      </select>
+      <select id="communityFilter">
+        <option value="all">Все сообщества</option>
+      </select>
+      <select id="lobeFilter">
+        <option value="all">Все доли</option>
+      </select>
+      <select id="sortMode">
+        <option value="relevance">По релевантности</option>
+        <option value="importance">По важности</option>
+        <option value="activity">По активности</option>
+        <option value="degree">По связности</option>
+        <option value="lobe">По доле</option>
+        <option value="label">По имени</option>
+      </select>
+      <div id="results" class="results"></div>
+    </section>
+    <section class="actions">
+      <span id="clusterControls" hidden></span>
+      <button id="addBrain">Добавить в мозг</button>
+      <button id="openHome">Obsidian Home</button>
+      <button id="openGraphNote">Graphify note</button>
+      <button id="toggleLabels" class="active">Labels</button>
+      <button id="toggleCards">Cards</button>
+      <button id="toggleLobes" class="active">Lobes</button>
+      <button id="toggleDrag">Move nodes</button>
+      <button id="toggleOps">Ops pulse</button>
+      <button id="toggleCinematic" class="active">Cinematic</button>
+      <button id="toggleQuiet">Тихий режим</button>
+      <button id="resetView">Reset</button>
+      <button id="toggleMotion">Пауза</button>
+    </section>
+  </div>
+  <aside class="inspector" id="inspector">
+    <h2>Выбери узел</h2>
+    <div class="field">Клик по нейрону откроет детали. Включи Move nodes, чтобы перетаскивать отдельные узлы. Labels/Cards показывают подписи и визуальные карточки.</div>
+  </aside>
+  <aside class="structure" id="structure"></aside>
+  <aside class="ops-panel" id="opsPanel"></aside>
+  <div id="bottomZone" class="bottom-zone">
+    <details id="legend" class="legend">
+      <summary>Легенда</summary>
+      <div class="legend-body">
+        <span><span class="dot" style="background:#68d8ff"></span>code</span>
+        <span><span class="dot" style="background:#ffd166"></span>document</span>
+        <span><span class="dot" style="background:#f5f7fb"></span>concept</span>
+        <span><span class="dot" style="background:#c084fc"></span>memory</span>
+        <span class="lobe-pill">size = importance</span>
+        <span class="lobe-pill">pulse = recent activity</span>
+        <span class="lobe-pill">lobes = functional regions</span>
+        <span id="energyState" class="lobe-pill">active · 60 fps</span>
+        <span>drag: rotate</span>
+        <span>Move nodes: drag neuron</span>
+        <span>wheel: zoom к курсору</span>
+      </div>
+    </details>
+    <div id="timeline" class="timebar">
+      <button id="timePlay" title="Проиграть выбранный режим">&#9654;</button>
+      <select id="timeMode" aria-label="Режим таймлайна">
+        <option value="growth" selected>Рост мозга</option>
+        <option value="activity">Активность</option>
+      </select>
+      <select id="timeWindow" aria-label="Период таймлайна">
+        <option value="24h">24 часа</option>
+        <option value="7d">7 дней</option>
+        <option value="30d">30 дней</option>
+        <option value="180d">6 месяцев</option>
+        <option value="all" selected>всё время</option>
+      </select>
+      <select id="timeSpeed" aria-label="Скорость воспроизведения">
+        <option value="10">×10</option>
+        <option value="60" selected>×60</option>
+        <option value="600">×600</option>
+      </select>
+      <input id="timeRange" type="range" min="0" max="1000" value="1000" aria-label="История роста мозга" />
+      <span id="timeLabel" class="time-label">вся история</span>
+      <span id="timeWho" class="time-who">нейроны: все</span>
+      <button id="timeHeat" class="time-reset">Где шла работа</button>
+      <button id="timeAll" class="time-reset">всё</button>
+    </div>
+    <div id="views" class="views"></div>
+  </div>
+
+  <script src="/vendor/three.min.js"></script>
+  <script type="module" src="/brain-viewer/app.js"></script>
+</body>
+</html>

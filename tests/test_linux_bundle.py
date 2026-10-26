@@ -24,6 +24,38 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+TMP_PREFIX = "bundle test "
+STALE_SECONDS = 6 * 3600
+
+
+def remove_tree(path):
+    """Remove a test tree even where the test made entries read-only."""
+    def writable_then_retry(function, failed, _info):
+        try:
+            os.chmod(os.path.dirname(failed), 0o700)
+            os.chmod(failed, 0o700)
+            function(failed)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onexc=writable_then_retry) if sys.version_info >= (3, 12) else \
+        shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def setUpModule():
+    # Each run copies the ~200 MB binary several times; an interrupted run would
+    # otherwise leave gigabytes in a quota-limited tmpfs. Only our own stale trees.
+    base = tempfile.gettempdir()
+    for name in os.listdir(base):
+        path = os.path.join(base, name)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if (name.startswith(TMP_PREFIX) and os.path.isdir(path) and not os.path.islink(path)
+                and info.st_uid == os.getuid() and time.time() - info.st_mtime > STALE_SECONDS):
+            remove_tree(path)
 TOOL = os.path.join(ROOT, "tools", "package-linux.py")
 BRAIN_BIN = os.environ.get("BRAIN_BIN")
 SOURCE_FILES = ["LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "docs/INSTALL.md", "docs/linux-download.md",
@@ -64,9 +96,9 @@ def snapshot(top):
 @unittest.skipUnless(BRAIN_BIN and os.path.isfile(BRAIN_BIN), "BRAIN_BIN must point at a built brain binary")
 class Bundle(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="bundle test ")
+        self.tmp = tempfile.mkdtemp(prefix=TMP_PREFIX)
         os.chmod(self.tmp, 0o755)
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(remove_tree, self.tmp)
         self.repo = os.path.join(self.tmp, "source repo")
         for rel in SOURCE_FILES:
             os.makedirs(os.path.dirname(os.path.join(self.repo, rel)), exist_ok=True)

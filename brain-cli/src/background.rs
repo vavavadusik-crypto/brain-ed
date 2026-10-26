@@ -749,14 +749,11 @@ impl Drop for WorkerLock {
 mod tests {
     use super::*;
 
-    fn temp_brain_home(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
+    fn temp_brain_home(_label: &str) -> PathBuf {
+        let _nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        std::env::temp_dir().join(format!(
-            "brain-background-{label}-{}-{nanos}",
-            std::process::id()
-        ))
+        crate::test_support::temp_path("brain-background")
     }
 
     #[test]

@@ -1,31 +1,30 @@
-//! `brain net …`: the `brain-coord/1` coordinator over loopback TLS.
+//! `brain net …`: explicit TLS coordination and an optional company relay.
 //!
-//! * `serve` runs a TLS coordinator bound to `127.0.0.1` only. There is no
-//!   bind option: a LAN listener is a separate deployment gate.
-//! * `enroll`, `revoke`, `principals` are trusted LOCAL administration of
-//!   the coordinator's own state directory; they never touch the network.
-//! * `status` and `call` are the client: a numeric loopback dial target,
-//!   a separate certificate name, a pinned CA file and a credential FILE
-//!   or inherited descriptor. A token is never accepted on the command
-//!   line, never printed, never put in an error.
-//!
-//! Identity comes from the credential. The global `--agent` is not sent:
-//! the server derives the acting agent and machine from the token.
-//! Every command prints exactly one JSON object; the exit code says what
-//! happened (see [`Exit`]). Nothing here writes Brain's user config or
-//! database; every path is explicit.
+//! * `serve` defaults to loopback; LAN/CGNAT listeners require opt-in. With
+//!   `--via-relay`, loopback TLS also accepts outgoing registered tunnels.
+//! * `relay serve` is an explicitly public listener with separate name/role
+//!   tokens. It unwraps only outer relay TLS; coordinator TLS stays end to end.
+//! * Local administration and join use explicit state paths. Client identity
+//!   comes from the coordinator credential, never the global `--agent`.
+//! * Clients pin the coordinator CA and SAN/Host independently of the route.
+//!   Only a failed direct TCP connect may select a configured relay. Requests
+//!   are never replayed after a TLS refusal or a possible dispatch.
+//! * Secrets are read from owner-only files/descriptors, never argv or output.
+//!   Serving commands print readiness JSON and stop when stdin closes.
 
 use std::error::Error;
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::bundle;
 use brain_core::network::auth::{DEFAULT_CREDENTIAL_TTL_SECS, MIN_CREDENTIAL_TTL_SECS};
 use brain_core::network::tls::{MAX_DEADLINE, MIN_DEADLINE};
 use brain_core::network::{
     AuthStore, KeySource, NetError, TcpDialer, TlsCallResult, TlsClientConfig, TlsCoordClient,
-    TlsCoordServer, TlsError, TlsServerConfig, allowed_tools, parse_dial_target_lan,
+    TlsCoordServer, TlsError, TlsServerConfig, allowed_tools, parse_dial_target_with,
     tools_for_role, write_credential_file,
 };
 use clap::{Args, Subcommand};
@@ -33,7 +32,9 @@ use serde_json::{Map, Value, json};
 
 use crate::RuntimeConfig;
 
+mod relay;
 mod share;
+pub(crate) mod team;
 
 const PROTOCOL: &str = "brain-coord/1";
 
@@ -61,6 +62,11 @@ pub(crate) enum NetCommand {
     /// Prints one JSON line with the actual bound address once it accepts.
     /// A private LAN address needs both --listen and the explicit --allow-lan.
     Serve(ServeArgs),
+    /// Company-hosted NAT relay with separate scoped tokens and end-to-end coordinator TLS.
+    Relay {
+        #[command(subcommand)]
+        command: relay::RelayCommand,
+    },
     /// Trusted local admin: create/refresh a principal and write a new credential file (0600).
     ///
     /// The token goes to --credential-out only; stdout shows its token_id.
@@ -69,6 +75,10 @@ pub(crate) enum NetCommand {
     Revoke(RevokeArgs),
     /// Trusted local admin: list principals (no secrets, no credential hashes).
     Principals(StateDirArg),
+    /// Create the coordinator's own CA and server certificate (rcgen, EC P-256).
+    Init(InitArgs),
+    /// Unpack a join bundle: CA, credential and endpoint for this machine.
+    Join(JoinArgs),
     /// Ask the coordinator who this credential is and what it may call.
     Status(ConnectArgs),
     /// Opt-in shared memory: host-local enable/grant/publish and TLS pull.
@@ -93,19 +103,52 @@ pub(crate) struct StateDirArg {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct ServeArgs {
+pub(crate) struct InitArgs {
     #[command(flatten)]
     state: StateDirArg,
-    /// Server certificate chain (PEM, owned by this uid).
+    /// DNS name for the server certificate SAN (repeatable).
+    #[arg(long = "name", value_name = "NAME")]
+    names: Vec<String>,
+    /// Numeric IP for the SAN (repeatable).
+    #[arg(long = "ip", value_name = "IP")]
+    ips: Vec<String>,
+    /// Replace existing certificates; without this a repeat init changes nothing.
+    #[arg(long)]
+    rotate: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct JoinArgs {
+    /// The bundle file written by `net enroll --bundle-out`.
+    bundle: PathBuf,
+    /// Client directory (default: $BRAIN_HOME/net/client).
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Allow dialing private LAN addresses; stored in endpoint.json.
+    #[arg(long)]
+    allow_lan_dial: bool,
+    /// Allow dialing shared CGNAT/overlay addresses; stored in endpoint.json.
+    #[arg(long)]
+    allow_cgnat_dial: bool,
+    /// Delete the bundle after a successful unpack.
+    #[arg(long)]
+    consume: bool,
+    /// Replace an already joined endpoint (the old one is kept as `<dir>.previous`).
+    #[arg(long)]
+    replace: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    relay: relay::RelayArgs,
+    #[command(flatten)]
+    state: StateDirArg,
+    /// Server certificate chain (PEM, owned by this uid); default DIR/tls/server.pem.
     #[arg(long, value_name = "FILE")]
-    cert: PathBuf,
+    cert: Option<PathBuf>,
     /// Server private key (PEM, 0600, no symlink).
-    #[arg(
-        long,
-        value_name = "FILE",
-        required_unless_present = "key_fd",
-        conflicts_with = "key_fd"
-    )]
+    #[arg(long, value_name = "FILE", conflicts_with = "key_fd")]
     key: Option<PathBuf>,
     /// Inherited descriptor (>= 3) holding the private key; same checks as --key.
     #[arg(long, value_name = "N")]
@@ -120,6 +163,9 @@ pub(crate) struct ServeArgs {
     /// Wildcard, multicast, broadcast, link-local and public addresses are always refused.
     #[arg(long)]
     allow_lan: bool,
+    /// Opt in to listening on a shared CGNAT/overlay address (RFC 6598 range, e.g. Tailscale IPv4).
+    #[arg(long)]
+    allow_cgnat: bool,
     /// Absolute per-connection deadline in milliseconds (50..=5000).
     #[arg(long, default_value_t = 5000)]
     deadline_ms: u64,
@@ -127,6 +173,8 @@ pub(crate) struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct EnrollArgs {
+    #[command(flatten)]
+    relay: relay::RelayArgs,
     #[command(flatten)]
     state: StateDirArg,
     /// Machine (installation) id, [a-z0-9-]{3,64}.
@@ -150,6 +198,15 @@ pub(crate) struct EnrollArgs {
     /// New file for the credential; must not exist. Created 0600.
     #[arg(long, value_name = "FILE")]
     credential_out: PathBuf,
+    /// Also write a versioned join bundle (CA + credential + endpoints) 0600.
+    #[arg(long, value_name = "FILE")]
+    bundle_out: Option<PathBuf>,
+    /// Dial endpoints for the bundle (repeatable, IP:PORT).
+    #[arg(long = "dial", value_name = "IP:PORT")]
+    bundle_dial: Vec<String>,
+    /// Server name for the bundle; default: first DNS name of the server cert.
+    #[arg(long, value_name = "NAME")]
+    server_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -164,27 +221,29 @@ pub(crate) struct RevokeArgs {
     machine: Option<String>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConnectArgs {
-    /// Numeric dial target, e.g. 127.0.0.1:7443. Hostnames are refused, never resolved.
+    #[command(flatten)]
+    #[serde(default)]
+    relay: relay::RelayArgs,
+    /// Numeric dial target, e.g. 127.0.0.1:7443; default: endpoint.json from `net join`.
     #[arg(long, value_name = "IP:PORT")]
-    dial: String,
+    dial: Option<String>,
     /// Opt in to dialing a private unicast LAN address (same policy as --allow-lan).
     #[arg(long)]
     allow_lan_dial: bool,
-    /// Name the server certificate must carry (SAN), e.g. localhost.
+    /// Opt in to dialing a shared CGNAT/overlay address (same policy as --allow-cgnat).
+    #[arg(long)]
+    allow_cgnat_dial: bool,
+    /// Name the server certificate must carry (SAN); default: endpoint.json.
     #[arg(long, value_name = "NAME")]
-    server_name: String,
-    /// The only CA trusted for this call (PEM). System roots are never used.
+    server_name: Option<String>,
+    /// The only CA trusted for this call (PEM); default: endpoint.json. System roots are never used.
     #[arg(long, value_name = "FILE")]
-    ca: PathBuf,
-    /// Credential file (0600, no symlink, owned by this uid).
-    #[arg(
-        long,
-        value_name = "FILE",
-        required_unless_present = "credential_fd",
-        conflicts_with = "credential_fd"
-    )]
+    ca: Option<PathBuf>,
+    /// Credential file (0600, no symlink, owned by this uid); default: endpoint.json.
+    #[arg(long, value_name = "FILE", conflicts_with = "credential_fd")]
     credential: Option<PathBuf>,
     /// Inherited descriptor (>= 3) of a credential file; same checks as --credential.
     #[arg(long, value_name = "N")]
@@ -202,14 +261,19 @@ pub(crate) enum RemoteOp {
     Whoami,
     /// One page of tasks with their live owners.
     Board {
+        /// Only tasks in this project.
         #[arg(long)]
         project: Option<String>,
+        /// Only tasks in this state (queued, active, paused, completed or failed).
         #[arg(long, value_parser = ["queued", "active", "paused", "completed", "failed"])]
         state: Option<String>,
+        /// Only claimable tasks: queued/paused, dependencies done, no live owner.
         #[arg(long)]
         ready: bool,
+        /// Skip this many tasks before the page (default 0).
         #[arg(long, default_value_t = 0)]
         offset: u32,
+        /// Page size (1-200, default 50).
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
         limit: u32,
     },
@@ -220,10 +284,13 @@ pub(crate) enum RemoteOp {
     },
     /// Live claims.
     Claims {
+        /// Only claims in this project.
         #[arg(long)]
         project: Option<String>,
+        /// Skip this many claims before the page (default 0).
         #[arg(long, default_value_t = 0)]
         offset: u32,
+        /// Page size (1-200, default 50).
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=200))]
         limit: u32,
     },
@@ -231,10 +298,13 @@ pub(crate) enum RemoteOp {
     Add {
         project: String,
         title: String,
+        /// Optional longer description of the task.
         #[arg(long)]
         detail: Option<String>,
+        /// Task id that must be completed first (repeatable).
         #[arg(long = "depends-on", value_parser = positive())]
         depends_on: Vec<i64>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -249,8 +319,10 @@ pub(crate) enum RemoteOp {
     Claim {
         #[arg(value_parser = positive())]
         task: i64,
+        /// Lease length in seconds (10-86400; default: the coordinator's).
         #[arg(long, value_parser = positive())]
         ttl: Option<i64>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -258,10 +330,13 @@ pub(crate) enum RemoteOp {
     ClaimPath {
         project: String,
         path: String,
+        /// Link the path claim to this task id.
         #[arg(long, value_parser = positive())]
         task: Option<i64>,
+        /// Lease length in seconds (10-86400; default: the coordinator's).
         #[arg(long, value_parser = positive())]
         ttl: Option<i64>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -271,6 +346,7 @@ pub(crate) enum RemoteOp {
         claim: i64,
         #[arg(value_parser = positive())]
         fence: i64,
+        /// New lease length in seconds (10-86400; default: the coordinator's).
         #[arg(long, value_parser = positive())]
         ttl: Option<i64>,
     },
@@ -280,6 +356,7 @@ pub(crate) enum RemoteOp {
         claim: i64,
         #[arg(value_parser = positive())]
         fence: i64,
+        /// Short reason recorded with the claim events.
         #[arg(long)]
         note: Option<String>,
     },
@@ -291,8 +368,10 @@ pub(crate) enum RemoteOp {
         fence: i64,
         #[arg(value_parser = ["queued", "paused", "completed", "failed"])]
         state: String,
+        /// Short reason recorded with the claim events.
         #[arg(long)]
         note: Option<String>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -302,26 +381,34 @@ pub(crate) enum RemoteOp {
         claim: i64,
         #[arg(value_parser = positive())]
         fence: i64,
+        /// Receiving agent name.
         #[arg(long)]
         to_agent: String,
+        /// Receiving installation id.
         #[arg(long)]
         to_machine: String,
+        /// Lease length for the receiver in seconds (10-86400; default: the coordinator's).
         #[arg(long, value_parser = positive())]
         ttl: Option<i64>,
+        /// Short reason recorded with the claim events.
         #[arg(long)]
         note: Option<String>,
+        /// Idempotency key: retrying with the same id never duplicates.
         #[arg(long)]
         request_id: Option<String>,
     },
     /// Read one page of the host's own shared events in --space (needs a host memory grant).
     SharePull {
+        /// Read only events after this shared-log sequence number (default 0).
         #[arg(long, default_value_t = 0)]
         after_seq: u64,
+        /// Page size (1-10, default 10).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=10))]
         limit: u32,
     },
     /// Live facts the host itself published in --space (needs a host memory grant).
     ShareQuery {
+        /// Page size (1-10, default 10).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=10))]
         limit: u32,
     },
@@ -350,6 +437,30 @@ enum Retry {
 
 pub(crate) fn run(config: &RuntimeConfig, command: NetCommand) -> Result<(), Box<dyn Error>> {
     let (exit, document) = match command {
+        NetCommand::Init(args) => {
+            match bundle::init(&args.state.state_dir, &args.names, &args.ips, args.rotate) {
+                Ok(document) => (Exit::Ok, document),
+                Err(error) => invalid(error.to_string()),
+            }
+        }
+        NetCommand::Join(args) => {
+            let client_dir = args
+                .state_dir
+                .clone()
+                .unwrap_or_else(|| crate::bundle::default_client_dir(&crate::brain_home()));
+            match bundle::join(
+                &args.bundle,
+                &client_dir,
+                args.allow_lan_dial,
+                args.allow_cgnat_dial,
+                args.consume,
+                args.replace,
+            ) {
+                Ok(document) => (Exit::Ok, document),
+                Err(error) => invalid(error.to_string()),
+            }
+        }
+        NetCommand::Relay { command } => return relay::run(command),
         NetCommand::Serve(args) => return serve(&args),
         NetCommand::Enroll(args) => enroll(&args),
         NetCommand::Revoke(args) => revoke(&args),
@@ -396,6 +507,49 @@ fn deadline(ms: u64) -> Result<Duration, (Exit, Value)> {
 }
 
 /// `NetError` text is built by this crate and never holds secret bytes.
+/// Classifies the predictable serve failures before the real start attempt:
+/// the bind probe yields `address_in_use` / `address_not_available` /
+/// `permission_denied`; unreadable certificate or key material yields
+/// `tls_material`; anything else keeps the previous category (`unavailable`).
+/// No paths or secrets ever appear in the category.
+fn serve_error_category(
+    listen: std::net::IpAddr,
+    port: u16,
+    allow_lan: bool,
+    allow_cgnat: bool,
+    cert: &Path,
+    key: Option<&Path>,
+) -> &'static str {
+    // The listen-address policy first: a policy refusal must keep the exact
+    // previous error text that start() produces (existing tests pin it), so
+    // this helper reports the previous category and lets start() speak.
+    if brain_core::network::server::checked_listen_ip_with(listen, allow_lan, allow_cgnat).is_err()
+    {
+        return "unavailable";
+    }
+    // Material second: unreadable certificate or key files yield the most
+    // specific category. Only real paths can be probed; a descriptor cannot
+    // be read without consuming it.
+    if let Some(key) = key
+        && (std::fs::read(cert).is_err() || std::fs::read(key).is_err())
+    {
+        return "tls_material";
+    }
+    let probe = std::net::TcpListener::bind(std::net::SocketAddr::new(listen, port));
+    match probe {
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::AddrInUse => "address_in_use",
+            std::io::ErrorKind::AddrNotAvailable => "address_not_available",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            _ => "unavailable",
+        },
+        Ok(listener) => {
+            drop(listener);
+            "unavailable"
+        }
+    }
+}
+
 fn net_error(error: &NetError) -> Value {
     json!({"http_status": error.status(), "detail": error.body()})
 }
@@ -403,13 +557,76 @@ fn net_error(error: &NetError) -> Value {
 // ---- serve ---------------------------------------------------------------
 
 fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
+    let relay_route = args.relay.route()?;
+    if relay_route.is_some()
+        && !args
+            .listen
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return Err("--via-relay coordinator must listen on loopback".into());
+    }
+    let relay_connector = relay_route
+        .as_ref()
+        .map(brain_core::network::relay::Connector::new)
+        .transpose()?;
     let deadline = match deadline(args.deadline_ms) {
         Ok(deadline) => deadline,
         Err((exit, document)) => return finish(exit, &document),
     };
+    // Default certificate material: DIR/tls written by `net init`.
+    let cert = args
+        .cert
+        .clone()
+        .unwrap_or_else(|| args.state.state_dir.join("tls/server.pem"));
+    // Understandable serve-failure categories (E7.0c): classified BEFORE
+    // TlsCoordServer::start from things this process can observe without
+    // leaking paths or secrets. The bind probe has a tiny race window; when
+    // start still fails on the bind, the previous category is kept.
+    // The material probe uses the effective paths: an explicit --key or the
+    // default DIR/tls/server.key. A descriptor key cannot be probed without
+    // consuming it, so --key-fd skips the key side of the check.
+    let default_key = args.state.state_dir.join("tls/server.key");
+    let key_probe: Option<&Path> = if args.key_fd.is_some() {
+        None
+    } else {
+        Some(args.key.as_deref().unwrap_or(&default_key))
+    };
+    let category = serve_error_category(
+        args.listen
+            .parse()
+            .unwrap_or(std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)),
+        args.port,
+        args.allow_lan,
+        args.allow_cgnat,
+        &cert,
+        key_probe,
+    );
+    // A classified failure is self-contained: category only, no paths, no
+    // secrets, and no start attempt (the material/port state will not change
+    // inside this process).
+    if category != "unavailable" {
+        let http_status = if category == "tls_material" { 400 } else { 503 };
+        return finish(
+            if category == "tls_material" {
+                Exit::InvalidConfig
+            } else {
+                Exit::Unreachable
+            },
+            &json!({
+                "status": "not_serving",
+                "error": {
+                    "detail": {"error": category, "message": category},
+                    "http_status": http_status,
+                },
+                "category": category,
+            }),
+        );
+    }
     let key = match (&args.key, args.key_fd) {
         (Some(path), None) => KeySource::File(path.clone()),
         (None, Some(fd)) => KeySource::Fd(fd),
+        (None, None) => KeySource::File(args.state.state_dir.join("tls/server.key")),
         _ => {
             return finish(
                 Exit::InvalidConfig,
@@ -423,12 +640,12 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
             &invalid("--listen must be a numeric IP; hostnames are never resolved").1,
         );
     };
-    let mut config =
-        TlsServerConfig::new(&args.state.state_dir, args.port, &args.cert, PathBuf::new());
+    let mut config = TlsServerConfig::new(&args.state.state_dir, args.port, &cert, PathBuf::new());
     config.key = key;
     config.deadline = deadline;
     config.listen = listen;
     config.allow_lan = args.allow_lan;
+    config.allow_cgnat = args.allow_cgnat;
     let server = match TlsCoordServer::start(&config) {
         Ok(server) => server,
         Err(error) => {
@@ -439,7 +656,7 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
             };
             return finish(
                 exit,
-                &json!({"status": "not_serving", "error": net_error(&error)}),
+                &json!({"status": "not_serving", "error": net_error(&error), "category": category}),
             );
         }
     };
@@ -452,6 +669,38 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
             );
         }
     };
+    let relay_handle = relay_connector
+        .map(|connector| {
+            brain_core::network::relay::register(
+                connector,
+                std::net::SocketAddr::new(listen, handle.port()),
+            )
+        })
+        .transpose()?;
+    // Local observation for the settings window, including non-default state dirs
+    // and ephemeral/LAN ports. No credentials enter this private document.
+    let observation_path = window_observation_path(&crate::brain_home());
+    let observation = json!({"pid": std::process::id(),
+        "started": process_start(std::process::id()),
+        "bind": std::net::SocketAddr::new(listen, handle.port()).to_string(),
+        "state_dir": std::fs::canonicalize(&args.state.state_dir)?});
+    crate::private_fs::ensure_private_home(observation_path.parent().ok_or("missing Brain home")?)?;
+    let runtime_metadata =
+        std::fs::symlink_metadata(observation_path.parent().ok_or("runtime directory")?)?;
+    if !runtime_metadata.is_dir()
+        || Some(runtime_metadata.uid()) != crate::private_fs::current_uid()
+        || runtime_metadata.mode() & 0o077 != 0
+    {
+        handle.stop();
+        return Err("unsafe coordinator runtime directory".into());
+    }
+    if let Err(error) = crate::private_fs::write_private(
+        &observation_path,
+        serde_json::to_vec(&observation)?.as_slice(),
+    ) {
+        handle.stop();
+        return Err(error.into());
+    }
     // One compact line, so a supervisor can read it before the server stops.
     let ready = json!({
         "status": "serving",
@@ -472,7 +721,13 @@ fn serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
     let mut sink = [0_u8; 256];
     let mut stdin = std::io::stdin().lock();
     while matches!(stdin.read(&mut sink), Ok(read) if read > 0) {}
+    drop(relay_handle);
     let joined = handle.stop();
+    if std::fs::read(&observation_path).ok().as_deref()
+        == Some(serde_json::to_vec(&observation)?.as_slice())
+    {
+        let _ = std::fs::remove_file(&observation_path);
+    }
     let mut stdout = std::io::stdout().lock();
     writeln!(
         stdout,
@@ -511,6 +766,13 @@ fn unix_now() -> i64 {
 }
 
 fn enroll(args: &EnrollArgs) -> (Exit, Value) {
+    let relay_bundle = match args.relay.bundle() {
+        Ok(route) => route,
+        Err(_) => return invalid("invalid relay route"),
+    };
+    if relay_bundle.is_some() && args.bundle_out.is_none() {
+        return invalid("--via-relay on enroll requires --bundle-out");
+    }
     let ttl = args.ttl_secs.unwrap_or(DEFAULT_CREDENTIAL_TTL_SECS);
     if !(MIN_CREDENTIAL_TTL_SECS..=DEFAULT_CREDENTIAL_TTL_SECS).contains(&ttl) {
         return invalid(format!(
@@ -570,18 +832,43 @@ fn enroll(args: &EnrollArgs) -> (Exit, Value) {
         );
     }
     drop(token);
-    (
-        Exit::Ok,
-        json!({
-            "status": "ok",
-            "principal": {"machine": args.machine, "agent": args.agent_id, "role": args.role, "spaces": args.grant_space, "label": args.label},
-            "token_id": token_id,
-            "expires_at": issued_at + ttl,
-            "credential_file": out,
-            "secret": "written to credential_file (0600) only",
-            "capabilities": tools_for_role(&args.role),
-        }),
-    )
+    let mut document = json!({
+        "status": "ok",
+        "principal": {"machine": args.machine, "agent": args.agent_id, "role": args.role, "spaces": args.grant_space, "label": args.label},
+        "token_id": token_id,
+        "expires_at": issued_at + ttl,
+        "credential_file": out,
+        "secret": "written to credential_file (0600) only",
+        "capabilities": tools_for_role(&args.role),
+    });
+    if let Some(bundle_out) = &args.bundle_out {
+        let server_name = args.server_name.clone().unwrap_or_else(|| {
+            bundle::first_dns_name(&args.state.state_dir).unwrap_or_else(|| "localhost".into())
+        });
+        match bundle::write_bundle(
+            &args.state.state_dir,
+            &server_name,
+            &args.bundle_dial,
+            out,
+            &args.machine,
+            &args.agent_id,
+            issued_at + ttl,
+            bundle_out,
+            relay_bundle,
+        ) {
+            Ok(written) => {
+                document["bundle"] = written["bundle"].clone();
+                document["bundle_server_name"] = json!(server_name);
+            }
+            Err(error) => {
+                return (
+                    Exit::InvalidConfig,
+                    json!({"status": "invalid_config", "error": error.to_string(), "note": "the credential file was written; the bundle was not"}),
+                );
+            }
+        }
+    }
+    (Exit::Ok, document)
 }
 
 fn revoke(args: &RevokeArgs) -> (Exit, Value) {
@@ -612,6 +899,80 @@ fn revoke(args: &RevokeArgs) -> (Exit, Value) {
     }
 }
 
+/// Private runtime observation names are scoped to the local Brain home.
+fn window_observation_path(brain_home: &Path) -> PathBuf {
+    // Per-user, per-Brain-home runtime metadata; net serve must not create a
+    // private memory store on coordinator-only installations.
+    let uid = crate::private_fs::current_uid().unwrap_or(u32::MAX);
+    let key = crate::installer::sha256(brain_home.as_os_str().as_encoded_bytes());
+    std::env::temp_dir()
+        .join(format!("brain-ed-net-{uid}"))
+        .join(format!("{key}.json"))
+}
+
+fn process_start(pid: u32) -> Option<String> {
+    // /proc stat field 22; comm can contain spaces and parentheses.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .map(str::to_owned)
+}
+
+fn window_observation(brain_home: &Path) -> Option<Value> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(window_observation_path(brain_home))
+        .ok()
+        .filter(|file| {
+            file.metadata().ok().is_some_and(|meta| {
+                meta.is_file()
+                    && Some(meta.uid()) == crate::private_fs::current_uid()
+                    && meta.mode() & 0o077 == 0
+            })
+        })
+        .and_then(|file| serde_json::from_reader::<_, Value>(file.take(16 * 1024)).ok())
+}
+
+pub(crate) fn window_state_dir(brain_home: &Path) -> PathBuf {
+    window_observation(brain_home)
+        .and_then(|v| v["state_dir"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| brain_home.join("net"))
+}
+
+pub(crate) fn window_state_document(brain_home: &Path) -> Value {
+    let observation = window_observation(brain_home);
+    let observed_dir = observation
+        .as_ref()
+        .and_then(|value| value["state_dir"].as_str());
+    let state_dir = observed_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| brain_home.join("net"));
+    let principals = AuthStore::principal_count_read_only(&state_dir).ok();
+    let bind = observation
+        .as_ref()
+        .and_then(|value| value["bind"].as_str());
+    let serving = observation.as_ref().and_then(|value| {
+        let pid = u32::try_from(value["pid"].as_u64()?).ok()?;
+        Some(
+            process_start(pid)
+                .as_deref()
+                .is_some_and(|started| Some(started) == value["started"].as_str()),
+        )
+    });
+    json!({
+        "team": team::manifest_document(&state_dir).unwrap_or_else(|_|json!({"error":"team_manifest_unavailable"})),
+        "auth_store": state_dir.join("auth.sqlite").is_file(),
+        "principals": principals,
+        "coordination_database": state_dir.join("coord.sqlite").is_file(),
+        "serving": serving,
+        "bind": bind,
+        "note": "Local process observation; unknown if no coordinator started by this version for this Brain home. No authenticated remote health check.",
+    })
+}
+
 fn principals(args: &StateDirArg) -> (Exit, Value) {
     let store = match existing_store(&args.state_dir) {
         Ok(store) => store,
@@ -631,24 +992,159 @@ fn principals(args: &StateDirArg) -> (Exit, Value) {
 
 // ---- client ----------------------------------------------------------------
 
-fn client(connect: &ConnectArgs) -> Result<TlsCoordClient, (Exit, Value)> {
-    let deadline = deadline(connect.deadline_ms)?;
-    let dial = parse_dial_target_lan(&connect.dial, connect.allow_lan_dial)
-        .map_err(|error| invalid(tls_message(&error)))?;
-    let credential = match (&connect.credential, connect.credential_fd) {
+/// Connection parameters after merging the explicit flags with the endpoint
+/// `net join` wrote. Explicit flags always win; the endpoint fills the rest.
+struct ResolvedConnect {
+    relay: Option<brain_core::network::relay::Route>,
+    dial: Option<String>,
+    server_name: String,
+    ca: PathBuf,
+    credential: Option<PathBuf>,
+    credential_fd: Option<i32>,
+    allow_lan_dial: bool,
+    allow_cgnat_dial: bool,
+    deadline_ms: u64,
+    from_endpoint: bool,
+}
+
+fn resolve_connect(
+    connect: &ConnectArgs,
+    use_endpoint: bool,
+) -> Result<ResolvedConnect, (Exit, Value)> {
+    let endpoint = use_endpoint
+        .then(|| bundle::load_endpoint(&bundle::default_client_dir(&crate::brain_home())))
+        .flatten();
+    let endpoint_value = endpoint.unwrap_or(Value::Null);
+    let endpoint_str = |key: &str| {
+        endpoint_value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    // The endpoint stores the dial list (the bundle's `--dial` repeats); the
+    // first entry is the primary target.
+    let dial = connect.dial.clone().or_else(|| {
+        endpoint_value
+            .get("dial")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| endpoint_str("dial"))
+    });
+    let relay = if connect.relay.via_relay.is_some() {
+        connect
+            .relay
+            .route()
+            .map_err(|_| invalid("invalid relay route"))?
+    } else {
+        endpoint_value
+            .get("relay")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                let mut route: brain_core::network::relay::Route =
+                    serde_json::from_value(v.clone())
+                        .map_err(|_| invalid("invalid relay endpoint"))?;
+                let dir = bundle::default_client_dir(&crate::brain_home());
+                route.ca = dir.join(route.ca);
+                route.token_file = dir.join(route.token_file);
+                Ok::<_, (Exit, Value)>(route)
+            })
+            .transpose()?
+    };
+    if dial.is_none() && relay.is_none() {
+        return Err(invalid(
+            "--dial is required (no endpoint.json: run brain net join or pass the flags)",
+        ));
+    }
+    let server_name = connect
+        .server_name
+        .clone()
+        .or_else(|| endpoint_str("server_name"))
+        .unwrap_or_else(|| "localhost".into());
+    let default_ca =
+        endpoint_str("ca").map(|name| bundle::default_client_dir(&crate::brain_home()).join(name));
+    let ca = match connect.ca.clone().or(default_ca) {
+        Some(ca) => ca,
+        None => {
+            return Err(invalid(
+                "--ca is required (no endpoint.json: run brain net join or pass the flags)",
+            ));
+        }
+    };
+    let default_credential = endpoint_str("credential")
+        .map(|name| bundle::default_client_dir(&crate::brain_home()).join(name));
+    let credential = connect.credential.clone().or(default_credential);
+    // Address policy from the endpoint is a floor, never silently widened:
+    // a flag can only add permission, not remove it.
+    let allow_lan_dial = connect.allow_lan_dial
+        || endpoint_value
+            .get("allow_lan_dial")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let allow_cgnat_dial = connect.allow_cgnat_dial
+        || endpoint_value
+            .get("allow_cgnat_dial")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    Ok(ResolvedConnect {
+        relay,
+        dial,
+        server_name,
+        ca,
+        credential,
+        credential_fd: connect.credential_fd,
+        allow_lan_dial,
+        allow_cgnat_dial,
+        deadline_ms: connect.deadline_ms,
+        from_endpoint: !endpoint_value.is_null(),
+    })
+}
+
+fn client(connect: &ConnectArgs) -> Result<(TlsCoordClient, bool), (Exit, Value)> {
+    client_with_endpoint(connect, true)
+}
+// A saved team peer supplies its own complete trust and routing configuration;
+// an unrelated local net-join endpoint must never fill in its relay route.
+fn client_explicit(connect: &ConnectArgs) -> Result<(TlsCoordClient, bool), (Exit, Value)> {
+    client_with_endpoint(connect, false)
+}
+fn client_with_endpoint(
+    connect: &ConnectArgs,
+    use_endpoint: bool,
+) -> Result<(TlsCoordClient, bool), (Exit, Value)> {
+    let resolved = resolve_connect(connect, use_endpoint)?;
+    let deadline = deadline(resolved.deadline_ms)?;
+    let dial = parse_dial_target_with(
+        resolved.dial.as_deref().unwrap_or("127.0.0.1:1"),
+        resolved.allow_lan_dial,
+        resolved.allow_cgnat_dial,
+    )
+    .map_err(|error| invalid(tls_message(&error)))?;
+    let credential = match (&resolved.credential, resolved.credential_fd) {
         (Some(path), None) => KeySource::File(path.clone()),
         (None, Some(fd)) => KeySource::Fd(fd),
         _ => return Err(invalid("exactly one of --credential / --credential-fd")),
     };
-    let mut config = TlsClientConfig::new(&connect.ca, &connect.server_name, dial);
+    let mut config = TlsClientConfig::new(&resolved.ca, &resolved.server_name, dial);
     config.deadline = deadline;
-    config.allow_lan = connect.allow_lan_dial;
-    TlsCoordClient::with_dialer(config, &credential, Arc::new(TcpDialer)).map_err(|error| {
+    config.allow_lan = resolved.allow_lan_dial;
+    config.allow_cgnat = resolved.allow_cgnat_dial;
+    let dialer: Arc<dyn brain_core::network::Dialer> = match &resolved.relay {
+        Some(route) => Arc::new(brain_core::network::relay::RelayDialer {
+            direct: resolved.dial.is_some(),
+            connector: brain_core::network::relay::Connector::new(route)
+                .map_err(|_| invalid("invalid relay configuration"))?,
+        }),
+        None => Arc::new(TcpDialer),
+    };
+    let built = TlsCoordClient::with_dialer(config, &credential, dialer).map_err(|error| {
         (
             Exit::InvalidConfig,
             json!({"status": "invalid_config", "error": net_error(&error)}),
         )
-    })
+    })?;
+    Ok((built, resolved.from_endpoint))
 }
 
 fn tls_message(error: &TlsError) -> String {
@@ -656,22 +1152,27 @@ fn tls_message(error: &TlsError) -> String {
 }
 
 fn transport(client: &TlsCoordClient, connect: &ConnectArgs) -> Value {
+    let resolved = resolve_connect(connect, true).ok();
     json!({
         "protocol": PROTOCOL,
         "tls": true,
-        "dial": client.dial_target().to_string(),
+        "dial": resolved.as_ref().and_then(|r| r.dial.as_ref()),
+        "relay": resolved.as_ref().and_then(|r| r.relay.as_ref()).map(|r| json!({"address":r.address,"name":r.name,"server_name":r.server_name})),
+        "selection": "direct TCP first when configured; relay only on TCP connect failure",
         "server_name": client.server_name(),
-        "pinned_ca": connect.ca,
+        "pinned_ca": resolved.as_ref().map(|r| &r.ca),
         "system_roots": false,
     })
 }
 
 fn status(connect: &ConnectArgs) -> (Exit, Value) {
-    let client = match client(connect) {
-        Ok(client) => client,
+    let (client, from_endpoint) = match client(connect) {
+        Ok(found) => found,
         Err(failed) => return failed,
     };
     let endpoint = transport(&client, connect);
+    let mut endpoint = endpoint;
+    endpoint["from_endpoint_json"] = json!(from_endpoint);
     let outcome = client.call("work_whoami", "", Map::new(), None);
     let (exit, mut document) = outcome_document(outcome, &Retry::Read);
     document["endpoint"] = endpoint;
@@ -698,10 +1199,12 @@ fn call(config: &RuntimeConfig, connect: &ConnectArgs, operation: RemoteOp) -> (
     };
     // Defence in depth: the typed surface can only name allowlisted tools.
     if !allowed_tools().contains(&tool) {
-        return invalid("tool is not allowlisted");
+        return invalid(
+            "tool is not allowlisted (the typed CLI can only name coordinator tools; update brain on both sides if you expect a newer tool)",
+        );
     }
-    let client = match client(connect) {
-        Ok(client) => client,
+    let (client, _from_endpoint) = match client(connect) {
+        Ok(found) => found,
         Err(failed) => return failed,
     };
     let request_id = match &retry {
@@ -964,4 +1467,38 @@ fn request_for(space: &str, operation: RemoteOp) -> Result<Request, (Exit, Value
         }
     };
     Ok((tool, args, retry))
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    #[test]
+    fn coordinator_observation_tracks_actual_process_and_custom_state_without_writes() {
+        let home = crate::test_support::temp_path("net-panel");
+        let state = home.join("explicit-coordinator");
+        let store = AuthStore::open(&state).unwrap();
+        let coordinator =
+            brain_core::coordination::Coordinator::open(&state.join("coord.sqlite")).unwrap();
+        let path = window_observation_path(&home);
+        crate::private_fs::ensure_private_home(path.parent().unwrap()).unwrap();
+        let observation = json!({"pid": std::process::id(), "started": process_start(std::process::id()),
+            "bind":"127.0.0.1:32145", "state_dir":state});
+        crate::private_fs::write_private(&path, &serde_json::to_vec(&observation).unwrap())
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let doc = window_state_document(&home);
+        assert_eq!(doc["serving"], true);
+        assert_eq!(doc["bind"], "127.0.0.1:32145");
+        assert_eq!(doc["principals"], 0);
+        assert_eq!(doc["coordination_database"], true);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let stale = json!({"pid":std::process::id(), "started":"wrong-start", "bind":"127.0.0.1:32145", "state_dir":state});
+        crate::private_fs::write_private(&path, &serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(window_state_document(&home)["serving"], false);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(window_state_document(&home)["serving"], Value::Null);
+        drop(store);
+        drop(coordinator);
+        let _ = std::fs::remove_dir_all(home);
+    }
 }

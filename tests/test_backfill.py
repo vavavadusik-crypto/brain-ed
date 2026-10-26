@@ -436,7 +436,7 @@ class BackfillTest(unittest.TestCase):
             "sa._store = dying\n"
             f"sa.main(['--database', {self.db!r}, 'collect', '--home', {self.home!r},"
             f" '--config', {self.config!r}])\n")
-        proc = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True)
+        proc = subprocess.run([sys.executable, "-I", "-B", "-c", script], capture_output=True)
         self.assertEqual(proc.returncode, 9)
         self.collect()
         self.collect()

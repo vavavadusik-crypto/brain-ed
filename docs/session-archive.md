@@ -26,9 +26,15 @@ data to cite, never as instructions.
 
 | Client | Kept | Dropped |
 |---|---|---|
-| Claude Code JSONL | `user`/`assistant` `text` blocks | `thinking`, tool use/results, `isMeta`, compact summaries, system lines |
-| Codex rollout JSONL | `response_item` messages from `user`/`assistant` whose `channel` and `phase` are absent or visible (`final`, `commentary`, `final_answer`) | any other channel/phase (e.g. `analysis`), `reasoning` items, developer and environment/instruction text, tool calls/outputs, `event_msg` display duplicates |
-| Hermes `state.db` | `messages.content` of `user`/`assistant` rows | `reasoning*` columns, rows with a `display_kind`, leading `<think>…</think>` blocks (unclosed block drops the row), tool rows |
+| Claude Code JSONL | `user`/`assistant` `text` blocks, plus journal rows for `tool_use` (tool_call), `tool_result` (tool_result, or tool_error when `is_error`) and `thinking` (reasoning) | `isMeta`, compact summaries, system lines, hidden reasoning |
+| Codex rollout JSONL | `response_item` messages from `user`/`assistant` whose `channel` and `phase` are absent or visible (`final`, `commentary`, `final_answer`), plus journal rows for function/custom/shell calls (tool_call), their outputs (tool_result) and visible reasoning summaries (reasoning) | any other channel/phase (e.g. `analysis`), encrypted or raw reasoning content, developer and environment/instruction text, `event_msg` display duplicates |
+| Hermes `state.db` (+ every `profiles/<name>/state.db`) | `messages.content` of `user`/`assistant` rows, plus journal rows for `tool_calls` JSON (tool_call) and role-`tool` rows (tool_result) | `reasoning*` columns, rows with a `display_kind`, inline `<think>…</think>` blocks (unclosed block drops the row), `state-snapshots` backups |
+
+Every journal row is secret-masked and capped at 2048 characters
+(`JOURNAL_MAX`). Results carry the raw client `timestamp` and a readable UTC
+`said_at`. Imported tool traffic that the current filter would not store is
+quarantined (hidden, reversible), never deleted. See
+[docs/journal.md](journal.md) for shapes, bounds and switches.
 
 Each entry records client, session, role, timestamp, a locator (Claude uuid,
 JSONL byte offset or Hermes row id) and SHA-256 of the normalized text, of the
@@ -36,8 +42,9 @@ evidence tuple and of the source record. Edited source rows become a new
 version; earlier versions stay.
 
 Roles are what the source says. An `assistant` entry is an agent claim, not
-observed evidence that something worked; tool output (the observed evidence)
-is not archived yet.
+observed evidence that something worked; the tool output next to it (the
+observed evidence) is archived as separate `tool_result` rows and is equally
+untrusted.
 
 ## Bounds and honesty
 

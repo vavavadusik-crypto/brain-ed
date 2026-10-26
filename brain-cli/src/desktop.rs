@@ -532,14 +532,11 @@ mod home_guard_tests {
 
     #[test]
     fn unusable_homes_refuse_every_launcher_operation_before_any_io() {
-        let nonce = std::time::SystemTime::now()
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-desktop-guard-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-desktop-guard");
         let good = root.join("ok");
         let good_brain = good.join(".brain");
         fs::create_dir_all(good.join("Desktop")).unwrap();
@@ -602,15 +599,12 @@ mod home_guard_tests {
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
+    fn temp_root(_tag: &str) -> PathBuf {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-desktop-{tag}-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-desktop");
         fs::create_dir_all(&root).expect("create desktop test root");
         root
     }

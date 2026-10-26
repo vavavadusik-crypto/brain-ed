@@ -6,6 +6,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,15 +18,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-fn isolated_home(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn isolated_home(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-ui-owner-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-ui-owner");
     fs::create_dir_all(&root).expect("create isolated home");
     root
 }

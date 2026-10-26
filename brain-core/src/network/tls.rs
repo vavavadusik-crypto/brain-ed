@@ -77,6 +77,8 @@ pub struct TlsServerConfig {
     /// Affirmative opt-in for a non-loopback `listen` (see
     /// [`checked_listen_ip`](crate::network::server::checked_listen_ip)).
     pub allow_lan: bool,
+    /// Affirmative opt-in for a CGNAT/overlay address (`RFC 6598 range`), separate from LAN.
+    pub allow_cgnat: bool,
 }
 
 /// Where a private key (or credential) comes from: an owner-only file, or
@@ -105,6 +107,7 @@ impl TlsServerConfig {
             deadline: MAX_DEADLINE,
             listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_lan: false,
+            allow_cgnat: false,
         }
     }
 }
@@ -123,6 +126,8 @@ pub struct TlsClientConfig {
     pub deadline: Duration,
     /// Affirmative opt-in to dial a private unicast LAN address.
     pub allow_lan: bool,
+    /// Affirmative opt-in for a CGNAT/overlay address (`RFC 6598 range`), separate from LAN.
+    pub allow_cgnat: bool,
 }
 
 impl TlsClientConfig {
@@ -137,6 +142,7 @@ impl TlsClientConfig {
             dial,
             deadline: MAX_DEADLINE,
             allow_lan: false,
+            allow_cgnat: false,
         }
     }
 }
@@ -154,7 +160,7 @@ pub fn parse_dial_target(text: &str) -> Result<SocketAddr, TlsError> {
             "dial target must be a numeric IP:PORT; hostnames are never resolved".into(),
         )
     })?;
-    checked_dial(address, false)
+    checked_dial(address, false, false)
 }
 
 /// As [`parse_dial_target`], but with `allow_lan` a numeric private unicast
@@ -164,21 +170,44 @@ pub fn parse_dial_target(text: &str) -> Result<SocketAddr, TlsError> {
 /// [`TlsError::InvalidConfig`] as for [`parse_dial_target`], or for a
 /// non-LAN address even with the opt-in.
 pub fn parse_dial_target_lan(text: &str, allow_lan: bool) -> Result<SocketAddr, TlsError> {
+    parse_dial_target_with(text, allow_lan, false)
+}
+
+/// As [`parse_dial_target_lan`], with the separate CGNAT/overlay opt-in.
+///
+/// # Errors
+/// As [`parse_dial_target_lan`].
+pub fn parse_dial_target_with(
+    text: &str,
+    allow_lan: bool,
+    allow_cgnat: bool,
+) -> Result<SocketAddr, TlsError> {
     let address: SocketAddr = text.parse().map_err(|_| {
         TlsError::InvalidConfig(
             "dial target must be a numeric IP:PORT; hostnames are never resolved".into(),
         )
     })?;
-    checked_dial(address, allow_lan)
+    checked_dial(address, allow_lan, allow_cgnat)
 }
 
-fn checked_dial(address: SocketAddr, allow_lan: bool) -> Result<SocketAddr, TlsError> {
+fn checked_dial(
+    address: SocketAddr,
+    allow_lan: bool,
+    allow_cgnat: bool,
+) -> Result<SocketAddr, TlsError> {
     if address.port() == 0 {
         return Err(TlsError::InvalidConfig(
             "dial target needs a non-zero port".into(),
         ));
     }
-    if !address.ip().is_loopback() {
+    if crate::network::server::is_cgnat(address.ip()) {
+        if !allow_cgnat {
+            return Err(TlsError::InvalidConfig(format!(
+                "{} is a shared CGNAT/overlay address; it needs the explicit CGNAT dial opt-in",
+                address.ip()
+            )));
+        }
+    } else if !address.ip().is_loopback() {
         if !allow_lan {
             return Err(TlsError::InvalidConfig(
                 "only loopback dial targets are allowed without the explicit LAN opt-in".into(),
@@ -194,15 +223,31 @@ fn checked_dial(address: SocketAddr, allow_lan: bool) -> Result<SocketAddr, TlsE
     Ok(address)
 }
 
-/// How the client opens its TCP socket. The bounded path only ever hands
-/// a dialer an already-numeric address and the time LEFT before the
-/// absolute deadline; there is no name in the call, so nothing can resolve.
+/// A byte transport whose I/O remains bounded by the caller deadline.
+pub trait Transport: Read + Write + Send {
+    fn set_timeout(&self, timeout: Duration) -> io::Result<()>;
+}
+impl Transport for TcpStream {
+    fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(timeout))?;
+        self.set_write_timeout(Some(timeout))
+    }
+}
+
+/// Opens a numeric direct socket or an explicitly configured relay tunnel.
+/// The caller passes only the time left before its absolute deadline.
 pub trait Dialer: Send + Sync {
     /// Connects to `address` within `timeout`.
     ///
     /// # Errors
     /// Any connect error; the caller reports it as unreachable.
     fn dial(&self, address: SocketAddr, timeout: Duration) -> io::Result<TcpStream>;
+
+    /// Open a transport; relay dialers return an outer TLS tunnel here.
+    fn open(&self, address: SocketAddr, timeout: Duration) -> io::Result<Box<dyn Transport>> {
+        self.dial(address, timeout)
+            .map(|s| Box::new(s) as Box<dyn Transport>)
+    }
 }
 
 /// The production dialer: `connect_timeout` on the numeric address.
@@ -454,7 +499,7 @@ fn tls_to_net(error: TlsError) -> NetError {
 /// every operation fails with `TimedOut`. rustls drives all its I/O
 /// (handshake included) through this wrapper.
 struct DeadlineStream {
-    sock: TcpStream,
+    sock: Box<dyn Transport>,
     deadline: Instant,
 }
 
@@ -475,7 +520,7 @@ impl DeadlineStream {
 impl Read for DeadlineStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self.remaining()?;
-        self.sock.set_read_timeout(Some(left))?;
+        self.sock.set_timeout(left)?;
         self.sock.read(buf)
     }
 }
@@ -483,7 +528,7 @@ impl Read for DeadlineStream {
 impl Write for DeadlineStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let left = self.remaining()?;
-        self.sock.set_write_timeout(Some(left))?;
+        self.sock.set_timeout(left)?;
         self.sock.write(buf)
     }
 
@@ -575,12 +620,23 @@ impl TlsCoordServer {
     pub fn start(config: &TlsServerConfig) -> Result<Self, NetError> {
         // The binding policy is checked first: a refused address loads no
         // key, opens no store and binds nothing.
-        let listen = crate::network::server::checked_listen_ip(config.listen, config.allow_lan)?;
+        let listen = crate::network::server::checked_listen_ip_with(
+            config.listen,
+            config.allow_lan,
+            config.allow_cgnat,
+        )?;
         let deadline = checked_deadline(config.deadline).map_err(tls_to_net)?;
         let tls = server_config(config).map_err(tls_to_net)?;
         // `Host` must also accept the exact bound IP, so a client whose
         // server name is that IP (the certificate's IP SAN) is not refused.
-        let core = Inner::open(&config.state_dir)?.with_bound_host(listen);
+        let leaf = parse_certs(&open_material(&config.cert_file, false).map_err(tls_to_net)?)
+            .map_err(tls_to_net)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NetError::invalid("server certificate file holds no certificate"))?;
+        let core = Inner::open(&config.state_dir)?
+            .with_bound_host(listen)
+            .with_certificate(leaf);
         let address = SocketAddr::new(listen, config.port);
         let listener = TcpListener::bind(address)
             .map_err(|error| NetError::unavailable(format!("bind {address}: {error}")))?;
@@ -746,7 +802,7 @@ fn handle_tls_connection(stream: TcpStream, inner: &TlsInner) {
     let mut tls = StreamOwned::new(
         conn,
         DeadlineStream {
-            sock: stream,
+            sock: Box::new(stream),
             deadline,
         },
     );
@@ -828,7 +884,7 @@ impl TlsCoordClient {
         dialer: Arc<dyn Dialer>,
     ) -> Result<Self, NetError> {
         let deadline = checked_deadline(tls.deadline).map_err(tls_to_net)?;
-        let dial = checked_dial(tls.dial, tls.allow_lan).map_err(tls_to_net)?;
+        let dial = checked_dial(tls.dial, tls.allow_lan, tls.allow_cgnat).map_err(tls_to_net)?;
         let server_name = ServerName::try_from(tls.server_name.clone())
             .map_err(|_| NetError::invalid("server name is not a valid DNS name or IP"))?;
         let config = client_config(&tls).map_err(tls_to_net)?;
@@ -947,13 +1003,13 @@ fn connect_before(
     dialer: &dyn Dialer,
     address: SocketAddr,
     deadline: Instant,
-) -> Result<TcpStream, String> {
+) -> Result<Box<dyn Transport>, String> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err("connect deadline exceeded".into());
     }
     let stream = dialer
-        .dial(address, left)
+        .open(address, left)
         .map_err(|error| format!("connect: {}", error.kind()))?;
     if Instant::now() >= deadline {
         return Err("connect deadline exceeded".into());
@@ -963,6 +1019,58 @@ fn connect_before(
 
 #[cfg(test)]
 mod tests {
+
+    /// G12: dial targets follow the policy table — loopback always, LAN only
+    /// with the explicit opt-in, CGNAT (100.64/10) only with its own opt-in,
+    /// hostnames never. Boundaries of the CGNAT range are pinned.
+    #[test]
+    fn dial_targets_follow_the_policy_table() {
+        let cases: &[(&str, bool, bool, bool)] = &[
+            ("127.0.0.1:7443", false, false, true),
+            ("[::1]:7443", false, false, true),
+            ("127.0.0.1:0", false, false, false),
+            ("10.0.0.5:7443", false, false, false),
+            ("10.0.0.5:7443", true, false, true),
+            ("192.168.1.10:7443", true, false, true),
+            ("169.254.9.9:7443", true, false, false),
+            ("224.0.0.1:7443", true, false, false),
+            ("8.8.8.8:53", true, false, false),
+            ("172.16.5.5:7443", true, false, true),
+            ("[fc00::1]:7443", false, false, false),
+            ("[fc00::1]:7443", true, false, true),
+            ("[fe80::1%3]:7443", true, false, false),
+            ("[::ffff:10.0.0.5]:7443", true, false, false),
+            // 100.63/100.128 are outside CGNAT and outside RFC1918: refused
+            // in every mode (the boundary is exclusive on both sides).
+            ("100.63.255.255:7443", true, false, false),
+            ("100.63.255.255:7443", false, true, false),
+            ("100.63.255.255:7443", true, true, false),
+            ("100.64.0.0:7443", false, false, false),
+            ("100.64.0.0:7443", true, false, false),
+            ("100.64.0.0:7443", false, true, true),
+            ("100.127.255.255:7443", false, true, true),
+            ("100.128.0.0:7443", false, true, false),
+            ("100.128.0.0:7443", true, true, false),
+            ("[fd7a::1]:7443", false, false, false),
+            ("[fd7a::1]:7443", true, false, true),
+            ("[fe80::1%3]:7443", true, false, false),
+            ("[fe80::1%eth0]:7443", true, false, false),
+            ("0.0.0.0:7443", true, false, false),
+            ("example.com:7443", true, true, false),
+            ("10.0.0.5", false, false, false),
+            ("10.0.0.5:99999", false, false, false),
+            ("10.0.0.5:-1", false, false, false),
+            ("", false, false, false),
+        ];
+        for (input, allow_lan, allow_cgnat, expected) in cases {
+            let parsed = parse_dial_target_with(input, *allow_lan, *allow_cgnat);
+            assert_eq!(
+                parsed.is_ok(),
+                *expected,
+                "{input} lan={allow_lan} cgnat={allow_cgnat}: {parsed:?}"
+            );
+        }
+    }
     use super::*;
     use std::os::unix::fs::symlink;
     use std::process::Command;
@@ -976,8 +1084,15 @@ mod tests {
     fn material() -> &'static Path {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("brain-tls-material-{}", std::process::id()));
+            // Process-lifetime data shared by every TLS test thread: NOT
+            // registered in the thread-local cleanup, whose Drop would race
+            // with other threads still reading the material.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir()
+                .join(format!("brain-tls-material-{}-{nanos}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("material dir");
             let ca = |name: &str, cn: &str| {
@@ -1055,6 +1170,12 @@ mod tests {
             leaf("server", "IP:127.0.0.1,DNS:localhost", &["-days", "2"]);
             leaf("ipalt", "IP:127.0.0.2,IP:::1", &["-days", "2"]);
             leaf("wronghost", "DNS:example.invalid", &["-days", "2"]);
+            // A coordinator reached by a name of its own (the client's --server-name).
+            leaf(
+                "named",
+                "IP:127.0.0.1,DNS:brain-coord.test",
+                &["-days", "2"],
+            );
             // Same SAN as the good server: only the validity window is wrong.
             leaf("expired", "IP:127.0.0.1,DNS:localhost", &["-days", "2"]);
             // The expired leaf is re-signed by the same CA through `openssl ca` with
@@ -1119,8 +1240,8 @@ mod tests {
         material().join(name)
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("brain-tls-{tag}-{}", std::process::id()));
+    fn temp_dir(_tag: &str) -> PathBuf {
+        let dir = crate::test_support::temp_path("brain-tls");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
@@ -1427,6 +1548,57 @@ mod tests {
                 }
                 other => panic!("whoami over TLS via {host}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn cgnat_dial_targets_need_their_own_opt_in() {
+        assert!(parse_dial_target_with("100.64.0.42:7443", false, false).is_err());
+        assert!(parse_dial_target_with("100.64.0.42:7443", true, false).is_err());
+        assert!(parse_dial_target_with("100.64.0.42:7443", false, true).is_ok());
+        assert!(parse_dial_target_with("10.0.0.5:7443", false, true).is_err());
+        assert!(parse_dial_target_with("10.0.0.5:7443", true, false).is_ok());
+        assert!(parse_dial_target_lan("100.64.0.42:7443", true).is_err());
+    }
+
+    #[test]
+    fn a_server_name_from_the_certificate_is_accepted_as_host() {
+        let (handle, dir) = start("named-host", "named");
+        let token = issue(&handle, "m-named", "named-agent", "worker", &["s"]);
+        let client = client_for(
+            &handle,
+            &dir,
+            "cred-named",
+            &token,
+            "ca.crt",
+            "brain-coord.test",
+        );
+        match client.call("work_whoami", "", serde_json::Map::new(), None) {
+            TlsCallResult::Ok(body) => assert_eq!(body["principal"]["agent"], "named-agent"),
+            other => panic!("whoami by the certificate's DNS name: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_names_the_certificate_is_valid_for_pass_the_host_check() {
+        let pem = std::fs::read(file("named.crt")).expect("named cert");
+        let leaf = parse_certs(&pem).expect("parse").remove(0);
+        let accepts = |host: &str| crate::network::server::host_is_certificate_name(host, &leaf);
+        assert!(accepts("brain-coord.test"));
+        assert!(accepts("brain-coord.test:7443"));
+        for refused in [
+            "evil.test",
+            "brain-coord.test.evil",
+            "brain-coord.test:",
+            "brain-coord.test:abc",
+            "127.0.0.1",
+            "[::1]:7443",
+            "",
+        ] {
+            assert!(
+                !accepts(refused),
+                "{refused:?} must not pass as a certificate name"
+            );
         }
     }
 
@@ -1882,7 +2054,7 @@ mod tests {
 
     #[test]
     fn lan_listen_and_dial_need_the_opt_in_and_refuse_wide_addresses() {
-        let dir = std::env::temp_dir().join(format!("brain-lan-start-{}", std::process::id()));
+        let dir = crate::test_support::temp_path("brain-lan-start");
         let refused = |listen: &str, allow_lan: bool| {
             let mut config =
                 TlsServerConfig::new(&dir, 0, dir.join("absent.crt"), dir.join("absent.key"));

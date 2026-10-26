@@ -1,4 +1,4 @@
-# Security model (0.1.0 early preview)
+# Security model (current development preview)
 
 This describes intended boundaries and what is tested. It is not a formal
 proof, and no external audit has been done.
@@ -18,7 +18,9 @@ proof, and no external audit has been done.
   addresses are refused; subnet broadcast/network addresses cannot be
   detected without the netmask). It has no rate limiting: unauthenticated
   LAN hosts can exhaust the 64 global connections, so an operator firewall
-  is required. Not production- or fleet-proven.
+  is required. Shared CGNAT/overlay addresses additionally have their own
+  explicit `--allow-cgnat` listener and `--allow-cgnat-dial` client options;
+  the LAN flag does not admit them. Not production- or fleet-proven.
 - **MCP over stdio.** `brain serve` has no network listener.
 
 ## Data classes
@@ -40,16 +42,38 @@ bound how much text reaches an agent.
 
 ## Capture limits
 
-The archive stores only visible, allowed user/assistant text from Claude Code,
-Codex and Hermes after `brain archive enable`. Thinking, tool calls and tool
-output are dropped. Coverage is best-effort and cannot be guaranteed complete.
+The archive stores visible user/assistant text from Claude Code, Codex and
+Hermes plus a bounded journal of what the agent did — tool calls, tool
+results, tool errors and visible reasoning summaries, each capped at 2048
+characters (`JOURNAL_MAX`) — after `brain archive enable`. Credentials are
+masked at write time (pattern-based, `MASK_REV = "mask:3"`), which is not a
+guarantee: treat the archive as containing secrets and keep it `0600`. Hidden
+or encrypted reasoning, system/instruction text and sidechains are never
+stored. Imported tool traffic that would mislead search is quarantined, not
+deleted. Coverage is best-effort and cannot be guaranteed complete; see
+[docs/journal.md](journal.md) for the exact per-role shapes.
+
+Agents reach this text only through `brain ask`, `archive search`/`read` and
+the `memory_search`/`archive_search` MCP tools, where every archived row is
+marked untrusted evidence and budgets bound how much reaches them.
 
 ## Network and downloads
 
-Ordinary commands never download. `brain model install` downloads embedding
-weights only after explicit approval; `--offline` forbids it. `install.sh`
-runs `cargo build --locked` (crates.io fetch of locked versions), uses no sudo
-and uploads nothing.
+Local memory and retrieval commands need no cloud connection. `brain model
+install` downloads embedding weights only after explicit approval; `--offline`
+forbids those downloads. `install.sh` downloads a selected release binary and
+its checksum manifest over HTTPS, verifies the digest and installs only the
+CLI. It does not run the downloaded binary, use sudo or configure agents.
+The separate `packaging/install-source.sh` runs `cargo build --locked` and may
+fetch locked crates. Checksums from the same release are not signatures.
+
+Explicit `llm test` and `distill run` invoke the configured provider. HTTP
+providers receive the selected text; subscription adapters invoke an already
+authorized Claude Code or Codex CLI. An enabled distillation schedule can do
+this later without another prompt. `--offline` is not a network sandbox and
+does not block those explicit LLM calls. The archive remains untrusted during
+distillation; validation of returned facts is not a proof against prompt
+injection. Read [the adapter isolation limits](distiller.md#через-подписку).
 
 ## Local UI owner access
 

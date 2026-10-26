@@ -6,6 +6,8 @@
 //! client processes. One machine, separate HOMEs and stores; not a LAN
 //! deployment and not ten physical computers.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -17,15 +19,12 @@ use serde_json::Value;
 
 const BRAIN: &str = env!("CARGO_BIN_EXE_brain");
 
-fn temp_root(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn temp_root(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-share-process-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-share-process");
     fs::create_dir_all(&root).expect("root");
     root
 }

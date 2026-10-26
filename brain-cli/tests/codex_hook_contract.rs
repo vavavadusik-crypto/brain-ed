@@ -5,6 +5,8 @@
 //! sandboxes forbid; there they fail at `UnixStream::pair`, not in the hook.
 #![cfg(target_os = "linux")]
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -42,15 +44,12 @@ impl Fixture {
         fixture
     }
 
-    fn without_brain_home(label: &str) -> Self {
-        let nonce = std::time::SystemTime::now()
+    fn without_brain_home(_label: &str) -> Self {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-hook-contract-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = test_support::temp_path("brain-hook-contract");
         let home = root.join("home");
         fs::create_dir_all(&home).unwrap();
         for dir in [&root, &home] {
@@ -216,7 +215,25 @@ fn run_hook(home: &Path, event: &str, input: Input) -> Outcome {
 
 fn assert_contract(outcome: &Outcome) {
     assert!(outcome.status.success(), "exit {:?}", outcome.status);
-    assert_eq!(outcome.stdout, b"{}\n", "stdout must be exactly {{}}");
+    // One JSON line: `{}`, or the fixed SessionStart notice with exactly the two
+    // fields Codex's SessionStartHookSpecificOutputWire allows.
+    assert!(
+        outcome.stdout.ends_with(b"\n")
+            && outcome.stdout.iter().filter(|b| **b == b'\n').count() == 1
+    );
+    let value: serde_json::Value = serde_json::from_slice(&outcome.stdout).expect("stdout is JSON");
+    if value != serde_json::json!({}) {
+        let output = &value["hookSpecificOutput"];
+        assert_eq!(value.as_object().map(|o| o.len()), Some(1), "{value}");
+        assert_eq!(output.as_object().map(|o| o.len()), Some(2), "{value}");
+        assert_eq!(output["hookEventName"], "SessionStart");
+        assert!(
+            output["additionalContext"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("Brain ED")
+        );
+    }
     assert!(
         outcome.stderr.is_empty(),
         "stderr: {}",
@@ -553,6 +570,8 @@ fn session_start_full_schema_keeps_only_allowlisted_metadata() {
         let payload = session_start(cwd, transcript).to_string().into_bytes();
         let outcome = fixture.hook("SessionStart", Input::Bytes(payload));
         assert_contract(&outcome);
+        let value: Value = serde_json::from_slice(&outcome.stdout).unwrap();
+        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "SessionStart");
         assert!(outcome.elapsed < Duration::from_secs(10));
     }
     assert_sentinel_untouched(&sentinel);

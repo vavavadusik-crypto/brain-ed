@@ -751,6 +751,21 @@ impl AuthStore {
         Ok(rows)
     }
 
+    /// Count all configured principals without migrations, schema creation or tokens.
+    pub fn principal_count_read_only(state_dir: &Path) -> Result<i64, NetError> {
+        let connection = Connection::open_with_flags(
+            state_dir.join("auth.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_millis(250))?;
+        let app: i64 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if app != APPLICATION_ID || version != SCHEMA_VERSION {
+            return Err(NetError::incompatible("unknown auth schema"));
+        }
+        Ok(connection.query_row("SELECT count(*) FROM principals", [], |row| row.get(0))?)
+    }
+
     pub fn list_principals(&self, limit: usize) -> Result<Vec<Value>, NetError> {
         let mut statement = self.connection.prepare(
             "SELECT machine_id, agent_id, label, role, spaces, disabled_at, created_at FROM principals ORDER BY id LIMIT ?1",
@@ -776,8 +791,38 @@ impl AuthStore {
 mod tests {
     use super::*;
 
-    fn store(tag: &str) -> (AuthStore, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("brain-auth-{tag}-{}", std::process::id()));
+    #[test]
+    fn panel_count_is_read_only_exact_and_does_not_migrate() {
+        let (store, dir) = store("panel-count");
+        for n in 0..205 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO principals(machine_id,agent_id,role,spaces,created_at,updated_at)
+                VALUES (?1,'codex','reader','default',1,1)",
+                    [format!("machine-{n}")],
+                )
+                .unwrap();
+        }
+        assert_eq!(AuthStore::principal_count_read_only(&dir).unwrap(), 205);
+        store
+            .connection
+            .pragma_update(None, "user_version", 1)
+            .unwrap();
+        assert!(AuthStore::principal_count_read_only(&dir).is_err());
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "GET must never migrate an older auth store");
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(AuthStore::principal_count_read_only(&dir).is_err());
+        assert!(!dir.exists(), "GET must not create the store");
+    }
+
+    fn store(_tag: &str) -> (AuthStore, PathBuf) {
+        let dir = crate::test_support::temp_path("brain-auth");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("dir");
         let store = AuthStore::open(&dir).expect("open");

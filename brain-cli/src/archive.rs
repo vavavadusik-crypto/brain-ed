@@ -14,6 +14,8 @@
 //! `"trust": "untrusted_conversation"`; it is evidence to cite, never an
 //! instruction to follow.
 
+use brain_core::lexical::STOP_WORDS;
+
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -31,11 +33,22 @@ use serde_json::{Map, Value, json};
 const COLLECTOR_SOURCE: &str = include_str!("../../tools/session_archive.py");
 
 pub(crate) const CLIENTS: [&str; 3] = ["claude", "codex", "hermes"];
+/// Every role the collector stores: the conversation pair plus the journal
+/// kinds (see `JOURNAL_ROLES` in tools/session_archive.py).
+pub(crate) const ROLES: [&str; 6] = [
+    "user",
+    "assistant",
+    "tool_call",
+    "tool_result",
+    "tool_error",
+    "reasoning",
+];
 const SCHEMA_CURRENT: &str = "brain_session_archive:3";
 const SCHEMA_LEGACY: &str = "brain_session_archive:2";
 const TRUST: &str = "untrusted_conversation";
-const STORED_TEXT: &str = "normalized visible user/assistant text only; reasoning, \
-     instructions, tool calls and tool output, attachments and metadata events are not stored";
+const STORED_TEXT: &str = "conversation plus bounded, secret-masked tool calls/results/errors \
+     and visible reasoning summaries; never system prompts, injected instructions, \
+     sidechains, hidden/encrypted reasoning, attachments or metadata events";
 
 const MAX_LIMIT: usize = 20;
 const DEFAULT_LIMIT: usize = 5;
@@ -131,8 +144,8 @@ impl ArchiveError {
     }
 }
 
-struct Archive {
-    connection: Connection,
+pub(crate) struct Archive {
+    pub(crate) connection: Connection,
     version: u8,
     /// The collector keeps a `quarantine` table of stored rows it no longer counts as
     /// conversation text (e.g. tool output Codex flattened into an imported session).
@@ -147,7 +160,7 @@ fn current_uid() -> Result<u32, ArchiveError> {
 }
 
 /// Opens the archive read-only after checking it is ours and really an archive.
-fn open(database: &Path) -> Result<Archive, ArchiveError> {
+pub(crate) fn open(database: &Path) -> Result<Archive, ArchiveError> {
     let metadata = match fs::symlink_metadata(database) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -216,7 +229,7 @@ fn open(database: &Path) -> Result<Archive, ArchiveError> {
 
 impl Archive {
     /// SQL condition: entry `{alias}` is not in active quarantine.
-    fn visible(&self, alias: &str) -> String {
+    pub(crate) fn visible(&self, alias: &str) -> String {
         if self.quarantine {
             format!(
                 "NOT EXISTS (SELECT 1 FROM quarantine q WHERE q.entry_id = {alias}.id AND q.released_at IS NULL)"
@@ -386,6 +399,43 @@ pub(crate) fn status(brain_home: &Path, home: &Path) -> Value {
     document
 }
 
+/// Hermes profile label for a source path: the profile name for a
+/// `profiles/<name>/state.db` database, `default` for everything else.
+///
+/// Mirrors the collector's session namespace (`profiles/<name>/<id>`, see
+/// session_archive.py): the path shape decides, not the home it lives in, so
+/// a relocated home changes neither the label nor the namespace.
+fn hermes_profile_label(path: &str) -> String {
+    let source = Path::new(path);
+    let in_profiles = source
+        .parent()
+        .and_then(|parent| parent.parent())
+        .and_then(|profiles| profiles.file_name())
+        .is_some_and(|name| name == "profiles");
+    match (
+        source.file_name(),
+        in_profiles,
+        source.parent().and_then(|parent| parent.file_name()),
+    ) {
+        (Some(file), true, Some(profile))
+            if file == "state.db" && profile.to_str().is_some_and(valid_profile_name) =>
+        {
+            profile.to_string_lossy().into_owned()
+        }
+        _ => "default".to_owned(),
+    }
+}
+
+/// Profile names the collector accepts (see `PROFILE_NAME` in session_archive.py):
+/// one plain ASCII lead character, then letters, digits, dots, underscores, dashes.
+fn valid_profile_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|lead| lead.is_ascii_alphanumeric())
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || matches!(rest, '.' | '_' | '-'))
+}
+
 fn stored_document(archive: &Archive) -> Result<Value, ArchiveError> {
     let connection = &archive.connection;
     let visible = archive.visible("e");
@@ -414,6 +464,61 @@ fn stored_document(archive: &Archive) -> Result<Value, ArchiveError> {
                    "first_observed_at": first, "last_observed_at": last}),
         );
     }
+    // Hermes counts per profile as well: the top-level database is "default"
+    // and every profiles/<name>/state.db is its own source whose sessions are
+    // stored namespaced as profiles/<name>/<id>, so ids never collide.
+    let mut hermes_profiles: std::collections::BTreeMap<String, (i64, i64)> =
+        std::collections::BTreeMap::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT s.path, count(*), count(DISTINCT e.source_id)
+             FROM entries e JOIN sources s ON s.id = e.source_id
+             WHERE {visible} AND s.client = 'hermes'
+             GROUP BY s.path ORDER BY s.path"
+        ))?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (path, entries, sources) = row?;
+            let per_profile = hermes_profiles
+                .entry(hermes_profile_label(&path))
+                .or_insert((0, 0));
+            per_profile.0 += entries;
+            per_profile.1 += sources;
+        }
+    }
+    // Sessions are counted per label, not summed per source: the same raw id
+    // may legitimately sit under two source paths.
+    let mut session_ids: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    {
+        let mut statement = connection.prepare(&format!(
+            "SELECT DISTINCT s.path, e.session_id FROM entries e
+             JOIN sources s ON s.id = e.source_id
+             WHERE {visible} AND s.client = 'hermes' AND e.session_id IS NOT NULL"
+        ))?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (path, session) = row?;
+            session_ids.insert((hermes_profile_label(&path), session));
+        }
+    }
+    let mut by_hermes_profile = Map::new();
+    for (label, (entries, sources)) in hermes_profiles {
+        let sessions = session_ids
+            .iter()
+            .filter(|(profile, _)| *profile == label)
+            .count();
+        by_hermes_profile.insert(
+            label,
+            json!({"entries": entries, "sessions": sessions, "sources": sources}),
+        );
+    }
     let mut roles = Map::new();
     let mut statement = connection.prepare(&format!(
         "SELECT e.role, count(*) FROM entries e WHERE {visible} GROUP BY e.role ORDER BY e.role"
@@ -430,6 +535,7 @@ fn stored_document(archive: &Archive) -> Result<Value, ArchiveError> {
         |row| row.get(0),
     )?;
     let mut quarantined = Map::new();
+    let mut quarantine_clients = Map::new();
     if archive.quarantine {
         let mut statement = connection.prepare(
             "SELECT reason, count(*) FROM quarantine WHERE released_at IS NULL GROUP BY reason ORDER BY reason",
@@ -441,9 +547,23 @@ fn stored_document(archive: &Archive) -> Result<Value, ArchiveError> {
             quarantined.insert(reason, json!(count));
         }
     }
+    if archive.quarantine {
+        let mut statement = connection.prepare(
+            "SELECT s.client, count(DISTINCT e.id) FROM quarantine q
+             JOIN entries e ON e.id = q.entry_id JOIN sources s ON s.id = e.source_id
+             WHERE q.released_at IS NULL GROUP BY s.client",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (client, count) = row?;
+            quarantine_clients.insert(client, json!(count));
+        }
+    }
     Ok(
         json!({"entries": entries, "by_client": by_client, "by_role": roles,
-              "quarantined": {"by_reason": quarantined,
+              "hermes_profiles": by_hermes_profile,
+              "quarantined": {"by_reason": quarantined, "by_client": quarantine_clients,
                               "note": "kept in the archive but excluded from search, read and these counts"}}),
     )
 }
@@ -564,7 +684,8 @@ pub(crate) fn collector_switch(brain_home: &Path) -> &'static str {
 
 fn config_document(paths: &Paths) -> Value {
     match read_config(paths) {
-        Ok(None) => json!({"present": false, "enabled": false}),
+        Ok(None) => json!({"present": false, "enabled": false, "since_days": 14,
+            "clients_configured": COLLECTOR_CLIENTS, "roles_configured": ROLES}),
         Ok(Some(config)) => {
             // Configured consent, not observed coverage: which clients were really
             // read is only in the last collector run.
@@ -578,12 +699,24 @@ fn config_document(paths: &Paths) -> Value {
                     }
                 },
             };
+            let roles = match config.get("roles") {
+                None => json!(ROLES),
+                Some(value) => match validate_roles(value) {
+                    Ok(roles) => json!(roles),
+                    Err(error) => {
+                        return json!({"present": true, "enabled": false,
+                                                "error": error.to_string()});
+                    }
+                },
+            };
             json!({
                 "present": true,
                 "enabled": config.get("enabled").and_then(Value::as_bool).unwrap_or(false),
                 "since_days": config.get("since_days").cloned().unwrap_or(json!(14)),
                 "clients_configured": clients,
                 "client_selection": selection,
+                "roles_configured": roles,
+                "role_selection": if config.get("roles").is_some() { "explicit" } else { "legacy_all" },
             })
         }
         Err(error) => json!({"present": true, "enabled": false, "error": error.to_string()}),
@@ -600,6 +733,118 @@ fn timer_document(home: &Path) -> Value {
 
 // ------------------------------------------------------------------ search
 
+/// One visible, already secret-masked archive entry for local distillation.
+#[derive(Clone, Debug)]
+pub(crate) struct DistillEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub ts: Option<String>,
+    pub cwd: Option<String>,
+    pub content: String,
+    pub role: String,
+}
+
+/// Session heads use the same visibility checks as archive reads. Only metadata
+/// is returned; content is retrieved in bounded batches after cursor selection.
+pub(crate) fn distill_sessions(
+    brain_home: &Path,
+    session: Option<&str>,
+    since: Option<&str>,
+    roles: &[String],
+) -> Result<Vec<(String, i64)>, ArchiveError> {
+    open(&Paths::new(brain_home).database)?.distill_sessions(session, since, roles)
+}
+
+impl Archive {
+    pub(crate) fn distill_sessions(
+        &self,
+        session: Option<&str>,
+        since: Option<&str>,
+        roles: &[String],
+    ) -> Result<Vec<(String, i64)>, ArchiveError> {
+        let archive = self;
+        let session = bounded_filter("session_id", session)?;
+        let since = since
+            .map(|s| {
+                epoch_seconds(s).ok_or_else(|| {
+                    ArchiveError::BadRequest("since must be an ISO date or Unix timestamp".into())
+                })
+            })
+            .transpose()?;
+        let visible = archive.visible("e");
+        // One metadata scan replaces a full timestamp query for every session.
+        // Parse in Rust so mixed ISO/numeric timestamps retain their exact semantics.
+        let sql = format!(
+            "SELECT e.session_id,e.id,e.ts FROM entries e WHERE {visible}
+        AND e.role IN (SELECT value FROM json_each(?2))
+        AND e.session_id IS NOT NULL AND (?1 IS NULL OR e.session_id=?1)"
+        );
+        let mut statement = archive.connection.prepare(&sql)?;
+        let mut rows = statement.query(params![session, json!(roles).to_string()])?;
+        let mut heads = std::collections::BTreeMap::<String, (i64, Option<i64>)>::new();
+        while let Some(row) = rows.next()? {
+            let session: String = row.get(0)?;
+            let id: i64 = row.get(1)?;
+            let ts: Option<String> = row.get(2)?;
+            let time = ts.as_deref().and_then(epoch_seconds);
+            let head = heads.entry(session).or_insert((id, None));
+            head.0 = head.0.max(id);
+            head.1 = head.1.max(time);
+        }
+        let mut timed: Vec<_> = heads
+            .into_iter()
+            .filter_map(|(session, (head, latest))| {
+                if since.is_some_and(|s| latest.is_none_or(|t| t < s)) {
+                    None
+                } else {
+                    Some((latest, session, head))
+                }
+            })
+            .collect();
+        timed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let result = timed
+            .into_iter()
+            .map(|(_, session, head)| (session, head))
+            .collect();
+        Ok(result)
+    }
+
+    /// Content is already masked by the collector. No raw source is opened.
+    pub(crate) fn distill_entries(
+        &self,
+        session: &str,
+        after: i64,
+        roles: &[String],
+    ) -> Result<Vec<DistillEntry>, ArchiveError> {
+        let archive = self;
+        let visible = archive.visible("e");
+        let cwd = if archive.version >= 3 {
+            "e.cwd"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+        "SELECT e.id,e.session_id,e.ts,{cwd},e.content,e.role
+        FROM sources s CROSS JOIN entries e
+        WHERE e.source_id=s.id AND {visible} AND e.session_id=?1 AND e.id>?2 AND e.role IN (SELECT value FROM json_each(?3)) ORDER BY e.id LIMIT 64"
+    );
+        let mut statement = archive.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params![session, after, json!(roles).to_string()], |row| {
+                Ok(DistillEntry {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    ts: row.get(2)?,
+                    cwd: row.get(3)?,
+                    content: row.get(4)?,
+                    role: row.get(5)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+}
+
 /// Filters and bounds for one search.
 #[derive(Default, Debug)]
 pub(crate) struct SearchRequest {
@@ -610,25 +855,71 @@ pub(crate) struct SearchRequest {
     pub(crate) project_root: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) budget_tokens: Option<usize>,
+    /// Match messages containing any content word rather than all words.
+    /// A spoken question rarely has every one of its words in one message.
+    pub(crate) match_any: bool,
+    /// Half-open `[from, to)` in Unix seconds; only entries said inside it match.
+    pub(crate) period: Option<(i64, i64)>,
 }
 
 /// Each whitespace-separated term becomes a quoted FTS5 phrase, so operators,
 /// column filters and quotes in the query are matched as text, never parsed.
 fn fts_query(query: &str) -> Result<String, ArchiveError> {
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(ArchiveError::BadRequest(format!(
-            "query longer than {MAX_QUERY_BYTES} bytes"
-        )));
-    }
-    let terms: Vec<String> = query
-        .split_whitespace()
+    let terms: Vec<String> = query_terms(query)?
         .take(MAX_TERMS)
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .map(quote_term)
         .collect();
     if terms.is_empty() {
         return Err(ArchiveError::BadRequest("empty query".into()));
     }
     Ok(terms.join(" "))
+}
+
+/// OR of the question's content words, ranked by bm25 like the strict form.
+/// Long words become a quoted five-letter prefix query because the tokenizer
+/// does no stemming: "октября" must still reach "октябре", "отказались" "отказ".
+fn fts_query_any(query: &str) -> Result<String, ArchiveError> {
+    let mut terms: Vec<String> = Vec::new();
+    for raw in query_terms(query)? {
+        let term = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        let lower = term.to_lowercase();
+        let chars = lower.chars().count();
+        let has_digit = lower.chars().any(|c| c.is_ascii_digit());
+        if lower.is_empty() || (!has_digit && (chars < 3 || STOP_WORDS.contains(&lower.as_str()))) {
+            continue;
+        }
+        let quoted = if !has_digit && chars >= 7 {
+            let stem: String = lower.chars().take(5).collect();
+            format!("{}*", quote_term(&stem))
+        } else {
+            quote_term(&lower)
+        };
+        if !terms.contains(&quoted) {
+            terms.push(quoted);
+        }
+        if terms.len() == MAX_TERMS {
+            break;
+        }
+    }
+    if terms.is_empty() {
+        // An OR question containing only grammar has no lexical evidence.
+        // Keep strict archive phrase search separate and unchanged.
+        return Ok(String::new());
+    }
+    Ok(terms.join(" OR "))
+}
+
+fn query_terms(query: &str) -> Result<std::str::SplitWhitespace<'_>, ArchiveError> {
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(ArchiveError::BadRequest(format!(
+            "query longer than {MAX_QUERY_BYTES} bytes"
+        )));
+    }
+    Ok(query.split_whitespace())
+}
+
+fn quote_term(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
 }
 
 fn bounded_filter(name: &str, value: Option<&str>) -> Result<Option<String>, ArchiveError> {
@@ -656,7 +947,11 @@ fn excerpt(text: &str, chars: usize) -> String {
 
 pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value, ArchiveError> {
     let paths = Paths::new(brain_home);
-    let fts = fts_query(&request.query)?;
+    let fts = if request.match_any {
+        fts_query_any(&request.query)?
+    } else {
+        fts_query(&request.query)?
+    };
     let client = bounded_filter("client", request.client.as_deref())?;
     if let Some(client) = &client
         && !CLIENTS.contains(&client.as_str())
@@ -667,12 +962,12 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
     }
     let role = bounded_filter("role", request.role.as_deref())?;
     if let Some(role) = &role
-        && role != "user"
-        && role != "assistant"
+        && !ROLES.contains(&role.as_str())
     {
-        return Err(ArchiveError::BadRequest(
-            "role must be user or assistant".into(),
-        ));
+        return Err(ArchiveError::BadRequest(format!(
+            "role must be one of {}",
+            ROLES.join(", ")
+        )));
     }
     let session = bounded_filter("session_id", request.session_id.as_deref())?;
     let project = bounded_filter("project_root", request.project_root.as_deref())?;
@@ -701,6 +996,9 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
             "project_root needs a schema 3 archive (the working directory is not recorded in schema 2)".into(),
         ));
     }
+    if fts.is_empty() {
+        return Ok(search_document(Vec::new(), limit, budget, 0, false));
+    }
     let cwd = if archive.version >= 3 {
         "e.cwd"
     } else {
@@ -711,6 +1009,9 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
         let trimmed = root.trim_end_matches('/');
         format!("{}/", if trimmed.is_empty() { "" } else { trimmed })
     });
+    // Claude and Codex record ISO-8601 times, Hermes Unix seconds as text.
+    let said_at = "(CASE WHEN e.ts GLOB '[0-9]*' AND e.ts NOT GLOB '*[^0-9.]*' \
+                   THEN CAST(e.ts AS REAL) ELSE CAST(strftime('%s', e.ts) AS REAL) END)";
     let sql = format!(
         "SELECT e.id, s.client, e.role, e.session_id, e.ts, e.imported_at, {cwd},
                 snippet(entries_fts, 0, '', '', '…', 32)
@@ -721,6 +1022,7 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
            AND (?3 IS NULL OR e.role = ?3)
            AND (?4 IS NULL OR e.session_id = ?4)
            AND (?5 IS NULL OR {cwd} = ?5 OR substr({cwd}, 1, length(?6)) = ?6)
+           AND (?8 IS NULL OR {said_at} >= ?8) AND (?9 IS NULL OR {said_at} < ?9)
          ORDER BY bm25(entries_fts), e.id LIMIT ?7"
     );
     let mut statement = archive.connection.prepare(&sql)?;
@@ -733,15 +1035,25 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
                 session,
                 project.as_ref().map(|root| root.trim_end_matches('/').to_owned()),
                 project_prefix,
-                limit as i64
+                limit as i64,
+                request.period.map(|period| period.0),
+                request.period.map(|period| period.1)
             ],
             |row| {
+                // `timestamp` stays exactly as the client wrote it; `said_at`
+                // is the same moment as readable UTC, null when unreadable.
+                let timestamp: Option<String> = row.get(4)?;
+                let said_at = timestamp
+                    .as_deref()
+                    .and_then(epoch_seconds)
+                    .map(crate::stats::utc_second);
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "client": row.get::<_, String>(1)?,
                     "role": row.get::<_, String>(2)?,
                     "session_id": row.get::<_, Option<String>>(3)?,
-                    "timestamp": row.get::<_, Option<String>>(4)?,
+                    "timestamp": timestamp,
+                    "said_at": said_at,
                     "observed_at": row.get::<_, String>(5)?,
                     "cwd": row.get::<_, Option<String>>(6)?,
                     "excerpt": excerpt(&row.get::<_, Option<String>>(7)?.unwrap_or_default(), EXCERPT_CHARS),
@@ -763,7 +1075,23 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
         used += cost;
         results.push(row);
     }
-    Ok(json!({
+    Ok(search_document(
+        results,
+        limit,
+        budget,
+        used,
+        truncated_by_budget,
+    ))
+}
+
+fn search_document(
+    results: Vec<Value>,
+    limit: usize,
+    budget: usize,
+    used: usize,
+    truncated_by_budget: bool,
+) -> Value {
+    json!({
         "trust": TRUST,
         "scope": "conversation archive (per client/session), not a Brain space",
         "limit": limit,
@@ -773,7 +1101,7 @@ pub(crate) fn search(brain_home: &Path, request: &SearchRequest) -> Result<Value
         "truncated_by_budget": truncated_by_budget,
         "results": results,
         "next": "read one hit with archive_read {id}; excerpts are cut to 300 characters",
-    }))
+    })
 }
 
 // ------------------------------------------------------------------ read
@@ -799,7 +1127,7 @@ fn parse_id(raw: &str) -> Result<i64, ArchiveError> {
 }
 
 /// Seconds since the epoch for an ISO-8601 or numeric (Hermes) timestamp.
-fn epoch_seconds(text: &str) -> Option<i64> {
+pub(crate) fn epoch_seconds(text: &str) -> Option<i64> {
     if let Ok(number) = text.parse::<f64>() {
         return number.is_finite().then_some(number as i64);
     }
@@ -911,7 +1239,8 @@ pub(crate) fn read(brain_home: &Path, request: &ReadRequest) -> Result<Value, Ar
         "role": role,
         "role_note": if role == "assistant" { "an agent's claim, not observed evidence that something worked" } else { "what the person typed" },
         "session_id": session,
-        "timestamp": ts,
+        "timestamp": ts.clone(),
+        "said_at": ts.as_deref().and_then(epoch_seconds).map(crate::stats::utc_second),
         "observed_at": observed,
         "capture_lag_seconds": lag,
         "cwd": cwd_value,
@@ -943,10 +1272,16 @@ fn neighbours(
         let mut statement = archive.connection.prepare(sql)?;
         let rows = statement
             .query_map(params![source_id, session, id, count as i64], |row| {
+                let timestamp: Option<String> = row.get(2)?;
+                let said_at = timestamp
+                    .as_deref()
+                    .and_then(epoch_seconds)
+                    .map(crate::stats::utc_second);
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "role": row.get::<_, String>(1)?,
-                    "timestamp": row.get::<_, Option<String>>(2)?,
+                    "timestamp": timestamp,
+                    "said_at": said_at,
                     "preview": excerpt(&row.get::<_, String>(3)?, PREVIEW_CHARS),
                 }))
             })?
@@ -1044,13 +1379,40 @@ fn validate_clients(value: &Value) -> Result<Vec<&'static str>, Box<dyn Error>> 
         .collect())
 }
 
+fn validate_roles(value: &Value) -> Result<Vec<&'static str>, Box<dyn Error>> {
+    let invalid = || -> Box<dyn Error> {
+        format!(
+            "roles must be a non-empty list of distinct names from: {}",
+            ROLES.join(", ")
+        )
+        .into()
+    };
+    let items = value
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or_else(invalid)?;
+    let mut names = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.as_str().filter(|name| ROLES.contains(name));
+        match name {
+            Some(name) if !names.contains(&name) => names.push(name),
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(ROLES
+        .into_iter()
+        .filter(|known| names.contains(known))
+        .collect())
+}
+
 /// Persists the switch the collector checks on every run. Budgets and an existing
-/// client selection are kept; `clients` replaces the selection only when given.
+/// client selection are kept; `clients`/`roles` replace selections only when given.
 pub(crate) fn set_enabled(
     brain_home: &Path,
     enabled: bool,
     since_days: Option<u64>,
     clients: Option<&[String]>,
+    roles: Option<&[String]>,
 ) -> Result<Value, Box<dyn Error>> {
     let paths = Paths::new(brain_home);
     ensure_private_dir(&paths.dir)?;
@@ -1058,10 +1420,16 @@ pub(crate) fn set_enabled(
     let selection = clients
         .map(|names| validate_clients(&json!(names)))
         .transpose()?;
+    let role_selection = roles
+        .map(|names| validate_roles(&json!(names)))
+        .transpose()?;
     config.insert("version".into(), json!(1));
     config.insert("enabled".into(), json!(enabled));
     if let Some(names) = selection {
         config.insert("clients".into(), json!(names));
+    }
+    if let Some(names) = role_selection {
+        config.insert("roles".into(), json!(names));
     }
     if let Some(days) = since_days {
         if !(SINCE_DAYS_RANGE.0..=SINCE_DAYS_RANGE.1).contains(&days) {
@@ -1079,6 +1447,8 @@ pub(crate) fn set_enabled(
               "since_days": config.get("since_days").cloned().unwrap_or(json!(14)),
               "clients_configured": config.get("clients").cloned()
                   .unwrap_or_else(|| json!(COLLECTOR_CLIENTS)),
+              "roles_configured": config.get("roles").cloned()
+                  .unwrap_or_else(|| json!(ROLES)),
               "note": if enabled { "the next collector run (timer or `brain archive collect`) will collect" }
                       else { "paused: collector runs now exit without reading any source" }}))
 }
@@ -1380,6 +1750,84 @@ pub(crate) fn backfill_document(brain_home: &Path) -> Value {
     document
 }
 
+/// The privacy panel of the settings window: what each archive client
+/// collects, which roles, the age window, and how much is stored or
+/// quarantined. Composed from the same status/config documents the CLI
+/// prints; turning a role off only stops the collection — stored rows stay.
+pub(crate) fn privacy_document(brain_home: &Path, home: &Path) -> Value {
+    let status = status(brain_home, home);
+    let config = &status["configured"]["collector_config"];
+    let stored = &status["stored"];
+    let quarantine_total: usize = stored["quarantined"]["by_reason"]
+        .as_object()
+        .map(|reasons| {
+            reasons
+                .values()
+                .filter_map(|value| value.as_u64())
+                .sum::<u64>() as usize
+        })
+        .unwrap_or(0);
+    json!({
+        "error": config["error"],
+        "archive_status": status["status"],
+        "enabled": config["enabled"].as_bool().unwrap_or(false),
+        "clients_configured": config["clients_configured"],
+        "client_selection": config["client_selection"],
+        "roles_configured": config["roles_configured"],
+        "role_selection": config["role_selection"],
+        "since_days": config["since_days"],
+        "stored_total": stored["entries"].as_u64().unwrap_or(0),
+        "stored_by_client": stored["by_client"],
+        "quarantine_total": quarantine_total,
+        "quarantine_by_reason": stored["quarantined"]["by_reason"],
+        "quarantine_by_client": stored["quarantined"]["by_client"],
+        "note": "Выключение роли или клиента останавливает только сбор новых записей; уже сохранённое не удаляется.",
+    })
+}
+
+/// Apply a settings-window privacy change through the same `set_enabled`
+/// the CLI uses. Omitted fields keep their current configured values; every
+/// validation (clients, roles, since_days range) is set_enabled's own, so an
+/// invalid change is refused whole and nothing else moves.
+pub(crate) fn apply_privacy(brain_home: &Path, payload: &Value) -> Result<Value, Box<dyn Error>> {
+    let object = payload.as_object().ok_or("expected an object")?;
+    if object.keys().any(|key| {
+        !["confirm", "enabled", "since_days", "clients", "roles"].contains(&key.as_str())
+    }) {
+        return Err("unknown privacy field (allowed: enabled, since_days, clients, roles; roles are user, assistant, tool_call, tool_result, tool_error, reasoning)".into());
+    }
+    let current = read_config(&Paths::new(brain_home))?.unwrap_or_default();
+    let enabled = match payload.get("enabled").or_else(|| current.get("enabled")) {
+        Some(value) => value.as_bool().ok_or("enabled must be boolean")?,
+        None => false,
+    };
+    let since_days = payload
+        .get("since_days")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or("since_days must be a positive integer")
+        })
+        .transpose()?;
+    let clients = payload
+        .get("clients")
+        .map(validate_clients)
+        .transpose()?
+        .map(|items| items.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    let roles = payload
+        .get("roles")
+        .map(validate_roles)
+        .transpose()?
+        .map(|items| items.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    set_enabled(
+        brain_home,
+        enabled,
+        since_days,
+        clients.as_deref(),
+        roles.as_deref(),
+    )
+}
+
 fn selected_total(summary: &Value) -> i64 {
     summary
         .get("clients")
@@ -1435,9 +1883,9 @@ fn missing_total(summary: &Value) -> i64 {
 }
 
 /// Writes owner-only bytes via a fresh temporary file and an atomic rename.
-fn write_private(target: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+pub(crate) fn write_private(target: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     if fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err("refusing to replace a symlink".into());
+        return Err("refusing to replace a symlink (remove the symlink yourself if you really want this path rewritten)".into());
     }
     let temporary = target.with_extension(format!("tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temporary);
@@ -1544,18 +1992,15 @@ pub(crate) fn collect(brain_home: &Path, home: &Path) -> Result<Value, Box<dyn E
 /// characters — is refused rather than escaped.
 pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Error>> {
     let text = binary.to_str().ok_or("binary path is not UTF-8")?;
-    if !text.starts_with('/')
-        || text
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '"' | '\\' | '\'' | '%' | '$' | ';'))
-    {
-        return Err("binary path cannot be written safely into a systemd unit; install brain under a plain path".into());
+    if !text.starts_with('/') {
+        return Err("binary path must be absolute".into());
     }
+    let binary_arg = systemd_argument(text)?;
     let service = format!(
         "[Unit]\nDescription=Brain for AI: bounded conversation archive collector\n\n\
-         [Service]\nType=oneshot\nExecStart=\"{}\" archive collect --quiet\nNice=10\n\
+         [Service]\nType=oneshot\nExecStart={} archive collect --quiet\nNice=10\n\
          IOSchedulingClass=idle\nTimeoutStartSec=180\n",
-        binary.display()
+        binary_arg
     );
     let timer =
         "[Unit]\nDescription=Brain for AI: collect new conversation text every 2 minutes\n\n\
@@ -1565,17 +2010,46 @@ pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Err
     Ok((service, timer))
 }
 
+/// Quote one literal ExecStart argument, refusing systemd expansion and escapes.
+pub(crate) fn systemd_argument(text: &str) -> Result<String, Box<dyn Error>> {
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '\\' | '\'' | '%' | '$' | ';'))
+    {
+        return Err(
+            "argument cannot be written safely into a systemd unit; use a plain path or name"
+                .into(),
+        );
+    }
+    Ok(format!("\"{text}\""))
+}
+
 /// Writes (or removes) the unit files; enabling is left to systemctl.
 pub(crate) fn write_timer_units(
     home: &Path,
     binary: &Path,
     install: bool,
 ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let units = if install {
+        Some(timer_units(binary)?)
+    } else {
+        None
+    };
+    write_named_timer_units(home, SERVICE_UNIT, TIMER_UNIT, units)
+}
+
+/// Shared private, atomic unit writer for archive and distillation timers.
+pub(crate) fn write_named_timer_units(
+    home: &Path,
+    service_name: &str,
+    timer_name: &str,
+    units: Option<(String, String)>,
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let dir = home.join(".config/systemd/user");
-    let service_path = dir.join(SERVICE_UNIT);
-    let timer_path = dir.join(TIMER_UNIT);
-    if install {
-        let (service, timer) = timer_units(binary)?;
+    let service_path = dir.join(service_name);
+    let timer_path = dir.join(timer_name);
+    if let Some((service, timer)) = units {
         fs::create_dir_all(&dir)?;
         for (path, text) in [(&service_path, service), (&timer_path, timer)] {
             write_private(path, text.as_bytes())?;
@@ -1616,9 +2090,54 @@ mod tests {
         }
     }
 
-    fn fixture(name: &str) -> (Fixture, PathBuf) {
-        let root =
-            std::env::temp_dir().join(format!("brain-archive-{name}-{}", std::process::id()));
+    #[test]
+    fn privacy_patch_rejects_invalid_types_and_preserves_untouched_settings() {
+        let (_guard, home) = fixture("privacy-patch");
+        set_enabled(
+            &home,
+            true,
+            Some(21),
+            Some(&["codex".to_owned()]),
+            Some(&["user".to_owned()]),
+        )
+        .unwrap();
+        let path = Paths::new(&home).config;
+        let before = fs::read(&path).unwrap();
+        for payload in [
+            json!({"enabled":"false"}),
+            json!({"enabled":null}),
+            json!({"since_days":-1}),
+            json!({"since_days":null}),
+            json!({"since_days":1.5}),
+            json!({"since_days":3651}),
+            json!({"clients":"claude"}),
+            json!({"clients":["claude",1]}),
+            json!({"roles":["user",1]}),
+            json!({"roles":null}),
+            json!({"roles":[]}),
+            json!({"roles":["user","user"]}),
+            json!({"typo":true}),
+        ] {
+            assert!(apply_privacy(&home, &payload).is_err(), "{payload}");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "invalid patch writes nothing: {payload}"
+            );
+        }
+        apply_privacy(&home, &json!({"roles":["assistant"]})).unwrap();
+        let config = read_config(&Paths::new(&home)).unwrap().unwrap();
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["clients"], json!(["codex"]));
+        assert_eq!(config["since_days"], 21);
+        assert_eq!(config["roles"], json!(["assistant"]));
+        fs::write(&path, b"broken JSON").unwrap();
+        assert!(apply_privacy(&home, &json!({"enabled":false})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"broken JSON");
+    }
+
+    fn fixture(_name: &str) -> (Fixture, PathBuf) {
+        let root = crate::test_support::temp_path("brain-archive");
         let _ = fs::remove_dir_all(&root);
         let brain_home = root.join("brain");
         let dir = brain_home.join("archive");
@@ -1766,6 +2285,88 @@ mod tests {
     }
 
     #[test]
+    fn hermes_profile_labels_come_from_the_path_shape() {
+        assert_eq!(hermes_profile_label("/home/u/.hermes/state.db"), "default");
+        assert_eq!(
+            hermes_profile_label("/home/u/.hermes/profiles/sol/state.db"),
+            "sol"
+        );
+        // Not the profiles/<name>/state.db shape, or a name the collector
+        // would never have accepted: not a profile.
+        assert_eq!(
+            hermes_profile_label("/home/u/.hermes/sol/state.db"),
+            "default"
+        );
+        assert_eq!(
+            hermes_profile_label("/home/u/.hermes/profiles/sol/backup.db"),
+            "default"
+        );
+        assert_eq!(hermes_profile_label("/x/profiles/../state.db"), "default");
+    }
+
+    #[test]
+    fn status_counts_hermes_sources_per_profile() {
+        let (_guard, brain_home) = fixture("hermes-profiles");
+        let database = Paths::new(&brain_home).database;
+        let connection = Connection::open(&database).expect("open");
+        for statement in SCHEMA {
+            connection.execute(statement, []).expect("schema");
+        }
+        connection
+            .execute(
+                "INSERT INTO archive_meta VALUES ('schema', 'brain_session_archive:3')",
+                [],
+            )
+            .expect("marker");
+        for (id, path) in [
+            (1_i64, "/h/.hermes/state.db"),
+            (2, "/h/.hermes/profiles/sol/state.db"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sources VALUES (?1, 'hermes', ?2, 'sha')",
+                    params![id, path],
+                )
+                .expect("source");
+        }
+        for (source, session, text) in [
+            (1_i64, "h9", "top-level message"),
+            (2, "profiles/sol/h9", "profile message one"),
+            (2, "profiles/sol/h9", "profile message two"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO entries(source_id, session_id, role, locator, ts, content,
+                       content_sha256, evidence_sha256, record_sha256, imported_at)
+                     VALUES (?1, ?2, 'user', 'row:1', '1791400000.5', ?3, 'c', 'e', 'r',
+                       '2026-10-08T10:00:05Z')",
+                    params![source, session, text],
+                )
+                .expect("entry");
+            let id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO entries_fts(rowid, content) VALUES (?1, ?2)",
+                    params![id, text],
+                )
+                .expect("fts");
+        }
+        drop(connection);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let archive = open(&database).expect("archive");
+        let stored = stored_document(&archive).expect("stored");
+        assert_eq!(
+            stored["hermes_profiles"],
+            json!({
+                "default": {"entries": 1, "sessions": 1, "sources": 1},
+                "sol": {"entries": 2, "sessions": 1, "sources": 1},
+            })
+        );
+        // The overall per-client counts keep their own shape.
+        assert_eq!(stored["by_client"]["hermes"]["sources"], 2);
+    }
+
+    #[test]
     fn fts_operators_and_quotes_are_literal_text() {
         let (_guard, brain_home) = fixture("fts");
         sample(&brain_home);
@@ -1794,6 +2395,161 @@ mod tests {
             search(&brain_home, &query(&long)).expect_err("long").kind(),
             "bad_request"
         );
+    }
+
+    #[test]
+    fn match_any_bounds_dedupe_and_fold_yo() {
+        // Sixteen content terms is the ceiling, and stop words interleaved
+        // between them never consume a slot.
+        let words = [
+            "барабан",
+            "чемодан",
+            "картина",
+            "корзина",
+            "карандаш",
+            "гитара",
+            "колесо",
+            "дерево",
+            "звезда",
+            "лодка",
+            "мост",
+            "поезд",
+            "самолет",
+            "телефон",
+            "улица",
+            "фонтан",
+            "хозяйка",
+            "церковь",
+        ];
+        let query = words
+            .iter()
+            .enumerate()
+            .map(|(index, word)| {
+                if index % 2 == 0 {
+                    format!("the что {word}")
+                } else {
+                    (*word).to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let built = fts_query_any(&query).expect("query builds");
+        let terms: Vec<&str> = built.split(" OR ").collect();
+        assert_eq!(terms.len(), MAX_TERMS, "{built}");
+        assert!(
+            !built.contains("церковь"),
+            "the 18th word is past the limit"
+        );
+        // Duplicates after lowercasing are one term, Ё/ё included.
+        assert_eq!(
+            fts_query_any("Отказ отказ ОТКАЗ")
+                .unwrap()
+                .split(" OR ")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fts_query_any("Ёлка ёлка ЁЛКА")
+                .unwrap()
+                .split(" OR ")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_query_byte_bound_is_checked_before_terms() {
+        // Cyrillic letters are two bytes each: 500 fit, 501 do not.
+        assert!(fts_query_any(&"ф".repeat(500)).is_ok());
+        let error = fts_query_any(&"ф".repeat(501)).expect_err("1002 bytes");
+        assert!(error.to_string().contains("longer than"), "{error}");
+    }
+
+    #[test]
+    fn match_any_keeps_content_words_digits_and_quotes_everything() {
+        assert_eq!(
+            fts_query_any("почему 9 октября отказались от Ollama Cloud?").expect("query"),
+            "\"9\" OR \"октяб\"* OR \"отказ\"* OR \"ollama\" OR \"cloud\""
+        );
+        assert_eq!(
+            fts_query_any("что было на порту 8803").expect("query"),
+            "\"порту\" OR \"8803\""
+        );
+        // Operators and quotes stay text: each survives only inside a quoted term.
+        assert_eq!(
+            fts_query_any("NEAR(a b) \"x\" OR* col:val").expect("query"),
+            "\"near(a\" OR \"col:v\"*"
+        );
+        // Stop words only: no lexical evidence and never an empty MATCH.
+        assert_eq!(fts_query_any("что как где").expect("query"), "");
+    }
+
+    #[test]
+    fn match_any_finds_a_spoken_question_strict_mode_does_not() {
+        let (_guard, brain_home) = fixture("match-any");
+        build(
+            &brain_home,
+            SCHEMA_CURRENT,
+            &[(
+                "codex",
+                "c1",
+                "user",
+                "Ollama Cloud отказ: подписка просрочена",
+                "",
+            )],
+        );
+        let question = "почему отказались от Ollama Cloud";
+        let strict = search(&brain_home, &query(question)).expect("strict");
+        assert_eq!(strict["results"].as_array().expect("results").len(), 0);
+        let any = search(
+            &brain_home,
+            &SearchRequest {
+                match_any: true,
+                ..query(question)
+            },
+        )
+        .expect("any");
+        assert_eq!(any["results"].as_array().expect("results").len(), 1);
+        for hostile in [
+            "\"",
+            "*",
+            "NEAR(a b)",
+            "OR AND NOT",
+            "-ollama",
+            "col:val",
+            "a\"b\" OR \"c",
+        ] {
+            let result = search(
+                &brain_home,
+                &SearchRequest {
+                    match_any: true,
+                    ..query(hostile)
+                },
+            );
+            assert!(
+                !matches!(result, Err(ArchiveError::Database(_))),
+                "{hostile}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_any_stop_words_have_no_results_even_when_the_phrase_exists() {
+        let (_guard, brain_home) = fixture("stop-only");
+        build(
+            &brain_home,
+            SCHEMA_CURRENT,
+            &[("codex", "c1", "user", "что как где the and for", "")],
+        );
+        for text in ["что как где", "the and for", "и на в", "a an the"] {
+            let mut request = query(text);
+            request.match_any = true;
+            let found = search(&brain_home, &request).expect("valid empty search");
+            assert_eq!(found["results"].as_array().unwrap().len(), 0);
+            assert_eq!(found["tokens_used_estimate"], 0);
+        }
+        let strict = search(&brain_home, &query("что как где")).unwrap();
+        assert_eq!(strict["results"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2057,6 +2813,10 @@ mod tests {
                  INSERT INTO quarantine VALUES (1, 'external_agent_tool_traffic', 'r', '{}', 't', NULL);",
             )
             .expect("quarantine");
+        let privacy = privacy_document(&brain_home, &brain_home);
+        assert_eq!(privacy["stored_by_client"]["codex"]["entries"], 2);
+        assert_eq!(privacy["quarantine_by_client"]["codex"], 1);
+        assert_eq!(privacy["quarantine_total"], 1);
         let ids = |text: &str| -> Vec<i64> {
             search(&brain_home, &query(text)).expect("search")["results"]
                 .as_array()
@@ -2144,7 +2904,7 @@ mod tests {
     fn enable_and_disable_persist_a_private_validated_switch() {
         let (_guard, brain_home) = fixture("switch");
         let paths = Paths::new(&brain_home);
-        set_enabled(&brain_home, true, Some(7), None).expect("enable");
+        set_enabled(&brain_home, true, Some(7), None, None).expect("enable");
         let config = read_config(&paths).expect("read").expect("present");
         assert_eq!(
             (config["enabled"].clone(), config["since_days"].clone()),
@@ -2154,13 +2914,13 @@ mod tests {
             fs::metadata(&paths.config).expect("meta").mode() & 0o777,
             0o600
         );
-        set_enabled(&brain_home, false, None, None).expect("disable");
+        set_enabled(&brain_home, false, None, None, None).expect("disable");
         let config = read_config(&paths).expect("read").expect("present");
         assert_eq!(
             (config["enabled"].clone(), config["since_days"].clone()),
             (json!(false), json!(7))
         );
-        assert!(set_enabled(&brain_home, true, Some(0), None).is_err());
+        assert!(set_enabled(&brain_home, true, Some(0), None, None).is_err());
         assert_eq!(
             read_config(&paths).expect("read").expect("present")["enabled"],
             json!(false)
@@ -2171,7 +2931,7 @@ mod tests {
     fn client_selection_is_validated_and_preserved_with_budgets() {
         let (_guard, brain_home) = fixture("clients");
         let paths = Paths::new(&brain_home);
-        set_enabled(&brain_home, true, Some(3), None).expect("enable");
+        set_enabled(&brain_home, true, Some(3), None, None).expect("enable");
         let document = config_document(&paths);
         assert_eq!(document["client_selection"], json!("legacy_all"));
         assert_eq!(
@@ -2184,9 +2944,9 @@ mod tests {
         let text = serde_json::to_string(&config).expect("json");
         write_private(&paths.config, text.as_bytes()).expect("write");
         let pick = vec!["hermes".to_string(), "codex".to_string()];
-        set_enabled(&brain_home, true, None, Some(&pick)).expect("select");
-        set_enabled(&brain_home, false, None, None).expect("disable");
-        set_enabled(&brain_home, true, None, None).expect("re-enable");
+        set_enabled(&brain_home, true, None, Some(&pick), None).expect("select");
+        set_enabled(&brain_home, false, None, None, None).expect("disable");
+        set_enabled(&brain_home, true, None, None, None).expect("re-enable");
         let config = read_config(&paths).expect("read").expect("present");
         assert_eq!(config["clients"], json!(["codex", "hermes"]));
         assert_eq!(config["max_seconds"], json!(9));
@@ -2199,7 +2959,7 @@ mod tests {
         let duplicate = vec!["codex".to_string(), "codex".to_string()];
         for bad in [vec![], vec!["cursor".to_string()], duplicate] {
             assert!(
-                set_enabled(&brain_home, true, None, Some(&bad)).is_err(),
+                set_enabled(&brain_home, true, None, Some(&bad), None).is_err(),
                 "{bad:?}"
             );
         }
@@ -2351,7 +3111,7 @@ mod tests {
     fn backfill_never_touches_the_collector_config() {
         let (_guard, brain_home) = fixture("bf-isolation");
         let paths = Paths::new(&brain_home);
-        set_enabled(&brain_home, true, Some(9), None).expect("enable collector");
+        set_enabled(&brain_home, true, Some(9), None, None).expect("enable collector");
         let collector_before = fs::read(&paths.config).expect("config");
         backfill_start(&brain_home, 2).expect("start backfill");
         backfill_stop(&brain_home).expect("stop backfill");

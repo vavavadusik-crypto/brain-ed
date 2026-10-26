@@ -4,6 +4,8 @@
 //! credential. This proves the protocol and its refusals on one machine;
 //! it is not a deployment on ten computers and never binds a LAN interface.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -16,15 +18,12 @@ use serde_json::Value;
 
 const BRAIN: &str = env!("CARGO_BIN_EXE_brain");
 
-fn temp_root(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn temp_root(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-net-process-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-net-process");
     fs::create_dir_all(&root).expect("root");
     root
 }
@@ -951,7 +950,7 @@ fn expired_certificate_and_key_descriptor_negatives() {
 /// never binds a non-loopback interface.
 #[test]
 fn lan_listen_and_dial_are_refused_without_opt_in_or_for_wide_addresses() {
-    let root = std::env::temp_dir().join(format!("brain-lan-cli-{}", std::process::id()));
+    let root = test_support::temp_path("brain-lan-cli");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("root");
     let home = root.join("home");

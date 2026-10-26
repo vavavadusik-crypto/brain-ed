@@ -122,6 +122,7 @@ impl HomeCheck {
 pub(crate) enum ClientsCommand {
     /// Register a client home explicitly (no integration or capture yet).
     Register {
+        /// Which client this home belongs to (codex, claude or hermes).
         #[arg(long, value_enum)]
         client: ClientKind,
         /// Absolute path of the client's home directory.
@@ -136,6 +137,7 @@ pub(crate) enum ClientsCommand {
     },
     /// List registrations (labels and checks; paths only with --show-paths).
     List {
+        /// Also print each registration's home path.
         #[arg(long)]
         show_paths: bool,
     },
@@ -143,27 +145,35 @@ pub(crate) enum ClientsCommand {
     /// `config.toml` of a registered Codex home. Exactly one of `--dry-run`
     /// or `--yes` is required. Configured is not a handshake or capture.
     Configure {
+        /// Label of the registered home to configure.
         #[arg(long)]
         label: String,
+        /// Show the planned config.toml edit without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Apply the edit.
         #[arg(long)]
         yes: bool,
     },
     /// Remove the Brain MCP entry added by `configure`, restoring the exact
     /// original bytes when the file was not edited since.
     Unconfigure {
+        /// Label of the registered home to unconfigure.
         #[arg(long)]
         label: String,
+        /// Show the planned config.toml edit without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Apply the edit.
         #[arg(long)]
         yes: bool,
     },
     /// Remove a registration. The client's directory is never touched.
     Forget {
+        /// Label of the registration to forget.
         #[arg(long)]
         label: String,
+        /// Read-only snapshot of what would be removed; writes nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -961,14 +971,11 @@ mod home_guard_tests {
 
     #[test]
     fn every_clients_command_refuses_unusable_homes_before_any_io() {
-        let nonce = std::time::SystemTime::now()
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-registry-guard-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-registry-guard");
         // A healthy registration a loose guard could read, lock or rewrite.
         let home = root.join("ok");
         let client = home.join("work-codex");
@@ -1043,15 +1050,12 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
+    fn scratch(_label: &str) -> PathBuf {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-registry-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-registry");
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         root

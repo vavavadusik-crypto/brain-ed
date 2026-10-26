@@ -5,10 +5,13 @@
 //! deadline) driven by `brain net`. Loopback is the default; a TLS listener or
 //! dial target on a numeric private unicast LAN address needs an explicit
 //! opt-in ([`checked_listen_ip`]). The plaintext server stays loopback-only.
+//! [`relay`] adds an explicit company-hosted NAT route with outer pinned TLS
+//! and scoped relay tokens; coordinator TLS is forwarded without termination.
 
 pub mod auth;
 pub mod client;
 pub mod protocol;
+pub mod relay;
 pub mod server;
 pub mod tls;
 
@@ -24,5 +27,5 @@ pub use server::{
 pub use tls::{
     Dialer, KeySource, TcpDialer, TlsCallResult, TlsClientConfig, TlsCoordClient, TlsCoordServer,
     TlsError, TlsServerConfig, TlsServerHandle, open_inherited_fd, parse_dial_target,
-    parse_dial_target_lan,
+    parse_dial_target_lan, parse_dial_target_with,
 };

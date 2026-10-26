@@ -46,6 +46,10 @@ html[data-theme="dark"] {
 .captable td.warn { color: var(--warn); }
 .table-scroll { overflow-x: auto; }
 .arch-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.memory-knob { margin: 14px 0; }
+.memory-knob .check-label { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.memory-knob .check-label input[type="number"] { width: 7em; }
+.memory-knob .hint { margin: 4px 0 0 26px; }
 .arch-form input, .arch-form select { font: inherit; color: inherit; background: var(--bg);
   border: 1px solid var(--panel-edge); border-radius: 8px; padding: 6px 10px; }
 .arch-form input { flex: 1 1 260px; }
@@ -244,8 +248,12 @@ html[data-theme="dark"] .primary { color: #06231a; }
   <section>
     <h2>Подробно</h2>
     <p class="hint">Каждое число можно задать вручную. Изменённые перестают следовать профилю — до тех пор, пока вы их не вернёте.</p>
+    <label><input id="advanced-search" type="checkbox"> Расширенный режим порогов (до 0,99; может почти убрать выдачу)</label>
+    <p class="hint">Выше порог отсечения — меньше результатов. Обычные пределы: cosine 0,45 и BM25 0,10, как у самого строгого встроенного профиля. Изменения применятся только после «Сохранить» и подтверждения.</p>
+    <p id="search-warning" class="note bad" role="status"></p>
+    <pre id="search-summary" aria-live="polite"></pre>
     <div id="knobs"></div>
-    <button class="ghost" id="reset" type="button" style="margin-top:12px">Вернуть все числа к профилю</button>
+    <button class="ghost" id="reset" type="button" style="margin-top:12px">Вернуть настройки по умолчанию</button>
   </section>
 
   <section>
@@ -276,6 +284,87 @@ html[data-theme="dark"] .primary { color: #06231a; }
     <ul class="hint" id="capture-limits"></ul>
   </section>
 
+  <section id="panels">
+    <h2>Агенты, приватность захвата и сеть</h2>
+
+    <h3>Агенты</h3>
+    <p class="hint">Подключение и отключение проходят тот же код, что <code>brain init --agents</code> и
+      <code>brain uninstall</code>, но для одного агента. Кнопка «План изменений» показывает дифф конфига
+      (как <code>--dry-run</code>); применяется он только после явного подтверждения — без него ничего не пишется.</p>
+    <div class="table-scroll" id="agents-list"></div>
+    <div id="agents-preview" hidden></div>
+    <p class="hint" id="agents-error" hidden></p>
+
+    <h3>Приватность захвата</h3>
+    <p class="hint">Что собирает архив по каждому клиенту: включён ли сбор, какие роли записей и окно возраста.
+      Выключение роли или клиента останавливает только сбор новых записей — уже сохранённое не удаляется.
+      Изменения идут тем же путём, что <code>brain archive enable --roles</code>.</p>
+    <div id="privacy-state"></div>
+    <div id="privacy-controls"></div>
+    <p class="hint" id="privacy-error" hidden></p>
+
+    <h3>Сеть</h3>
+    <p class="hint">Состояние координатора (<code>brain net</code>): база координации, учётки и отвечает ли
+      что-то на стандартном порту. Только просмотр; токены и ключи здесь не показываются никогда.</p>
+    <div id="net-state"></div>
+    <h3>Факты для команды</h3>
+    <p class="hint">Публикация по умолчанию выключена. Изменение политики закрывает старый срез до следующей публикации. Уже полученные копии у других машин сохраняются.</p>
+    <div id="team-manifest"></div>
+  </section>
+
+  <section id="memory-controls">
+    <h2>Память разговоров</h2>
+    <p class="hint">Те же настройки, что меняет <code>brain config set</code> и команда импорта:
+      значения читаются из одного файла и применяются к каждой следующей команде <code>brain</code>.
+      Кнопка «Сохранить» наверху относится и к этому разделу.</p>
+    <div class="memory-knob">
+      <label for="include-archive" class="check-label">
+        <input type="checkbox" id="include-archive" aria-label="Искать в архиве переписок">
+        Искать в архиве переписок
+      </label>
+      <p class="hint">Находить ли при вопросах (<code>brain ask</code>) прошлые переписки из Claude Code, Codex и Hermes как свидетельства.</p>
+    </div>
+    <div class="memory-knob">
+      <label for="archive-min-age" class="check-label">
+        Прятать записи архива моложе <input type="number" id="archive-min-age" min="0" max="4294967295"
+          step="1" data-exact-knob aria-label="Скрывать записи архива моложе этого числа минут"> минут
+      </label>
+      <p class="hint">Записи, написанные меньше этого числа минут назад, не показываются в ответах —
+        иначе текущий разговор цитирует сам себя. <code>0</code> — показывать записи любого возраста.</p>
+      <p class="hint bad" id="archive-min-age-error" hidden></p>
+    </div>
+    <div class="memory-knob">
+      <label for="session-start-notice" class="check-label">
+        <input type="checkbox" id="session-start-notice" aria-label="Сообщать новой сессии о Brain">
+        Сообщать новой сессии о Brain
+      </label>
+      <p class="hint">Показывать ли агенту подсказку о памяти на старте сессии (<code>brain hook</code>).</p>
+      <p class="hint bad" id="session-start-brief-error" hidden></p>
+      <label for="session-start-brief" class="check-label">
+        Брифинг новой сессии:
+        <select id="session-start-brief" aria-label="Режим брифинга новой сессии">
+          <option value="off">выключен</option>
+          <option value="brief">бриф проекта (из кэша, ≤ 2000 токенов)</option>
+        </select>
+      </label>
+      <p class="hint">«Бриф» добавляет к подсказке кэшированный бриф проекта (только память, решения и задачи — без текстов архива), помеченный как недоверенный контекст. Нет кэша — только подсказка.</p>
+    </div>
+    <div class="arch-backfill">
+      <h3>Импорт старых переписок</h3>
+      <p class="hint">Старые переписки старше окна сбора не читаются, пока вы явно их не допустите.
+        Импорт берёт за прогон несколько самых новых из них и не заменяет обычный сборщик.
+        Полный захват истории не заявляется.</p>
+      <p id="backfill-state" class="hint">Состояние импорта ещё не получено.</p>
+      <form class="arch-form" id="backfill-form" autocomplete="off">
+        <label for="backfill-quota" class="hint">Файлов за прогон:</label>
+        <input id="backfill-quota" type="number" min="1" max="20" value="2" aria-label="Файлов за прогон" title="От 1 до 20">
+        <button type="submit">Пусть импорт начнётся</button>
+        <button type="button" id="backfill-stop">Остановить импорт</button>
+      </form>
+      <p class="hint" id="backfill-note"></p>
+    </div>
+  </section>
+
   <section>
     <h2>Архив переписок <span class="tag" id="archive-state" hidden></span></h2>
     <p class="hint">Отдельная приватная база (<code>$BRAIN_HOME/archive/sessions.sqlite</code>) с видимым текстом
@@ -296,19 +385,30 @@ html[data-theme="dark"] .primary { color: #06231a; }
     <p class="hint" id="archive-search-note"></p>
     <div id="archive-results"></div>
     <div class="arch-read" id="archive-read"></div>
-    <div class="arch-backfill">
-      <h3>Импорт старых переписок</h3>
-      <p class="hint">Старые переписки старше окна сбора не читаются, пока вы явно их не допустите.
-        Импорт берёт за прогон несколько самых новых из них и не заменяет обычный сборщик.
-        Полный захват истории не заявляется.</p>
-      <p id="backfill-state" class="hint">Состояние импорта ещё не получено.</p>
-      <form class="arch-form" id="backfill-form" autocomplete="off">
-        <label for="backfill-quota" class="hint">Файлов за прогон:</label>
-        <input id="backfill-quota" type="number" min="1" max="20" value="2" aria-label="Файлов за прогон" title="От 1 до 20">
-        <button type="submit">Пусть импорт начнётся</button>
-        <button type="button" id="backfill-stop">Остановить импорт</button>
-      </form>
-      <p class="hint" id="backfill-note"></p>
+  </section>
+
+  <section id="backup-controls">
+    <h2>Резервные копии</h2>
+    <p class="hint">Снимки мозга (база, архив переписок, настройки) командой
+      <code>brain backup create</code>; по расписанию — <code>brain backup timer install</code>.
+      Значения читаются из одного файла с CLI и применяются кнопкой «Сохранить».</p>
+    <div class="memory-knob">
+      <label for="backup-dir" class="check-label">
+        Каталог снимков: <input type="text" id="backup-dir" spellcheck="false"
+          aria-label="Каталог резервных копий (пусто — по умолчанию)">
+      </label>
+      <p class="hint">Пусто — <code>$BRAIN_HOME/backups</code>. Должен быть абсолютным путём.</p>
+    </div>
+    <div class="memory-knob">
+      <label for="backup-keep" class="check-label">
+        Хранить снимков: <input type="number" id="backup-keep" min="1" max="1000" step="1"
+          data-exact-knob aria-label="Сколько последних снимков хранить">
+      </label>
+      <p class="hint"><code>brain backup prune --keep N</code> удаляет более старые; самый свежий не удаляется никогда.</p>
+    </div>
+    <p class="hint bad" id="backup-error" hidden></p>
+    <div class="memory-knob">
+      <p class="hint" id="backup-timer-state">Состояние таймера ещё не получено.</p>
     </div>
   </section>
 
@@ -350,7 +450,271 @@ html[data-theme="dark"] .primary { color: #06231a; }
   <span class="note" id="status">Изменений нет</span>
 </div></div>
 
-<script>
+<script id="team-panel-model">
+(function () {
+  function rows(doc) {
+    if (!doc || doc.error) return { error: "Манифест недоступен; выдача закрыта.", items: [] };
+    return { error: null, items: (doc.manifests || []).map(function (entry) {
+      const m = entry.manifest;
+      const slice = entry.last_slice;
+      return { space: m.space, enabled: m.enabled, revision: m.revision,
+        text: "Машина " + m.machine_id + "; проект " + m.project_id + "; space " + m.space +
+          "; получатели: " + m.recipients.map(r => r.machine + ":" + r.agent).join(", ") +
+          "; последний срез: " + (slice ? new Date(slice.generated_at * 1000).toISOString() : "нет среза") +
+          "; " + (entry.ready ? "срез разрешён" : "выдача закрыта") + "; целостность TLS+BLAKE3, без подписи",
+        classes: (doc.classes || []).map(c => ({ name: c, enabled: m.classes.includes(c),
+          fields: ((doc.fields || {})[c] || []).map(f => ({ name: f, enabled: !(m.disabled_fields || []).includes(c + "." + f) })) })) };
+    }) };
+  }
+  window.__BrainTeamPanel__ = { rows };
+})();
+</script>
+<script id="search-safety">
+(() => {
+  const caps = {min_cosine: 0.45, min_bm25: 0.10};
+  const keys = ["candidates_per_signal", "graph_hops", "budget_tokens", "min_cosine", "min_bm25"];
+  window.__BrainSearchSafety__ = {
+    high(key, cliHigh, advanced) { return !advanced && key in caps ? Math.min(caps[key], cliHigh) : cliHigh; },
+    warnings(live, base) {
+      return Object.keys(caps).filter(key => live[key] > base[key] + 1e-9)
+        .map(key => `${key}: ${base[key]} → ${live[key]}`);
+    },
+    summary(before, after, profiles) {
+      const lines = [];
+      if (before.profile !== after.profile) lines.push(`profile: ${before.profile} → ${after.profile}`);
+      const effective = (value, key) => value.overrides[key] ?? profiles.find(p => p.name === value.profile)[key];
+      for (const key of keys) {
+        const a = before.overrides[key] ?? null, b = after.overrides[key] ?? null;
+        if (a !== b || effective(before, key) !== effective(after, key)) {
+          const label = value => `${effective(value, key)} (${value.overrides[key] == null ? "из профиля" : "вручную"})`;
+          lines.push(`${key}: ${label(before)} → ${label(after)}`);
+        }
+      }
+      return lines;
+    },
+    reset(draft) { draft.profile = "balanced"; draft.overrides = {}; },
+    confirm(lines) { return window.confirm("Сохранить настройки? Было → стало:\n" + lines.join("\n")); },
+  };
+})();
+</script>
+
+<script id="memory-draft">
+    /* Pure draft/diff/validation logic for the memory settings, kept free of
+       DOM so tests/test_memory_settings.js can run it in a node vm. The page
+       wires DOM events to these functions; the server state is the only other
+       input. One rule per review item: only user-changed fields are saved,
+       clean fields always follow the server, and errors are sticky until the
+       next edit. */
+    window.__BrainMemoryDraft__ = (function () {
+      const KEYS = [
+        "include_archive", "archive_min_age_minutes", "session_start_notice",
+        "backup_dir", "backup_keep",
+      ];
+      const MAX_MINUTES = 4294967295;
+      const MAX_KEEP = 1000;
+      const state = { values: {}, dirty: {}, errors: {} };
+
+      function adopt(server) {
+        // Clean fields always take the server's value, even while the block
+        // holds focus; dirty fields keep what the user typed.
+        for (const key of KEYS) {
+          if (!state.dirty[key]) state.values[key] = server ? server[key] : undefined;
+        }
+        return state.values;
+      }
+
+      function edit(key, value) {
+        // Any edit clears that field's error and marks it dirty; an invalid
+        // value stays dirty but invalid, and blocks saving.
+        state.dirty[key] = true;
+        delete state.errors[key];
+        state.values[key] = value;
+        const message = validate(key, value);
+        if (message) state.errors[key] = message;
+        return message || null;
+      }
+
+      function validate(key, value) {
+        if (key === "backup_dir") {
+          if (typeof value !== "string") return "каталог должен быть строкой";
+          if (value !== "" && !value.startsWith("/")) {
+            return "каталог должен быть абсолютным путём (или пустым для значения по умолчанию)";
+          }
+          return null;
+        }
+        if (key === "backup_keep") {
+          if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_KEEP) {
+            return "число снимков должно быть целым от 1 до 1000";
+          }
+          return null;
+        }
+        if (key === "archive_min_age_minutes") {
+          if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+            return "число минут должно быть целым и не меньше 0";
+          }
+          if (value > MAX_MINUTES) {
+            return "число минут не может быть больше 4294967295";
+          }
+          return null;
+        }
+        if (typeof value !== "boolean") return "значение должно быть true или false";
+        return null;
+      }
+
+      function payload() {
+        // Only fields the user changed and that parse: saving the profile
+        // must never smuggle a stale memory setting back to the server.
+        const out = {};
+        for (const key of KEYS) {
+          if (state.dirty[key] && !state.errors[key]) out[key] = state.values[key];
+        }
+        return out;
+      }
+
+      function accepted(server) {
+        // After the server accepts a save, the saved fields stop being dirty
+        // and start following the server again.
+        for (const key of Object.keys(payload())) {
+          delete state.dirty[key];
+        }
+        adopt(server);
+      }
+
+      function hasErrors() {
+        return Object.keys(state.errors).length > 0;
+      }
+
+      function hasChanges() {
+        return Object.keys(payload()).length > 0;
+      }
+
+      function reset() {
+        for (const key of KEYS) {
+          delete state.dirty[key];
+          delete state.errors[key];
+        }
+      }
+
+      return { KEYS, MAX_MINUTES, state, adopt, edit, validate, payload, accepted, hasErrors, hasChanges, reset };
+    })();
+  </script>
+  <script id="panels-draft">
+    /* Pure draft/confirm logic for the agents and privacy panels (E6.4),
+       DOM-free so tests/test_panels_draft.js runs it in a node vm. Two rules:
+       an agent change is held as a draft until an explicit confirm, and a
+       privacy payload carries only user-changed valid fields. */
+    window.__BrainPanelsDraft__ = (function () {
+      const ROLE_KEYS = ["user", "assistant", "tool_call", "tool_result", "tool_error", "reasoning"];
+      const CLIENT_KEYS = ["claude", "codex", "hermes"];
+      const AGENT_IDS = ["claude", "codex", "cursor", "opencode", "openclaw", "kimi"];
+      const MAX_SINCE_DAYS = 3650;
+      const privacy = { values: {}, dirty: {}, errors: {} };
+      const agent = { draft: null, preview: null };
+
+      function subset(value, known) {
+        return Array.isArray(value) && value.length > 0
+          && value.every((item) => known.includes(item))
+          && new Set(value).size === value.length;
+      }
+
+      function validate(key, value) {
+        if (key === "enabled") {
+          return typeof value === "boolean" ? null : "значение должно быть true или false";
+        }
+        if (key === "since_days") {
+          if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+            return "окно возраста должно быть целым числом дней от 1";
+          }
+          if (value > MAX_SINCE_DAYS) {
+            return "окно возраста не может быть больше " + MAX_SINCE_DAYS + " дней";
+          }
+          return null;
+        }
+        if (key === "roles") {
+          return subset(value, ROLE_KEYS) ? null : "нужен непустой список различных ролей из: " + ROLE_KEYS.join(", ");
+        }
+        if (key === "clients") {
+          return subset(value, CLIENT_KEYS) ? null : "нужен непустой список различных клиентов из: " + CLIENT_KEYS.join(", ");
+        }
+        return "неизвестное поле";
+      }
+
+      function adoptPrivacy(server) {
+        for (const key of ["enabled", "since_days", "roles", "clients"]) {
+          if (!privacy.dirty[key]) privacy.values[key] = server ? server[key] : undefined;
+        }
+        return privacy.values;
+      }
+
+      function editPrivacy(key, value) {
+        privacy.dirty[key] = true;
+        delete privacy.errors[key];
+        privacy.values[key] = value;
+        const message = validate(key, value);
+        if (message) privacy.errors[key] = message;
+        return message || null;
+      }
+
+      function privacyPayload() {
+        const out = {};
+        for (const key of ["enabled", "since_days", "roles", "clients"]) {
+          if (privacy.dirty[key] && !privacy.errors[key]) out[key] = privacy.values[key];
+        }
+        return out;
+      }
+
+      function acceptedPrivacy(server) {
+        for (const key of Object.keys(privacyPayload())) delete privacy.dirty[key];
+        adoptPrivacy(server);
+      }
+
+      function hasPrivacyErrors() { return Object.keys(privacy.errors).length > 0; }
+      function hasPrivacyChanges() { return Object.keys(privacyPayload()).length > 0; }
+
+      function resetPrivacy() {
+        for (const key of ["enabled", "since_days", "roles", "clients"]) {
+          delete privacy.dirty[key];
+          delete privacy.errors[key];
+        }
+      }
+
+      function selectAgent(id, action) {
+        if (!AGENT_IDS.includes(id)) return "неизвестный агент";
+        if (action !== "connect" && action !== "disconnect") {
+          return "action должен быть connect или disconnect";
+        }
+        agent.draft = { agent: id, action: action };
+        agent.preview = null;
+        return null;
+      }
+
+      function clearAgent() { agent.draft = null; agent.preview = null; }
+
+      function acceptAgentPreview(selection, doc) {
+        if (!agent.draft || selection !== agent.draft || doc.agent !== selection.agent) return false;
+        agent.preview = typeof doc.revision === "string" && !doc.error && doc.detected !== false && Array.isArray(doc.plans)
+          && doc.plans.some(plan => plan.changed) && !doc.plans.some(plan => plan.conflict);
+        if (agent.preview) agent.preview = doc.revision;
+        return !!agent.preview;
+      }
+
+      function agentPayload(confirm) {
+        // No draft or no confirm: no payload, so nothing is ever applied
+        // without the explicit confirmation click.
+        if (!agent.draft || !agent.preview || confirm !== true) return null;
+        return { agent: agent.draft.agent, action: agent.draft.action, confirm: true, preview_revision: agent.preview };
+      }
+
+      return {
+        ROLE_KEYS, CLIENT_KEYS, AGENT_IDS, MAX_SINCE_DAYS,
+        privacy, agent,
+        adoptPrivacy, editPrivacy, privacyPayload, acceptedPrivacy,
+        hasPrivacyErrors, hasPrivacyChanges, resetPrivacy,
+        selectAgent, clearAgent, acceptAgentPreview, agentPayload, validate,
+      };
+    })();
+  </script>
+  <script>
 "use strict";
 // The window key never appears in this page. The launcher opens the page with
 // it in the URL fragment (never sent to the server, never in a Referer); it is
@@ -374,10 +738,10 @@ const KNOBS = [
     why: "На сколько шагов по связям уходить от найденного узла. Ноль — не уходить вовсе." },
   { key: "budget_tokens", label: "Бюджет ответа, токенов", step: 50, kind: "int",
     why: "Потолок на объём выдачи. Прямо определяет, сколько контекста достанется агенту и сколько он за него заплатит." },
-  { key: "min_cosine", label: "Порог косинуса", step: 0.01, kind: "float",
-    why: "Ниже какого сходства векторное совпадение не засчитывается. Понижение впускает более слабые попадания." },
-  { key: "min_bm25", label: "Порог BM25", step: 0.01, kind: "float",
-    why: "То же самое для словесных совпадений." },
+  { key: "min_cosine", label: "Порог отсечения cosine", step: 0.01, kind: "float",
+    why: "Отсечение векторных сигналов до ранжирования: выше = меньше результатов. Это не регулятор качества." },
+  { key: "min_bm25", label: "Порог отсечения BM25", step: 0.01, kind: "float",
+    why: "Отсечение словесных сигналов по нормированному BM25: выше = меньше результатов. Это не регулятор качества." },
 ];
 
 const PROFILE_NAMES = { fast: "Быстро", balanced: "Сбалансированно", precise: "Точно", max: "Максимум" };
@@ -428,6 +792,7 @@ function effective() {
 function dirty() {
   if (draft.profile !== state.profile) { return true; }
   if (draft.embedding_mode !== state.embedding_mode) { return true; }
+  if (window.__BrainMemoryDraft__.hasChanges()) { return true; }
   for (const knob of KNOBS) {
     const before = state.overrides[knob.key];
     const after = draft.overrides[knob.key];
@@ -462,7 +827,8 @@ function renderKnobs() {
   const base = profileDefaults(draft.profile);
   const live = effective();
   $("knobs").replaceChildren(...KNOBS.map((knob) => {
-    const [low, high] = state.limits[knob.key];
+    const [low, cliHigh] = state.limits[knob.key];
+    const high = window.__BrainSearchSafety__.high(knob.key, cliHigh, $("advanced-search").checked);
     const overridden = draft.overrides[knob.key] !== null && draft.overrides[knob.key] !== undefined;
 
     const box = document.createElement("div");
@@ -482,6 +848,8 @@ function renderKnobs() {
     slider.type = "range";
     slider.min = low; slider.max = high; slider.step = knob.step;
     slider.value = live[knob.key];
+    // Existing advanced values stay visible in the number field; never silently clamp a loaded setting.
+    slider.disabled = live[knob.key] > high;
     slider.setAttribute("aria-label", knob.label);
 
     const number = document.createElement("input");
@@ -510,6 +878,7 @@ function renderKnobs() {
       number.value = slider.value;
       draft.overrides[knob.key] = knob.kind === "int" ? Math.round(Number(slider.value)) : Number(slider.value);
       renderPrice();
+      renderSearchSafety();
       renderSaveBar();
     });
     slider.addEventListener("change", () => commit(slider.value));
@@ -1030,15 +1399,70 @@ function renderActivity() {
   }));
 }
 
+let saveErrorSticky = false;
+function renderSearchSafety() {
+  const warnings = window.__BrainSearchSafety__.warnings(effective(), profileDefaults(draft.profile));
+  $("search-warning").textContent = warnings.length
+    ? "Поиск строже профиля: " + warnings.join("; ") + ". Выше = меньше результатов."
+    : "";
+  const summary = window.__BrainSearchSafety__.summary(state, draft, state.profiles);
+  $("search-summary").textContent = summary.length ? "Было → стало (ещё не сохранено):\n" + summary.join("\n") : "";
+}
+
 function renderSaveBar() {
   const changed = dirty();
-  $("save").disabled = !changed;
+  $("save").disabled = !changed || window.__BrainMemoryDraft__.hasErrors();
+  if (saveErrorSticky) { saveErrorSticky = false; return; }
   if (changed) { setStatus("Есть несохранённые изменения", ""); }
 }
 
 function exactNumberIsBeingEdited() {
   const active = document.activeElement;
-  return Boolean(active && active.matches("#knobs input[type=number][data-exact-knob]"));
+  return Boolean(active && active.matches(
+    "#knobs input[type=number][data-exact-knob], #memory-controls input[type=number][data-exact-knob]"));
+}
+
+
+function renderMemory() {
+  const values = window.__BrainMemoryDraft__.state.values;
+  $("include-archive").checked = values.include_archive === true;
+  $("session-start-notice").checked = values.session_start_notice === true;
+  const briefSelect = $("session-start-brief");
+  if (!briefSelect.matches(":focus") && values.session_start_brief !== undefined) {
+    briefSelect.value = values.session_start_brief;
+  }
+  const briefMessage = window.__BrainMemoryDraft__.state.errors.session_start_brief;
+  const briefError = $("session-start-brief-error");
+  briefError.hidden = !briefMessage;
+  briefError.textContent = briefMessage || "";
+  const field = $("archive-min-age");
+  if (!field.matches(":focus") && values.archive_min_age_minutes !== undefined) {
+    field.value = String(values.archive_min_age_minutes);
+  }
+  const message = window.__BrainMemoryDraft__.state.errors.archive_min_age_minutes;
+  const note = $("archive-min-age-error");
+  note.hidden = !message;
+  note.textContent = message || "";
+  const backupDir = $("backup-dir");
+  if (!backupDir.matches(":focus") && values.backup_dir !== undefined) {
+    backupDir.value = values.backup_dir || "";
+  }
+  const keep = $("backup-keep");
+  if (!keep.matches(":focus") && values.backup_keep !== undefined) {
+    keep.value = String(values.backup_keep);
+  }
+  const backupMessage = window.__BrainMemoryDraft__.state.errors.backup_dir
+    || window.__BrainMemoryDraft__.state.errors.backup_keep;
+  const backupNote = $("backup-error");
+  backupNote.hidden = !backupMessage;
+  backupNote.textContent = backupMessage || "";
+  // The timer is systemd state, not a draft value: show what the server says.
+  const timerState = $("backup-timer-state");
+  if (state && state.backup_timer_enabled !== undefined) {
+    timerState.textContent = state.backup_timer_enabled
+      ? "Дневной таймер установлен (brain backup timer remove — убрать)."
+      : "Таймер не установлен (brain backup timer install — установить).";
+  }
 }
 
 function setStatus(text, kind) {
@@ -1051,8 +1475,10 @@ function render() {
   $("space").textContent = "пространство «" + state.space + "»";
   renderProfiles();
   renderKnobs();
+  renderSearchSafety();
   renderPrice();
   renderModes();
+  renderMemory();
   renderDatabase();
   renderActivity();
   renderWork();
@@ -1069,6 +1495,15 @@ function render() {
 }
 
 function adopt(document_, keepDraft) {
+  if (keepDraft && draft && state) {
+    // A memory-only draft must never resurrect stale search settings after a CLI change.
+    const searchChanged = window.__BrainSearchSafety__.summary(state, draft, state.profiles).length > 0;
+    if (!searchChanged) {
+      draft.profile = document_.profile;
+      draft.overrides = {...document_.overrides};
+    }
+    if (draft.embedding_mode === state.embedding_mode) draft.embedding_mode = document_.embedding_mode;
+  }
   state = document_;
   if (!keepDraft || !draft) {
     draft = {
@@ -1083,18 +1518,26 @@ function adopt(document_, keepDraft) {
 }
 
 async function save() {
+  if (!dirty() || window.__BrainMemoryDraft__.hasErrors()) return;
+  const summary = window.__BrainSearchSafety__.summary(state, draft, state.profiles);
+  if (draft.embedding_mode !== state.embedding_mode) summary.push(`embedding_mode: ${state.embedding_mode} → ${draft.embedding_mode}`);
+  for (const [key, value] of Object.entries(window.__BrainMemoryDraft__.payload())) {
+    summary.push(`${key}: ${JSON.stringify(state[key])} → ${JSON.stringify(value)}`);
+  }
+  if (!window.__BrainSearchSafety__.confirm(summary)) return;
   $("save").disabled = true;
   setStatus("Сохраняю…", "");
   try {
     const answer = await api("/api/settings", {
       method: "POST",
-      body: JSON.stringify({
+      body: JSON.stringify(Object.assign({
         profile: draft.profile,
         embedding_mode: draft.embedding_mode,
         overrides: draft.overrides,
-      }),
+      }, window.__BrainMemoryDraft__.payload())),
     });
     const recoveryWarnings = answer.settings_warnings || [];
+    window.__BrainMemoryDraft__.accepted(answer);
     adopt(answer, false);
     render();
     if (recoveryWarnings.length) {
@@ -1103,8 +1546,10 @@ async function save() {
       setStatus("Сохранено — применится к каждой следующей команде brain", "ok");
     }
   } catch (error) {
+    // The server's reason stays on screen; the next user change may replace it.
+    saveErrorSticky = true;
     setStatus("Не сохранено: " + error.message, "bad");
-    renderSaveBar();
+    $("save").disabled = !dirty();
   }
 }
 
@@ -1113,7 +1558,11 @@ async function refresh() {
     const answer = await api("/api/state");
     const wasDirty = draft !== null && dirty();
     const preserveExactInput = exactNumberIsBeingEdited();
-    state = answer;
+    adopt(answer, true);
+    // Clean memory fields always adopt the server's value — a CLI change must
+    // reach the window without a reload. Only a field the user edited keeps
+    // its own value, and a focused number input is not rewritten mid-typing.
+    window.__BrainMemoryDraft__.adopt(answer);
     // A number input may contain an intentional intermediate value such as
     // "", "-", or "0." that cannot be committed to the numeric draft yet.
     // Rebuilding the controls here used to erase it and move focus to BODY on
@@ -1127,6 +1576,8 @@ async function refresh() {
       renderWork();
       renderCapture();
       renderDiagnostics();
+      renderMemory();
+      renderSearchSafety();
     }
   } catch (error) {
     $("db-note").textContent = "Состояние недоступно: " + error.message;
@@ -1147,13 +1598,49 @@ function initTheme() {
 
 $("save").addEventListener("click", save);
 $("reset").addEventListener("click", () => {
-  for (const knob of KNOBS) { draft.overrides[knob.key] = null; }
+  window.__BrainSearchSafety__.reset(draft);
   render();
 });
+$("advanced-search").addEventListener("change", render);
 initTheme();
 $("archive-form").addEventListener("submit", archiveSearch);
 $("backfill-form").addEventListener("submit", (event) => { event.preventDefault(); backfillAction("start"); });
 $("backfill-stop").addEventListener("click", () => backfillAction("stop"));
+$("include-archive").addEventListener("change", () => {
+  window.__BrainMemoryDraft__.edit("include_archive", $("include-archive").checked);
+  renderSaveBar();
+});
+$("session-start-notice").addEventListener("change", () => {
+  window.__BrainMemoryDraft__.edit("session_start_notice", $("session-start-notice").checked);
+  renderSaveBar();
+});
+$("session-start-brief").addEventListener("change", () => {
+  window.__BrainMemoryDraft__.edit("session_start_brief", $("session-start-brief").value);
+  renderMemory();
+  renderSaveBar();
+});
+$("archive-min-age").addEventListener("input", () => {
+  const raw = $("archive-min-age").value;
+  if (raw === "") { return; }  // an intermediate value; blur will normalise it
+  window.__BrainMemoryDraft__.edit("archive_min_age_minutes", Number(raw));
+  renderMemory();   // show or clear the field's own message
+  renderSaveBar();
+});
+$("archive-min-age").addEventListener("blur", renderMemory);
+$("backup-dir").addEventListener("input", () => {
+  window.__BrainMemoryDraft__.edit("backup_dir", $("backup-dir").value);
+  renderMemory();
+  renderSaveBar();
+});
+$("backup-keep").addEventListener("input", () => {
+  const raw = $("backup-keep").value;
+  if (raw === "") { return; }
+  window.__BrainMemoryDraft__.edit("backup_keep", Number(raw));
+  renderMemory();
+  renderSaveBar();
+});
+$("backup-dir").addEventListener("blur", renderMemory);
+$("backup-keep").addEventListener("blur", renderMemory);
 refreshArchive();
 setInterval(refreshArchive, 15000);
 
@@ -1215,6 +1702,319 @@ $("work-prev").addEventListener("click", () => { workOffset = Math.max(0, workOf
 $("work-next").addEventListener("click", () => { workOffset += 25; refreshWork(); });
 refreshWork();
 setInterval(refreshWork, 15000);
+// ---- panels: agents, privacy, net (E6.4) -----------------------------------
+let agentsDoc = null;
+let privacyDoc = null;
+let netDoc = null;
+let agentsPreviewDoc = null;
+let privacyArmed = false;
+
+function panelsHoldFocus() {
+  const panels = $("panels");
+  return !!(panels && document.activeElement && panels.contains(document.activeElement));
+}
+
+function agentBadge(agent) {
+  if (agent.connected === null && agent.managed) return '<span class="tag">конфигурация не прочитана; есть резервная копия</span>';
+  if (agent.connected) return '<span class="tag">подключён</span>';
+  if (agent.detected) return '<span class="tag">найден, не подключён</span>';
+  return '<span class="tag">не найден</span>';
+}
+
+function renderAgents() {
+  const holder = $("agents-list");
+  const doc = agentsDoc;
+  if (!doc || !Array.isArray(doc.agents)) {
+    holder.textContent = "Состояние агентов ещё не получено.";
+    return;
+  }
+  const rows = doc.agents.map((agent) => {
+    const action = agent.managed ? "disconnect" : "connect";
+    const verb = agent.managed ? "Отключить" : "Подключить";
+    const planLabel = agent.managed ? "План отключения" : "План изменений";
+    return "<tr><td>" + agent.label + "</td><td>" + agentBadge(agent) + "</td><td>" +
+      '<button type="button" class="ghost" data-plan="' + agent.id + '" data-action="' + action + '">' + planLabel + "</button> " +
+      '<button type="button" class="ghost" data-agent="' + agent.id + '" data-action="' + action + '">' + verb + "</button></td></tr>";
+  });
+  holder.innerHTML = "<table><thead><tr><th>Агент</th><th>Статус</th><th>Действия</th></tr></thead><tbody>" +
+    rows.join("") + "</tbody></table>";
+  for (const button of holder.querySelectorAll("button[data-plan]")) {
+    button.addEventListener("click", agentsPlan);
+  }
+  for (const button of holder.querySelectorAll("button[data-agent]")) {
+    button.addEventListener("click", agentsAct);
+  }
+}
+
+async function agentsPlan(event) {
+  const button = event.currentTarget;
+  const draft = window.__BrainPanelsDraft__;
+  const error = draft.selectAgent(button.dataset.plan, button.dataset.action);
+  const box = $("agents-error");
+  if (error) { box.hidden = false; box.textContent = error; return; }
+  box.hidden = true;
+  agentsPreviewDoc = null;
+  renderAgentsPreview();
+  const selection = draft.agent.draft;
+  try {
+    agentsPreviewDoc = await api("/api/agents/preview?agent=" + encodeURIComponent(button.dataset.plan)
+      + "&action=" + button.dataset.action);
+  } catch (failure) {
+    agentsPreviewDoc = { error: failure.message };
+  }
+  if (selection !== draft.agent.draft) return;
+  draft.acceptAgentPreview(selection, agentsPreviewDoc);
+  renderAgentsPreview();
+}
+
+function renderAgentsPreview() {
+  const box = $("agents-preview");
+  const doc = agentsPreviewDoc;
+  if (!doc) { box.hidden = true; return; }
+  if (doc.error) {
+    box.hidden = false;
+    box.textContent = "План не получен: " + doc.error;
+    return;
+  }
+  if (doc.detected === false) {
+    box.hidden = false;
+    box.textContent = "Агент не найден: подключать нечего (нет его каталога или команды в PATH).";
+    return;
+  }
+  const draft = window.__BrainPanelsDraft__.agent.draft;
+  const lines = (doc.plans || []).map((plan) => {
+    const head = "<b>" + plan.file + "</b> — " + (plan.conflict
+      ? "КОНФЛИКТ: " + plan.conflict
+      : (plan.changed ? "изменится" : "без изменений"));
+    const diff = plan.diff ? "<pre>" + plan.diff.replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</pre>" : "";
+    return "<p>" + head + "</p>" + diff;
+  });
+  const verb = draft && draft.action === "disconnect" ? "Отключить" : "Подключить";
+  box.hidden = false;
+  box.innerHTML = (lines.length ? lines.join("") : "<p>Изменений нет.</p>") +
+    '<p><button type="button" class="primary" id="agents-confirm">Подтвердить: ' + verb + " (" +
+    (draft ? draft.agent : "") + ")</button> " +
+    '<button type="button" class="ghost" id="agents-cancel">Отмена</button></p>';
+  const confirm = $("agents-confirm");
+  if (confirm) { confirm.disabled = !window.__BrainPanelsDraft__.agent.preview; confirm.addEventListener("click", agentsApply); }
+  const cancel = $("agents-cancel");
+  if (cancel) cancel.addEventListener("click", () => {
+    window.__BrainPanelsDraft__.clearAgent();
+    agentsPreviewDoc = null;
+    renderAgentsPreview();
+  });
+}
+
+async function agentsAct(event) {
+  const button = event.currentTarget;
+  const error = window.__BrainPanelsDraft__.selectAgent(button.dataset.agent, button.dataset.action);
+  if (error) {
+    const box = $("agents-error");
+    box.hidden = false;
+    box.textContent = error;
+    return;
+  }
+  await agentsPlan({ currentTarget: {
+    dataset: { plan: button.dataset.agent, action: button.dataset.action } } });
+}
+
+async function agentsApply() {
+  const payload = window.__BrainPanelsDraft__.agentPayload(true);
+  if (!payload) return;
+  const box = $("agents-error");
+  try {
+    await api("/api/agents/apply", { method: "POST", body: JSON.stringify(payload) });
+    box.hidden = true;
+  } catch (failure) {
+    box.hidden = false;
+    box.textContent = "Не применено: " + failure.message;
+    return;
+  }
+  window.__BrainPanelsDraft__.clearAgent();
+  agentsPreviewDoc = null;
+  renderAgentsPreview();
+  await refreshPanels(true);
+}
+
+function renderPrivacy() {
+  const draft = window.__BrainPanelsDraft__;
+  const state = $("privacy-state");
+  const controls = $("privacy-controls");
+  const doc = privacyDoc;
+  if (doc && doc.error) { state.textContent = "Ошибка настроек захвата: " + doc.error; controls.textContent = ""; return; }
+  if (!doc) { state.textContent = "Состояние приватности ещё не получено."; controls.textContent = ""; return; }
+  state.textContent = "Сбор " + (doc.enabled ? "включён" : "выключен") + "; окно возраста: " +
+    ru(doc.since_days || 0) + " дн.; сохранено записей: " + (doc.archive_status === "error" ? "неизвестно" : ru(doc.stored_total || 0)) +
+    (doc.archive_status === "error" ? "; карантин: неизвестно" : doc.quarantine_total ? "; в карантине: " + ru(doc.quarantine_total) : "; карантин пуст") + ".";
+  if (panelsHoldFocus() && draft.hasPrivacyChanges()) return;
+  draft.adoptPrivacy({ enabled: doc.enabled, since_days: doc.since_days,
+    roles: (doc.roles_configured || []).slice(), clients: (doc.clients_configured || []).slice() });
+  const roleBoxes = draft.ROLE_KEYS.map((role) =>
+    '<label class="check-label"><input type="checkbox" data-role="' + role + '"' +
+    (draft.privacy.values.roles && draft.privacy.values.roles.includes(role) ? " checked" : "") + "> " + role + "</label>").join(" ");
+  const clientBoxes = draft.CLIENT_KEYS.map((client) =>
+    '<label class="check-label"><input type="checkbox" data-client="' + client + '"' +
+    (draft.privacy.values.clients && draft.privacy.values.clients.includes(client) ? " checked" : "") + "> " + client + "</label>").join(" ");
+  const clientRows = draft.CLIENT_KEYS.map(client => {
+    const collecting = doc.enabled && (doc.clients_configured || []).includes(client);
+    const stored = doc.stored_by_client && doc.stored_by_client[client];
+    const quarantine = doc.quarantine_by_client && doc.quarantine_by_client[client];
+    const known = doc.archive_status === "ok" || doc.archive_status === "not_configured";
+    return "<tr><td>" + client + "</td><td>" + (collecting ? "включён" : "выключен") +
+      "</td><td>" + (collecting ? (doc.roles_configured || []).join(", ") : "—") +
+      "</td><td>" + ru(doc.since_days || 14) + "</td><td>" + (known ? ru(stored ? stored.entries : 0) : "неизвестно") +
+      "</td><td>" + (known ? ru(quarantine || 0) : "неизвестно") + "</td></tr>";
+  }).join("");
+  controls.innerHTML = '<table><thead><tr><th>Клиент</th><th>Сбор</th><th>Роли</th><th>Дней</th><th>Сохранено (видимых)</th><th>Карантин</th></tr></thead><tbody>' +
+    clientRows + '</tbody></table><p class="hint">Роли и окно возраста общие для выбранных клиентов. Снятие всех клиентов: выключите сбор.</p>' +
+    '<p><label class="check-label"><input type="checkbox" id="privacy-enabled"' +
+    (draft.privacy.values.enabled ? " checked" : "") + "> Сбор включён</label></p>" +
+    "<p>Роли: " + roleBoxes + "</p><p>Клиенты: " + clientBoxes + "</p>" +
+    '<p>Окно возраста (дней): <input type="number" id="privacy-since" aria-label="Окно возраста архива, дней" min="1" max="' + draft.MAX_SINCE_DAYS +
+    '" value="' + (draft.privacy.values.since_days || 1) + '"></p>' +
+    '<p><button type="button" class="primary" id="privacy-apply">Применить</button></p>';
+  $("privacy-enabled").addEventListener("change", (event) => {
+    privacyFieldError(draft.editPrivacy("enabled", event.target.checked));
+  });
+  for (const box of controls.querySelectorAll("input[data-role]")) {
+    box.addEventListener("change", () => {
+      const roles = Array.from(controls.querySelectorAll("input[data-role]:checked")).map((item) => item.dataset.role);
+      privacyFieldError(draft.editPrivacy("roles", roles));
+    });
+  }
+  for (const box of controls.querySelectorAll("input[data-client]")) {
+    box.addEventListener("change", () => {
+      const clients = Array.from(controls.querySelectorAll("input[data-client]:checked")).map((item) => item.dataset.client);
+      privacyFieldError(draft.editPrivacy("clients", clients));
+    });
+  }
+  $("privacy-since").addEventListener("change", (event) => {
+    privacyFieldError(draft.editPrivacy("since_days", Number(event.target.value)));
+  });
+  $("privacy-apply").addEventListener("click", privacyApply);
+  privacyArmed = false;
+  $("privacy-apply").textContent = "Применить";
+}
+
+function privacyFieldError(message) {
+  privacyArmed = false;
+  $("privacy-apply").textContent = "Применить";
+  const box = $("privacy-error");
+  if (message) { box.hidden = false; box.textContent = message; }
+  else box.hidden = true;
+}
+
+async function privacyApply() {
+  const draft = window.__BrainPanelsDraft__;
+  const box = $("privacy-error");
+  if (draft.hasPrivacyErrors()) {
+    box.hidden = false;
+    box.textContent = "Исправьте ошибки полей перед применением.";
+    return;
+  }
+  if (!draft.hasPrivacyChanges()) {
+    box.hidden = false;
+    box.textContent = "Нет изменений.";
+    return;
+  }
+  if (!privacyArmed) {
+    privacyArmed = true;
+    $("privacy-apply").textContent = "Подтвердить применение";
+    box.hidden = true;
+    return;
+  }
+  const payload = Object.assign({ confirm: true }, draft.privacyPayload());
+  try {
+    const answer = await api("/api/archive/privacy", { method: "POST", body: JSON.stringify(payload) });
+    draft.acceptedPrivacy({ enabled: answer.enabled, since_days: answer.since_days,
+      roles: (answer.roles_configured || []).slice(), clients: (answer.clients_configured || []).slice() });
+    box.hidden = true;
+  } catch (failure) {
+    box.hidden = false;
+    box.textContent = "Не применено: " + failure.message;
+    privacyArmed = false;
+    $("privacy-apply").textContent = "Применить";
+    return;
+  }
+  privacyArmed = false;
+  await refreshPanels(true);
+}
+
+function renderTeam(doc) {
+  const holder = $("team-manifest");
+  holder.replaceChildren();
+  const model = window.__BrainTeamPanel__.rows(doc);
+  if (model.error) { holder.textContent = model.error; return; }
+  if (!model.items.length) { holder.textContent = "Не настроено. Публикация выключена. Администратор задаёт проект и получателей через brain team configure."; return; }
+  function control(item, className, enabled, label, fieldName = null, target = holder) {
+    const row = document.createElement("label");
+    row.style.display = "block";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = enabled;
+    input.setAttribute("aria-label", label + " — " + item.space);
+    input.addEventListener("change", async () => {
+      input.disabled = true;
+      try {
+        await api("/api/team/toggle", { method: "POST", body: JSON.stringify({ space: item.space, class: className, enabled: input.checked, field: fieldName }) });
+        await refreshPanels(true);
+      } catch (error) {
+        input.checked = enabled;
+        const message = document.createElement("p");
+        message.textContent = "Не применено: " + error.message;
+        holder.appendChild(message);
+      } finally { input.disabled = false; }
+    });
+    row.appendChild(input);
+    row.appendChild(document.createTextNode(" " + label));
+    target.appendChild(row);
+  }
+  for (const item of model.items) {
+    const description = document.createElement("p");
+    description.textContent = item.text;
+    holder.appendChild(description);
+    control(item, null, item.enabled, "Публикация машины");
+    for (const c of item.classes) {
+      control(item, c.name, c.enabled, "Класс " + c.name);
+      if (!c.fields.length) continue;
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Поля " + c.name + " (закрытие обязательного поля исключает запись)";
+      details.appendChild(summary);
+      for (const field of c.fields) control(item, c.name, field.enabled, field.name, field.name, details);
+      holder.appendChild(details);
+    }
+  }
+}
+
+function renderNet() {
+  renderTeam(netDoc && netDoc.team);
+  const holder = $("net-state");
+  const doc = netDoc;
+  if (doc && doc.error) { holder.textContent = "Ошибка сети: " + doc.error; return; }
+  if (!doc) { holder.textContent = "Состояние сети ещё не получено."; return; }
+  const principals = doc.principals === null || doc.principals === undefined
+    ? "неизвестно"
+    : ru(doc.principals);
+  holder.innerHTML = "<ul>" +
+    "<li>База координации: " + (doc.coordination_database ? "есть" : "нет") + "</li>" +
+    "<li>Хранилище учёток сети: " + (doc.auth_store ? "есть" : "нет") + "</li>" +
+    "<li>Учёток: " + principals + "</li>" +
+    "<li>Координатор: " + (doc.serving === true ? "слушает (локальный процесс)" : doc.serving === false ? "остановлен" : "неизвестно") + "</li>" +
+    "<li>Адрес: " + String(doc.bind || "не зарегистрирован").replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</li></ul>" +
+    "<p class=hint>Состояние локального процесса, без проверки TLS-сеанса. Незапущенный этой версией координатор может быть не зарегистрирован.</p>";
+}
+
+async function refreshPanels(force) {
+  const skipRender = !force && panelsHoldFocus();
+  try { agentsDoc = await api("/api/agents"); } catch (error) { $("agents-error").hidden = false; $("agents-error").textContent = error.message; agentsDoc = null; }
+  try { privacyDoc = await api("/api/archive/privacy"); } catch (error) { privacyDoc = { error: error.message }; }
+  try { netDoc = await api("/api/net/state"); } catch (error) { netDoc = { error: error.message }; }
+  if (!skipRender) { renderAgents(); renderPrivacy(); renderNet(); }
+}
+setInterval(() => refreshPanels(false), 15000);
+refreshPanels(true);
+
 api("/api/state").then((answer) => { adopt(answer, false); render(); })
   .catch((error) => setStatus("Не удалось получить состояние: " + error.message, "bad"));
 setInterval(refresh, 5000);

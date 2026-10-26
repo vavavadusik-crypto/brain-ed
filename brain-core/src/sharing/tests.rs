@@ -19,11 +19,10 @@ use super::{
 struct Dir(PathBuf);
 
 impl Dir {
-    fn new(tag: &str) -> Self {
+    fn new(_tag: &str) -> Self {
         static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("brain-share-{tag}-{}-{n}", std::process::id()));
+        let _n = N.fetch_add(1, Ordering::SeqCst);
+        let path = crate::test_support::temp_path("brain-share");
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp dir");
         Self(path)

@@ -3,6 +3,96 @@
 All notable changes are listed here. Versions follow semantic versioning;
 `0.x` releases may change formats and interfaces.
 
+## [0.2.0] - 2026-10-26
+
+### Distillation and providers
+- Opt-in distillation of attributed decisions, errors, dead ends, findings and
+  plans from the stored masked archive; validated evidence, project boundaries,
+  versioned status transitions, session provenance and links between facts.
+- Role filters (user/assistant/tool_error by default), dry runs, counted rejection
+  reasons and opt-in private response diagnostics. Serialized request budgets
+  include prompt/schema headroom; undersized contexts are refused.
+- OpenAI-compatible provider registry with explicit fallback; Claude Code and
+  Codex subscription CLI adapters, executable checks, timeouts, process cleanup
+  and fallback on subscription limits. Selected text goes to the chosen provider;
+  `--offline` alone does not block explicitly requested LLM calls.
+- Whole-session batching, newest-first processing, atomic per-role cursors and
+  bounded planning; opt-in user timer, pinned database paths and quiet hours.
+
+### Team memory and networking
+- `net init`, enrollment bundles and `net join`: local CA/server TLS setup,
+  rotation, CA fingerprint checks and atomic join/replace; explicit LAN/CGNAT
+  opt-ins, certificate DNS names and actionable connection errors.
+- Local opt-in team manifests with recipients, source spaces and class/field
+  controls; bounded slices of distilled facts, work state and recent Git history.
+  Raw archive messages, paths, diffs and Git author/email are excluded.
+- Atomic publication generations, retraction, bounded snapshot history,
+  schema/digest validation, attributed TLS replicas and query audit records.
+  Coverage, source watermarks and stale/unavailable peers remain explicit.
+- `team ask` understands ordinary RU/EN manager questions and combines lexical
+  and available local semantic ranks. Read-only MCP `team_ask`, `team_manifest`
+  and `team_peers` appear when team mode is configured; results are untrusted data.
+- Isolated process demo, optional publication user timer and synthetic SSH
+  scenario. Company relay with separate scoped credentials, nested coordinator
+  TLS and v2 join bundles; direct TLS remains available. No public-NAT or physical
+  fleet readiness claim.
+
+### Archive, import and retrieval
+- Conversation archive hits in `ask` and MCP `memory_search`, with bounded fused
+  ranking, `archive://` provenance and untrusted labels; `--no-archive` opt-out.
+  RU/EN date phrases scope both interfaces; young/self-quoting hits are filtered.
+- Natural-question archive matching, deduplicated excerpts, conversation-first
+  ranking, RU/EN inflection prefixes in core retrieval and packing of shorter
+  hits after an oversized result. Strict `archive search` remains available.
+- Journal roles end to end: tool calls/results/errors and visible reasoning
+  summaries, bounded to 2048 characters; role filters, counts and readable UTC `said_at`.
+  Hermes profiles have independent namespaced cursors; backup snapshots are skipped.
+- Idempotent Markdown import with front matter, wiki-links, bounded named sections,
+  exclusions and revisions; Graphify import masks labels and revises changed nodes.
+- `stats` reports source counts/freshness, UTC dates and active edges; `query`,
+  `path` and `graph explain` forward to Graphify without a shell.
+- Fixed SessionStart memory notices for Claude Code/Codex; optional cached project
+  briefing. Stored conversation text remains untrusted, never system instructions.
+
+### Settings, viewer and diagnostics
+- Settings panels for agents (including Kimi Code), archive privacy, team manifests
+  and read-only network diagnostics; confirmed per-agent plans and draft previews.
+- Bounded settings journal, search-only `settings revert`, guarded cutoff values
+  and explicit advanced mode; backup preserves settings bytes and audit history.
+- Keyboard/focus, labels, dialogs, status announcements and reduced-motion
+  improvements across window pages; static accessibility regression coverage.
+- Offline New Generation Brain viewer with authenticated stored-graph data routes,
+  bounded cluster navigation, cache invalidation, selection wakeup and idle behavior.
+  Counts describe the loaded sample; no whole-history visualization claim.
+- `doctor` reports hook-journal refusal reasons, settings history, user timers,
+  LLM provider configuration and disk space without starting providers or services.
+- Additional `init --agents` integrations for OpenCode, OpenClaw and Kimi Code;
+  configuration presence does not prove a running client handshake.
+
+### Security, backup and release tooling
+- Shared Rust/Python masking through `mask:4`: env/JSON/auth/URL credentials,
+  service keys, long/unclosed values, code-reference handling and bounded scanning.
+  Stored rows are re-masked and duplicates collapsed; Markdown/Graphify imports
+  are masked too. Unknown secret formats can still pass through.
+- Redaction uses a consistent SQLite snapshot, handles vector registration and
+  missing source files, and purges replaced text from the database file.
+- LLM URLs reject userinfo, pin localhost and disable redirects; transport errors
+  do not echo secrets. Private-group hook homes are accepted with owner checks.
+- Atomic backup/restore, retention protections and opt-in daily backup timer.
+- Local OTLP/JSON journal export with GenAI span attributes, numeric enums,
+  session/time filters and `--no-content` that never reads the content column;
+  protected archive reader, no automatic telemetry transmission.
+- Static Linux musl release build tooling for x86_64/aarch64, CI build jobs and
+  checksum manifests; verified HTTPS download installer with side-effect-free
+  dry run, atomic binary replacement and preserved Brain data. Artifacts are
+  unsigned; this entry does not announce published binaries or cross-platform support.
+- Offline full-history/worktree secret scanner, exact reviewed fixture exceptions,
+  privacy gate, locked licence notices and public source export with one root
+  commit, exclusions, isolated build/tests and quick start.
+- Generated CLI reference with drift tests, documented MCP/team tools, RU/EN
+  distillation/team walkthroughs and documentation index; installer, parser,
+  transport, UI and quick-start regressions with actionable error hints.
+
 ## [0.1.4] — early preview
 
 ### Added

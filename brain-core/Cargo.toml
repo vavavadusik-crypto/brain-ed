@@ -18,6 +18,8 @@ model2vec-rs = { version = "0.2.1", optional = true, default-features = false, f
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+regex = "1.13"
 sqlite-vec = "0.1.9"
 thiserror = "2.0"
 tree-sitter = "0.25"

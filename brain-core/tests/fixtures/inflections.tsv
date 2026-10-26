@@ -1,0 +1,36 @@
+# Synthetic word families: each form is a separate indexed document.
+rules_ru	правило правила правилам
+work_ru	работа работой работать
+agents_ru	агент агенты агентами
+settings_ru	настройка настройки настройками
+memory_ru	память памяти памятью
+models_ru	модель модели моделями
+errors_ru	ошибка ошибки ошибками
+systems_ru	система системы системами
+requests_ru	запрос запросы запросами
+documents_ru	документ документы документами
+projects_ru	проект проекты проектами
+versions_ru	версия версии версиями
+rules_en	rule rules
+work_en	work works worked working
+agents_en	agent agents
+compile_en	compile compiled compiling
+plan_en	plan plans planned planning
+policy_en	policy policies
+branch_en	branch branches branching
+requests_en	request requests requested requesting
+documents_en	document documents documented documenting
+projects_en	project projects projected projecting
+errors_en	error errors
+tests_en	test tests tested testing
+storage_en	store stored storing
+build_en	build builds building
+# Adversarial neighbours, deliberately not relevant to the word families above.
+decoy_ru_edit	правка
+decoy_ru_truth	правда
+decoy_ru_right	правый
+decoy_en_testament	testament
+decoy_en_police	police
+decoy_en_planet	planet
+decoy_en_agentic	agentic
+decoy_ru_systematic	систематизация

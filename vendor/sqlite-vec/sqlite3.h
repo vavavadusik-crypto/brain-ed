@@ -3710,11 +3710,11 @@ SQLITE_API void sqlite3_progress_handler(sqlite3*, int, int(*)(void*), void*);
 ** <tr><th> URI filenames <th> Results
 ** <tr><td> file:data.db <td>
 **          Open the file "data.db" in the current directory.
-** <tr><td> file:/home/fred/data.db<br>
-**          file:///home/fred/data.db <br>
-**          file://localhost/home/fred/data.db <br> <td>
-**          Open the database file "/home/fred/data.db".
-** <tr><td> file://darkstar/home/fred/data.db <td>
+** <tr><td> file:/example/fred/data.db<br>
+**          file:///example/fred/data.db <br>
+**          file://localhost/example/fred/data.db <br> <td>
+**          Open the database file "/example/fred/data.db".
+** <tr><td> file://darkstar/example/fred/data.db <td>
 **          An error. "darkstar" is not a recognized authority.
 ** <tr><td style="white-space:nowrap">
 **          file:///C:/Documents%20and%20Settings/fred/Desktop/data.db
@@ -3726,8 +3726,8 @@ SQLITE_API void sqlite3_progress_handler(sqlite3*, int, int(*)(void*), void*);
 **          Open file "data.db" in the current directory for read-only access.
 **          Regardless of whether or not shared-cache mode is enabled by
 **          default, use a private cache.
-** <tr><td> file:/home/fred/data.db?vfs=unix-dotfile <td>
-**          Open file "/home/fred/data.db". Use the special VFS "unix-dotfile"
+** <tr><td> file:/example/fred/data.db?vfs=unix-dotfile <td>
+**          Open file "/example/fred/data.db". Use the special VFS "unix-dotfile"
 **          that uses dot-files in place of posix advisory locking.
 ** <tr><td> file:data.db?mode=readonly <td>
 **          An error. "readonly" is not a valid option for the "mode" parameter.

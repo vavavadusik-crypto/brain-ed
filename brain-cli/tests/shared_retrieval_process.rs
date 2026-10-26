@@ -3,6 +3,8 @@
 //! default deny without it, space opt-in, project isolation before limits,
 //! typed kinds, claimed vs recorded provenance, retraction and byte budgets.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,15 +15,12 @@ use serde_json::{Value, json};
 
 const MACHINE: &str = "m-0123456789abcdef0123456789abcdef";
 
-fn isolated_home(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn isolated_home(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-shared-retrieval-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-shared-retrieval");
     fs::create_dir_all(&root).expect("create isolated home");
     root
 }

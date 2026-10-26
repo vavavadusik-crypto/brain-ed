@@ -4,6 +4,8 @@
 //! cache: no network, no weights, no user state, no user services.
 #![cfg(target_os = "linux")]
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -40,15 +42,12 @@ enum PathChange {
     Unlinked,
 }
 
-fn scratch(label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn scratch(_label: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-self-reexec-{label}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-self-reexec");
     let brain_home = root.join("home/.brain");
     fs::create_dir_all(&brain_home).expect("create isolated Brain home");
     // `always` is the mode in which every write starts the worker.

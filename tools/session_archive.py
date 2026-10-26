@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private local transcript archive prototype (normalized text capture only).
+"""Private local transcript archive prototype (bounded, secret-masked capture).
 
 Explicitly invoked CLI; no hooks, no background jobs, no network.
 
@@ -12,14 +12,16 @@ Explicitly invoked CLI; no hooks, no background jobs, no network.
 Every import is a bounded full rescan of one explicitly named source with
 dedupe on (source, locator, evidence sha256), where the evidence hash covers
 session, role, timestamp and text. It is NOT an incremental cursor and NOT a
-complete raw backup: reasoning, system/developer/instruction text and tool
-payloads are dropped, and scans stop at fixed byte/row/record bounds.
+complete raw backup, and scans stop at fixed byte/row/record bounds.
 
 `collect` is the bounded automatic collector: it discovers only the canonical
 sources under HOME (Claude Code projects JSONL, Codex sessions JSONL, Hermes
-state.db), reads them read-only from a durable per-source cursor committed in
-the same transaction as the entries, and stops at per-run source/byte/record/
-time budgets. It does nothing unless the config file says `"enabled": true`.
+state.db -- the top-level one plus every profiles/<name>/state.db, never the
+state-snapshots/ backups; profile session ids are stored namespaced as
+profiles/<name>/<id> so ids stay unique across profiles), reads them read-only
+from a durable per-source cursor committed in the same transaction as the
+entries, and stops at per-run source/byte/record/time budgets. It does nothing
+unless the config file says `"enabled": true`.
 
 An existing archive file must be owned by the current user with no group or
 other permission bits; otherwise it is rejected before anything is written.
@@ -48,6 +50,12 @@ SEARCH_MAX = 20
 EXCERPT_MAX = 300
 READ_MAX = 32 << 10
 CLIENTS = ("claude", "codex", "hermes")
+# What the archive keeps, said in one place for every surface that reports it.
+# Must stay in sync with STORED_TEXT in brain-cli/src/archive.rs.
+STORED_TEXT = ("conversation plus bounded, secret-masked tool calls/results/errors"
+               " and visible reasoning summaries; never system prompts, injected"
+               " instructions, sidechains, hidden/encrypted reasoning, attachments"
+               " or metadata events")
 CODEX_INSTRUCTION_PREFIXES = (
     "<environment_context>", "<user_instructions>", "<instructions>",
     "<permissions instructions>", "# agents.md instructions",
@@ -60,13 +68,79 @@ CODEX_VISIBLE_PHASES = (None, "final", "final_answer", "commentary")
 # calls and results into assistant output_text that starts with these markers (strings
 # in the Codex binary next to "<EXTERNAL SESSION IMPORTED>"). That is tool traffic, not
 # something the agent said. Assistant only: a person quoting a marker is still talking.
-CODEX_EXTERNAL_TOOL_MARKERS = ("[external_agent_tool_call]", "[external_agent_tool_result]")
+# Prefixes, not whole markers: real imports write "[external_agent_tool_call: Bash]" and
+# "[external_agent_tool_result: error]", which the bracket-closed forms never matched
+# (10 885 such rows reached search before rule 2).
+CODEX_EXTERNAL_TOOL_MARKERS = ("[external_agent_tool_call", "[external_agent_tool_result")
 # internal_chat_message_metadata_passthrough.content_item_kinds the client itself labels
 # as injected context (besides any "*.instructions"); a message made only of them is skipped.
 CODEX_INJECTED_KINDS = ("environments.environment_context",
                         "additional_content.codex_apps_open_page")
 # Bump when the Codex filter changes so stored rows are judged again once.
-QUARANTINE_RULE = "codex_visible_text:1"
+QUARANTINE_RULE = "codex_visible_text:2"
+# Bump when the extractors start capturing new kinds of records: every followed
+# JSONL source is then read again from the start once, and existing rows are
+# recognised by their unchanged locator/evidence, so only the new kinds are added.
+# journal:2 - Hermes tool calls (assistant tool_calls JSON) and tool results
+# (role='tool' rows) join the archive; reasoning stays hidden.
+CAPTURE_REV = "journal:2"
+# Roles beyond the conversation itself. Their text is bounded and secret-masked.
+JOURNAL_ROLES = ("tool_call", "tool_result", "tool_error", "reasoning")
+JOURNAL_MAX = 2048          # characters kept per tool call/result/reasoning record
+# Masked at write time, in every record. Shapes of real credentials, not keywords:
+# a secret that reaches the archive is copied into search results and backups.
+SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.DOTALL),
+    re.compile(r"\b(?:sk|rk|pk)-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Service keys shaped `<prefix>_live_…` / `_test_` / `_prod_` (Stripe and many others): a run of
+    # 24+ letters and digits is a generated value, not an identifier in code.
+    re.compile(r"\b[A-Za-z]{1,16}_(?:live|test|prod)_[A-Za-z0-9]{24,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{30,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)(?P<keep>\b(?:bearer|basic)\s+)(?!\[REDACTED\])[A-Za-z0-9_\-\.\+/=]{12,}"),
+    # user:password@ in a URL; the user and host stay readable. Only the scheme and user are
+    # bounded (an unbounded scheme made a long "a-a-a-…" line quadratic); the secret is not.
+    re.compile(r"(?P<keep>\b[a-z][a-z0-9+.\-]{0,30}://[^\s:/@]{1,128}:)(?!\[REDACTED\]@)"
+               r"[^\s/]+(?P<tail>@)"),
+]
+_SECRET_NAME = (r"(?:password|(?<!no)passwd|passphrase|secret|token|api[_-]?key|access[_-]?key"
+                r"|private[_-]?key)")
+# A value assigned to a key that names a credential, whatever its prefix: DB_PASSWORD=…,
+# GITHUB_TOKEN: …, "client_secret": "…" (the JSON shape of every tool_call row), YAML
+# `api_key: >-` blocks, `?access_token=` in a URL. Suffixes are limited so tokenize=,
+# max_tokens= and token_count= stay readable, as do NOPASSWD: and credentials: 'include'.
+# A quoted value is taken whole, spaces included; `_keyed_secret` decides what is code.
+KEYED_SECRET = re.compile(
+    r"(?i)(?P<keep>\b[A-Za-z0-9_]{0,64}?" + _SECRET_NAME + r"(?:[_-](?:key|value))?"
+    r"['\"]?[ \t]*[:=][ \t]*(?:[|>][-+]?[ \t]*\n[ \t]*)?)"
+    # A quote left open masks to the end of the line. Values are unbounded on purpose: a
+    # match starts only right after a credential name, so the scan stays linear.
+    r"(?P<value>(?P<quote>['\"])[^'\"\n]+(?:(?P=quote)|(?=\n|$))|(?:(?![\"'`,;&}\]\)\[\(])[\x21-\x7e])+)")
+# A secret passed as a word after its name: `--password X`, `.netrc` `password X`, `token X`.
+SPOKEN_SECRET = re.compile(r"(?i)(?P<keep>(?:(?<![\w-])--?)?\b" + _SECRET_NAME + r"[ \t]+)"
+                           r"(?P<value>[\x21-\x7e]{4,})")
+# mysql-style -p'secret' / -p"secret".
+FLAG_SECRET = re.compile(r"(?P<keep>(?<!\S)-p)(?P<value>'[^'\n]+'|\"[^\"\n]+\")")
+# Values that name a type or state rather than hold a secret.
+NOT_SECRETS = frozenset(("true", "false", "null", "none", "nil", "undefined", "string", "str", "int",
+                         "integer", "number", "bool", "boolean", "required", "optional", "example",
+                         "redacted", "[redacted]", "***", "..."))
+# A reference in code that names where the secret comes from: os.environ, parser.next_token.
+# Digits make a dotted value look generated, so it is masked.
+CODE_REFERENCE = re.compile(r"[A-Za-z_][A-Za-z_]*(?:\.[A-Za-z_][A-Za-z_]*)*")
+VARIABLE_REFERENCE = re.compile(r"\$\{?[A-Za-z_]\w*\}?")
+GENERATED_VALUE = re.compile(r"[A-Za-z0-9_\-+/=.!@#$%^&*~]+")
+ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+BASE64_VALUE = re.compile(r"[A-Za-z0-9_\-+/=]+")
+
+# Bump when the masking covers new shapes: rows already stored are masked again once.
+MASK_REV = "mask:4"
+# A Hermes profile directory name: conservative so a session namespace built
+# from it cannot smuggle path separators or traversal.
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 THINK_OPEN = re.compile(r"\s*<think>", re.IGNORECASE)
 THINK_BLOCK = re.compile(r"\s*<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
@@ -210,6 +284,8 @@ def _quarantine_sweep(conn):
     handles = {}
     try:
         for entry_id, path, offset, record_sha, role, content in rows:
+            if role not in ("user", "assistant"):
+                continue  # journal rows come from non-message lines by design
             reason = basis = None
             line = _source_line(handles, path, offset)
             if line is not None and record_sha in (_sha(line), _sha(line.rstrip(b"\r\n"))):
@@ -366,6 +442,107 @@ def _text_blocks(content, kinds, skip_prefixes=()):
     return "\n".join(parts)
 
 
+def _mask_secrets(text):
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub(_redacted, text)
+    text = KEYED_SECRET.sub(_keyed_secret, text)
+    text = SPOKEN_SECRET.sub(_spoken_secret, text)
+    return FLAG_SECRET.sub(lambda m: m.group("keep") + _quoted_redaction(m.group("value")), text)
+
+
+def _quoted_redaction(value):
+    """[REDACTED] in the value's own quotes; an unclosed quote stays unclosed."""
+    if value[:1] in ("'", '"'):
+        closing = value[0] if len(value) > 1 and value[-1] == value[0] else ""
+        return f"{value[0]}[REDACTED]{closing}"
+    return "[REDACTED]"
+
+
+def _keyed_secret(match):
+    value, quoted = match.group("value"), bool(match.group("quote"))
+    inner = value[1:].rstrip(value[0]) if quoted else value
+    after = match.string[match.end():match.end() + 1]
+    if (len(inner) < 4 or inner.lower() in NOT_SECRETS or inner.isdigit()
+            or VARIABLE_REFERENCE.fullmatch(inner)  # $VAR / ${VAR}: a reference, not the value
+            or (not quoted and CODE_REFERENCE.fullmatch(inner) and ("." in inner or (after != "" and after in "([.")))):
+        return match.group(0)
+    return match.group("keep") + _quoted_redaction(value)
+
+
+def _spoken_secret(match):
+    value = match.group("value")
+    core = value.rstrip(".,:;)]}\"'`*")
+    tail = value[len(core):]
+    flag = match.group("keep").lstrip().startswith("-")
+    # Prose and code listings ("token usage:", "secret sauce") stay: a spoken value counts
+    # after a --flag, or when it looks generated: letters and digits mixed, or long base64/hex.
+    generated = ((len(core) >= 8 and any(c.isdigit() for c in core) and any(c.isalpha() for c in core)
+                  and GENERATED_VALUE.fullmatch(core))
+                 or (len(core) >= 16 and BASE64_VALUE.fullmatch(core)))
+    if (not core or value.startswith(("-", "[REDACTED]", "$")) or "\\" in core
+            or core.lower().strip("'\"") in NOT_SECRETS or not (flag or generated)
+            # After a flag, an environment variable name or a <placeholder> is not the value.
+            or ENV_NAME.fullmatch(core) or core.startswith(("<", "{"))):
+        return match.group(0)
+    return match.group("keep") + "[REDACTED]" + tail
+
+
+def _redacted(match):
+    parts = match.groupdict()
+    return (parts.get("keep") or "") + "[REDACTED]" + (parts.get("tail") or "")
+
+
+def _journal_text(text):
+    text = _mask_secrets(text)
+    if len(text) > JOURNAL_MAX:
+        text = text[:JOURNAL_MAX] + f"\n…[{len(text) - JOURNAL_MAX} more characters not archived]"
+    return text
+
+
+def _json_text(value):
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _result_text(content):
+    """Tool output as text: a string, or the text parts of a content list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b["text"] for b in content
+                         if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if isinstance(content, dict) and isinstance(content.get("output"), str):
+        return content["output"]
+    return _json_text(content)
+
+
+def _claude_journal(msg):
+    """(suffix, role, text) for the tool calls, results and thinking in one Claude message."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    out = []
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "tool_use" and isinstance(block.get("name"), str):
+            ident = block.get("id") if isinstance(block.get("id"), str) else str(index)
+            out.append((f"#tool_use:{ident}", "tool_call",
+                        f"{block['name']} {_json_text(block.get('input'))}"))
+        elif kind == "tool_result":
+            ident = block.get("tool_use_id") if isinstance(block.get("tool_use_id"), str) else str(index)
+            role = "tool_error" if block.get("is_error") is True else "tool_result"
+            out.append((f"#tool_result:{ident}", role, _result_text(block.get("content"))))
+        elif kind == "thinking" and isinstance(block.get("thinking"), str):
+            out.append((f"#thinking:{index}", "reasoning", block["thinking"]))
+    return [(suffix, role, _journal_text(text)) for suffix, role, text in out if text.strip()]
+
+
 def _extract_claude(obj, ctx):
     # Sidechain lines are subagent conversations the person never saw in the chat.
     if (obj.get("type") not in ("user", "assistant") or obj.get("isMeta")
@@ -374,10 +551,14 @@ def _extract_claude(obj, ctx):
     msg = obj.get("message")
     if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
         return None
-    text = _text_blocks(msg.get("content"), ("text",))
+    text = _mask_secrets(_text_blocks(msg.get("content"), ("text",)))
     uuid = obj.get("uuid") if isinstance(obj.get("uuid"), str) and obj["uuid"] else None
     cwd = obj.get("cwd") if isinstance(obj.get("cwd"), str) else None
-    return msg["role"], obj.get("sessionId"), obj.get("timestamp"), text, uuid, cwd
+    session, ts = obj.get("sessionId"), obj.get("timestamp")
+    records = [("", msg["role"], session, ts, text, uuid, cwd)]
+    records += [(suffix, role, session, ts, body, uuid, cwd)
+                for suffix, role, body in _claude_journal(msg)]
+    return records
 
 
 def _extract_codex(obj, ctx):
@@ -391,12 +572,39 @@ def _extract_codex(obj, ctx):
             ctx["cwd"] = payload["cwd"]
         return None
     # event_msg lines duplicate response_item messages for display; ignore them.
-    if obj.get("type") != "response_item" or payload.get("type") != "message":
+    if obj.get("type") != "response_item":
         return None
-    text, reason = _codex_visible_text(payload)
-    if reason:
+    session, ts, cwd = ctx.get("session"), obj.get("timestamp"), ctx.get("cwd")
+    kind = payload.get("type")
+    if kind == "message":
+        text, reason = _codex_visible_text(payload)
+        if reason:
+            return None
+        return [("", payload["role"], session, ts, _mask_secrets(text), None, cwd)]
+    journal = _codex_journal(payload)
+    if journal is None:
         return None
-    return payload["role"], ctx.get("session"), obj.get("timestamp"), text, None, ctx.get("cwd")
+    suffix, role, text = journal
+    return [(suffix, role, session, ts, _journal_text(text), None, cwd)]
+
+
+def _codex_journal(payload):
+    """(suffix, role, text) for a Codex tool call, its output, or a visible reasoning summary."""
+    kind = payload.get("type")
+    call = payload.get("call_id") if isinstance(payload.get("call_id"), str) else ""
+    if kind in ("function_call", "custom_tool_call", "local_shell_call"):
+        name = payload.get("name") if isinstance(payload.get("name"), str) else kind
+        args = payload.get("arguments", payload.get("input", payload.get("action")))
+        return f"#call:{call}", "tool_call", f"{name} {_json_text(args)}"
+    if kind in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
+        return f"#output:{call}", "tool_result", _result_text(payload.get("output"))
+    if kind == "reasoning":
+        # Only the summary the client shows; encrypted or raw reasoning content is never read.
+        summary = payload.get("summary")
+        text = "\n".join(part["text"] for part in summary if isinstance(part, dict)
+                         and isinstance(part.get("text"), str)) if isinstance(summary, list) else ""
+        return "#reasoning", "reasoning", text
+    return None
 
 
 def _codex_visible_text(payload):
@@ -437,20 +645,21 @@ def _jsonl_records(lines, client, stats, ctx):
         except (UnicodeDecodeError, ValueError, RecursionError):
             stats["malformed"] += 1
             continue
-        got = extract(obj, ctx)
-        if not got or not got[3].strip():
+        got = [record for record in (extract(obj, ctx) or []) if record[4].strip()]
+        if not got:
             stats["skipped"] += 1
             continue
-        role, session, ts, text, uuid, cwd = got
-        try:
-            text.encode("utf-8")  # JSON "\ud800" escapes yield unstorable lone surrogates
-            (cwd or "").encode("utf-8")
-        except UnicodeEncodeError:
-            stats["malformed"] += 1
-            continue
-        # Stable message identity when the client provides one, else byte offset.
-        locator = f"uuid:{uuid}" if uuid else f"offset:{offset}"
-        yield locator, offset, _sha(raw), role, _opt_str(session), _opt_str(ts), text, cwd
+        for suffix, role, session, ts, text, uuid, cwd in got:
+            try:
+                text.encode("utf-8")  # JSON "\ud800" escapes yield unstorable lone surrogates
+                (cwd or "").encode("utf-8")
+            except UnicodeEncodeError:
+                stats["malformed"] += 1
+                continue
+            # Stable message identity when the client provides one, else byte offset; a
+            # journal record adds its kind so it never collides with the message text.
+            locator = (f"uuid:{uuid}" if uuid else f"offset:{offset}") + suffix
+            yield locator, offset, _sha(raw), role, _opt_str(session), _opt_str(ts), text, cwd
 
 
 def _iter_jsonl(path, client, stats):
@@ -529,7 +738,83 @@ def _hermes_open(path):
     ts_col = next((c for c in ("timestamp", "created_at", "ts") if c in cols), "NULL")
     # Rows Hermes itself hides from display (any non-NULL display_kind) are not archived.
     kind_col = "display_kind" if "display_kind" in cols else "NULL"
-    return conn, ts_col, kind_col
+    # Journal columns: absent in older schemas, read as NULL there.
+    call_col = "tool_calls" if "tool_calls" in cols else "NULL"
+    tool_name_col = "tool_name" if "tool_name" in cols else "NULL"
+    return conn, ts_col, kind_col, call_col, tool_name_col
+
+
+def _hermes_session_prefix(path):
+    """Namespace added to a profile source's session ids; "" for the top level.
+
+    Hermes reuses session ids across its top-level database and the per-profile
+    ones, so a stored id alone no longer names one conversation. Profile ids
+    are stored as `profiles/<name>/<id>`; the top-level database keeps ids as
+    Hermes wrote them. The path shape (.../profiles/<name>/state.db) decides,
+    so the collector and an explicit `import` of the same file agree.
+    """
+    real = os.path.abspath(path)
+    if os.path.basename(real) != "state.db":
+        return ""
+    name = os.path.basename(os.path.dirname(real))
+    if os.path.basename(os.path.dirname(os.path.dirname(real))) != "profiles":
+        return ""
+    return f"profiles/{name}/" if PROFILE_NAME.match(name) else ""
+
+
+def _hermes_tool_calls(raw):
+    """The parsed `tool_calls` value as a list of dicts, or None when there are none.
+
+    Hermes stores the OpenAI-style array as JSON text; a single object, an
+    already-parsed value and an unparseable string are all tolerated because
+    the column's shape is the client's, not ours.
+    """
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            raw = json.loads(raw)
+        except (ValueError, RecursionError):
+            return None
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None
+    calls = [call for call in raw if isinstance(call, dict)]
+    return calls or None
+
+
+def _hermes_journal(role, call_raw, tool_name, content):
+    """(suffix, role, text) records a Hermes row contributes beside its message.
+
+    - an assistant's `tool_calls` JSON becomes one `tool_call` record per call,
+      "<function name> <arguments>";
+    - a role='tool' row becomes one `tool_result` record, "<tool_name>: <content>"
+      (the name falls back to "tool" when the column is empty).
+
+    Everything goes through _journal_text, so records are secret-masked and
+    bounded to JOURNAL_MAX characters. The `reasoning` column and inline
+    <think> blocks are deliberately never read here: Hermes gives no way to
+    tell a visible summary from hidden reasoning, so both stay out.
+
+    Locators: the message keeps `row:<id>`; journal records append their suffix
+    (`row:<id>#tool_call:<call id or index>`, `row:<id>#tool_result`), so the
+    several records one row can yield never collide with the message locator
+    or with each other.
+    """
+    out = []
+    if role == "assistant":
+        for index, call in enumerate(_hermes_tool_calls(call_raw) or ()):
+            function = call.get("function") if isinstance(call.get("function"), dict) else call
+            name = function.get("name") if isinstance(function.get("name"), str) else "tool"
+            arguments = function.get("arguments", call.get("arguments"))
+            ident = call.get("id") if isinstance(call.get("id"), str) and call["id"] else str(index)
+            out.append((f"#tool_call:{ident}", "tool_call", f"{name} {_json_text(arguments)}"))
+    if role == "tool" and isinstance(content, str) and content.strip():
+        name = tool_name if isinstance(tool_name, str) and tool_name.strip() else "tool"
+        out.append(("#tool_result", "tool_result", f"{name}: {content}"))
+    return [(suffix, journal_role, _journal_text(text))
+            for suffix, journal_role, text in out if text.strip()]
 
 
 def _iter_hermes(path, stats, after_id=0, max_rows=None, max_bytes=None, cursor=None):
@@ -539,18 +824,21 @@ def _iter_hermes(path, stats, after_id=0, max_rows=None, max_bytes=None, cursor=
     """
     max_rows = HERMES_MAX_ROWS if max_rows is None else max_rows
     max_bytes = MAX_SCAN if max_bytes is None else max_bytes
-    conn, ts_col, kind_col = _hermes_open(path)
+    session_prefix = _hermes_session_prefix(path)
+    conn, ts_col, kind_col, call_col, tool_name_col = _hermes_open(path)
     try:
         size_expr = "length(CAST(content AS BLOB))"
         # LIMIT bounds rows of any type/size; the one extra row only signals truncation.
         rows = conn.execute(
             f"SELECT id, session_id, role, typeof(content), {size_expr},"
             f" CASE WHEN {size_expr} <= {MAX_LINE} THEN content END, {ts_col}, {kind_col},"
-            " typeof(id) FROM messages WHERE id > ? ORDER BY id LIMIT ?",
+            f" {call_col}, {tool_name_col}, typeof(id) FROM messages WHERE id > ?"
+            " ORDER BY id LIMIT ?",
             (after_id, max_rows + 1))
         budget = 0
         scanned = 0
-        for mid, session, role, kind, size, content, ts, display_kind, id_kind in rows:
+        for (mid, session, role, kind, size, content, ts, display_kind, call_raw,
+             tool_name, id_kind) in rows:
             if scanned >= max_rows:
                 stats["scan_truncated"] = True
                 return
@@ -567,29 +855,49 @@ def _iter_hermes(path, stats, after_id=0, max_rows=None, max_bytes=None, cursor=
             stats["scanned"] += 1
             if cursor is not None:
                 cursor["position"] = mid
+            session_value = _opt_str(session)
+            if session_value is not None and session_prefix:
+                session_value = session_prefix + session_value
+            # Journal first: a text-less assistant tool-call row and a role='tool'
+            # row are archived through it even when there is no message text.
+            # A row Hermes hides from display keeps its journal out too.
+            journal = () if display_kind is not None else _hermes_journal(
+                role, call_raw, tool_name, content if kind == "text" else None)
             if kind == "null":
-                stats["skipped"] += 1  # e.g. assistant tool-call rows without text
-                continue
-            if kind != "text":
+                if not journal:
+                    stats["skipped"] += 1  # a row without text and without tool calls
+                    continue
+            elif kind != "text":
                 stats["malformed"] += 1  # BLOB/numeric content is unexpected
                 continue
-            if content is None:
+            elif content is None:
                 stats["oversize"] += 1
                 continue
-            text = _strip_inline_reasoning(content) if role == "assistant" else content
-            if (role not in ("user", "assistant") or display_kind is not None
-                    or text is None or not text.strip()):
-                stats["skipped"] += 1
-                continue
-            try:
-                content.encode("utf-8")
-            except UnicodeEncodeError:
-                stats["malformed"] += 1
-                continue
-            # record hash covers the source row as stored, before reasoning removal
-            record = json.dumps([mid, session, role, content, ts], ensure_ascii=False, default=str)
-            yield (f"row:{mid}", None, _sha(record.encode("utf-8")), role, _opt_str(session),
-                   _opt_str(ts), text, None)
+            else:
+                text = _strip_inline_reasoning(content) if role == "assistant" else content
+                hidden = (role not in ("user", "assistant") or display_kind is not None
+                          or text is None or not text.strip())
+                if hidden:
+                    if not journal:
+                        stats["skipped"] += 1
+                else:
+                    try:
+                        content.encode("utf-8")  # JSON "\ud800" escapes yield unstorable surrogates
+                    except UnicodeEncodeError:
+                        stats["malformed"] += 1
+                    else:
+                        # record hash covers the source row as stored, before reasoning removal
+                        record = json.dumps([mid, session, role, content, ts],
+                                            ensure_ascii=False, default=str)
+                        yield (f"row:{mid}", None, _sha(record.encode("utf-8")), role,
+                               session_value, _opt_str(ts), text, None)
+            for suffix, journal_role, body in journal:
+                # Same row, different facet: the locator suffix keeps the journal
+                # records distinct from the message and from each other.
+                record = json.dumps([mid, suffix, session, role, ts],
+                                    ensure_ascii=False, default=str)
+                yield (f"row:{mid}{suffix}", None, _sha(record.encode("utf-8")),
+                       journal_role, session_value, _opt_str(ts), body, None)
     finally:
         conn.close()
 
@@ -607,7 +915,7 @@ def _ensure_source(conn, client, path):
                         (client, path)).fetchone()[0]
 
 
-def _store(conn, source_id, record, now, stats, evidence_only=False):
+def _store(conn, source_id, record, now, stats, evidence_only=False, roles=None):
     """Insert one record unless it is already stored; True if inserted.
 
     Identity is (source, locator, evidence). After a collector reset the byte
@@ -616,10 +924,18 @@ def _store(conn, source_id, record, now, stats, evidence_only=False):
     session, role, timestamp and text) in such a file then collapse into one.
     """
     locator, offset, record_sha, role, session, ts, text, cwd = record
+    if roles is not None and role not in roles:
+        stats["skipped"] += 1
+        return False
+    # The single choke point: whatever an extractor forgot, no credential is stored.
+    text = _mask_secrets(text)
     evidence = _evidence_sha(session, role, ts, text)
     if evidence_only and locator.startswith("offset:") and conn.execute(
             "SELECT 1 FROM entries WHERE source_id = ? AND evidence_sha256 = ? LIMIT 1",
             (source_id, evidence)).fetchone():
+        stats["duplicates"] += 1
+        return False
+    if _mask_stored_twin(conn, source_id, locator, session, role, ts, text, evidence):
         stats["duplicates"] += 1
         return False
     cur = conn.execute(
@@ -634,6 +950,30 @@ def _store(conn, source_id, record, now, stats, evidence_only=False):
     conn.execute("INSERT INTO entries_fts(rowid, content) VALUES (?, ?)", (cur.lastrowid, text))
     stats["inserted"] += 1
     return True
+
+
+# Role selection is applied at this choke point so every client extractor follows
+# the same consent rule and already stored rows remain untouched.
+
+
+def _mask_stored_twin(conn, source_id, locator, session, role, ts, text, evidence):
+    """Mask in place a row stored unmasked for this very record; True if there was one.
+
+    Without it a raw row kept from before a masking change and the freshly masked record
+    would differ in evidence and both stay, the secret included.
+    """
+    for entry_id, content in conn.execute(
+            "SELECT id, content FROM entries WHERE source_id = ? AND locator = ?"
+            " AND evidence_sha256 != ? AND session_id IS ? AND role = ? AND ts IS ?",
+            (source_id, locator, evidence, session, role, ts)).fetchall():
+        if content != text and _mask_secrets(content) == text:
+            conn.execute("INSERT INTO entries_fts(entries_fts, rowid, content) VALUES ('delete', ?, ?)",
+                         (entry_id, content))
+            conn.execute("UPDATE entries SET content = ?, content_sha256 = ?, evidence_sha256 = ?"
+                         " WHERE id = ?", (text, _sha(text.encode("utf-8")), evidence, entry_id))
+            conn.execute("INSERT INTO entries_fts(rowid, content) VALUES (?, ?)", (entry_id, text))
+            return True
+    return False
 
 
 def cmd_import(args):
@@ -656,6 +996,9 @@ def cmd_import(args):
     try:
         conn.execute("BEGIN IMMEDIATE")
         _prepare_write(conn)
+        # Stored rows are masked as the collector would before any of them is compared
+        # with a freshly masked record, or the raw copy would stay beside the masked one.
+        _mask_upgrade(conn)
         source_id = _ensure_source(conn, args.client, real_source)
         records = (_iter_hermes(real_source, stats) if args.client == "hermes"
                    else _iter_jsonl(real_source, args.client, stats))
@@ -676,7 +1019,7 @@ def cmd_import(args):
     # Deliberately filtered records ("skipped") do not count; unreadable ones ("malformed") do.
     bounded = bool(stats["scan_truncated"] or stats["record_limit_reached"]
                    or stats["oversize"] or stats["partial_tail"] or stats["malformed"])
-    return {"client": args.client, "capture": "normalized_text",
+    return {"client": args.client, "capture": "normalized_text", "stored_text": STORED_TEXT,
             "mode": "bounded_full_rescan_with_dedupe", "incremental": False,
             "complete_capture_claimed": False, "source_bounded_or_partial": bounded, **stats}
 
@@ -804,6 +1147,7 @@ CONFIG_LIMITS = {
     "max_seconds": (1, 60, 20),
     "hermes_rows_per_run": (1, HERMES_MAX_ROWS, 5000),
 }
+CONFIG_ROLES = ("user", "assistant", "tool_call", "tool_result", "tool_error", "reasoning")
 CONFIG_VERSION = 1
 DISCOVERY_MAX = 20000   # files listed per client per run
 HEAD_BYTES = 4096       # prefix fingerprint that detects a rewritten JSONL file
@@ -843,7 +1187,7 @@ def load_config(path):
         raise ArchiveError("collector config is not valid JSON") from None
     if not isinstance(data, dict):
         raise ArchiveError("collector config must be a JSON object")
-    unknown = set(data) - {"version", "enabled", "clients", *CONFIG_LIMITS}
+    unknown = set(data) - {"version", "enabled", "clients", "roles", *CONFIG_LIMITS}
     if unknown:
         raise ArchiveError("unknown collector config key: " + sorted(unknown)[0][:40])
     if data.get("version", CONFIG_VERSION) != CONFIG_VERSION:
@@ -866,6 +1210,18 @@ def load_config(path):
     else:
         config["clients"] = CLIENTS
         config["client_selection"] = "legacy_all"
+    if "roles" in data:
+        roles = data["roles"]
+        if (not isinstance(roles, list) or not roles
+                or any(not isinstance(role, str) or role not in CONFIG_ROLES for role in roles)
+                or len(set(roles)) != len(roles)):
+            raise ArchiveError("collector config roles must be a non-empty list of distinct names from: "
+                               + ", ".join(CONFIG_ROLES))
+        config["roles"] = tuple(role for role in CONFIG_ROLES if role in roles)
+        config["role_selection"] = "explicit"
+    else:
+        config["roles"] = CONFIG_ROLES
+        config["role_selection"] = "legacy_all"
     for key, (low, high, default) in CONFIG_LIMITS.items():
         value = data.get(key, default)
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -989,22 +1345,57 @@ def _list(path, summary):
         return []
 
 
+def _hermes_profile_databases(hermes_dir, summary, add):
+    """Every profiles/<name>/state.db as its own source; snapshots never are.
+
+    Hermes keeps a separate live state.db per profile beside the top-level one.
+    Backups under state-snapshots/ duplicate that history and are deliberately
+    never scanned. Symlinks are not followed at any step (directory entries are
+    checked without following, the database itself is lstat-ed), so nothing
+    outside the profile tree is ever read. An unreadable profiles directory or
+    database is reported through the summary and never fails the run.
+    """
+    profiles = os.path.join(hermes_dir, "profiles")
+    try:
+        with os.scandir(profiles) as scan:
+            names = sorted(e.name for e in scan if e.is_dir(follow_symlinks=False))
+        summary["profiles_root"] = "present"
+    except FileNotFoundError:
+        summary["profiles_root"] = "absent"
+        return
+    except OSError:
+        summary["profiles_root"] = "unreadable"
+        return
+    for name in names:
+        if not PROFILE_NAME.match(name):
+            continue
+        path = os.path.join(profiles, name, "state.db")
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue  # absent or unreadable: not a source, never a failure
+        add("hermes", path, info)
+
+
 def _discover(home, summary, clients=CLIENTS):
     """Only the canonical source locations of selected clients; symlinks are ignored."""
     found = []
     counts = dict.fromkeys(CLIENTS, 0)
 
-    def add(client, entry):
+    def add(client, path, info):
         if counts[client] >= DISCOVERY_MAX:
             summary[client]["discovery_truncated"] = True
             return
+        if stat.S_ISREG(info.st_mode):
+            counts[client] += 1
+            found.append((client, path, info))
+
+    def add_entry(client, entry):
         try:
             info = entry.stat(follow_symlinks=False)
         except OSError:
             return
-        if stat.S_ISREG(info.st_mode):
-            counts[client] += 1
-            found.append((client, entry.path, info))
+        add(client, entry.path, info)
 
     def subdirs(path, client, pattern):
         return [e for e in _list(path, summary[client])
@@ -1016,7 +1407,7 @@ def _discover(home, summary, clients=CLIENTS):
         for project in subdirs(claude, "claude", lambda name: True):
             for entry in _list(project.path, summary["claude"]):
                 if entry.name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
-                    add("claude", entry)
+                    add_entry("claude", entry)
 
     codex = os.path.join(home, ".codex", "sessions")
     if "codex" in clients and os.path.isdir(codex) and not os.path.islink(codex):
@@ -1030,7 +1421,7 @@ def _discover(home, summary, clients=CLIENTS):
                     for entry in _list(day.path, summary["codex"]):
                         if (entry.name.startswith("rollout-") and entry.name.endswith(".jsonl")
                                 and entry.is_file(follow_symlinks=False)):
-                            add("codex", entry)
+                            add_entry("codex", entry)
 
     hermes_dir = os.path.join(home, ".hermes")
     if "hermes" not in clients:
@@ -1042,7 +1433,8 @@ def _discover(home, summary, clients=CLIENTS):
         entry = None
     if entry is not None:
         summary["hermes"]["root"] = "present"
-        add("hermes", entry)
+        add_entry("hermes", entry)
+    _hermes_profile_databases(hermes_dir, summary["hermes"], add)
     return found
 
 
@@ -1102,7 +1494,7 @@ def _read_lines_from(handle, cursor, budget, stats, deadline):
             return
 
 
-def _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, now):
+def _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, now, roles):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as handle:
         info = os.fstat(handle.fileno())
@@ -1130,7 +1522,8 @@ def _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, 
         rescanning = cursor["resets"] > 0
         try:
             for record in records:
-                if _store(conn, source_id, record, now, stats, evidence_only=rescanning):
+                if _store(conn, source_id, record, now, stats, evidence_only=rescanning,
+                          roles=roles):
                     limits["records"] -= 1
                     if limits["records"] <= 0:
                         break
@@ -1154,9 +1547,9 @@ def _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, 
         cursor["state"] = "pending"
 
 
-def _visit_hermes(conn, source_id, path, cursor, limits, stats, summary, now):
+def _visit_hermes(conn, source_id, path, cursor, limits, stats, summary, now, roles):
     info = os.stat(path, follow_symlinks=False)
-    probe, _, _ = _hermes_open(path)
+    probe, _, _, _, _ = _hermes_open(path)
     try:
         max_id = probe.execute("SELECT max(id) FROM messages").fetchone()[0]
     finally:
@@ -1182,7 +1575,7 @@ def _visit_hermes(conn, source_id, path, cursor, limits, stats, summary, now):
                            cursor=cursor)
     try:
         for record in records:
-            if _store(conn, source_id, record, now, stats):
+            if _store(conn, source_id, record, now, stats, roles=roles):
                 limits["records"] -= 1
                 if limits["records"] <= 0:
                     break
@@ -1204,7 +1597,7 @@ def _needs_visit(client, info, cursor):
     return info.st_size != cursor["position"]
 
 
-def _visit(conn, client, path, limits, summary, now):
+def _visit(conn, client, path, limits, summary, now, roles):
     stats = dict(scanned=0, inserted=0, duplicates=0, malformed=0, skipped=0, oversize=0,
                  partial_tail=0, scan_truncated=False, bytes_scanned=0)
     summary["visited"] += 1
@@ -1213,9 +1606,10 @@ def _visit(conn, client, path, limits, summary, now):
         source_id = _ensure_source(conn, client, path)
         cursor = _load_cursor(conn, source_id) or _new_cursor(client, now)
         if client == "hermes":
-            _visit_hermes(conn, source_id, path, cursor, limits, stats, summary, now)
+            _visit_hermes(conn, source_id, path, cursor, limits, stats, summary, now, roles)
         else:
-            _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, now)
+            _visit_jsonl(conn, source_id, client, path, cursor, limits, stats, summary, now,
+                         roles)
         cursor.update(last_error=None, last_visit=now,
                       malformed=cursor["malformed"] + stats["malformed"],
                       oversize=cursor["oversize"] + stats["oversize"])
@@ -1242,7 +1636,8 @@ def _visit(conn, client, path, limits, summary, now):
 def cmd_collect(args):
     db = os.path.abspath(args.database)
     config = load_config(args.config)
-    base = {"capture": "normalized_text", "complete_capture_claimed": False}
+    base = {"capture": "normalized_text", "stored_text": STORED_TEXT,
+            "complete_capture_claimed": False}
     if config is None:
         return {**base, "status": "not_configured"}
     if not config["enabled"]:
@@ -1261,6 +1656,84 @@ def cmd_collect(args):
         os.close(lock)
 
 
+def _capture_upgrade(conn, summary):
+    """Read every followed source again once when the extractors capture more.
+
+    JSONL cursors restart at byte 0, Hermes cursors at row id 0 — the top-level
+    database and every profiles/<name> one alike, because the journal records
+    the new revision captures live in all of them. Rows the previous revision
+    already stored keep their locator and evidence, so the re-read recognises
+    them and only the newly captured kinds are added.
+    """
+    row = conn.execute("SELECT value FROM archive_meta WHERE key = 'capture_rev'").fetchone()
+    if row and row[0] == CAPTURE_REV:
+        return
+    for source_id, client in conn.execute(
+            "SELECT c.source_id, s.client FROM cursors c JOIN sources s ON s.id = c.source_id"
+            " WHERE s.client IN ('claude', 'codex', 'hermes')").fetchall():
+        cursor = _load_cursor(conn, source_id)
+        _reset(cursor, "capture_upgrade", summary[client])
+        cursor["state"] = "pending"
+        _save_cursor(conn, source_id, cursor)
+    _mask_stored_secrets(conn)
+    conn.execute("INSERT OR REPLACE INTO archive_meta VALUES ('capture_rev', ?)", (CAPTURE_REV,))
+
+
+def _mask_upgrade(conn):
+    """Mask stored rows again once when SECRET_PATTERNS learn new shapes; no source is re-read."""
+    row = conn.execute("SELECT value FROM archive_meta WHERE key = 'mask_rev'").fetchone()
+    if row and row[0] == MASK_REV:
+        return
+    _mask_stored_secrets(conn)
+    conn.execute("INSERT OR REPLACE INTO archive_meta VALUES ('mask_rev', ?)", (MASK_REV,))
+
+
+def _mask_stored_secrets(conn):
+    """Mask credentials in rows stored before masking existed; the row and its hashes follow.
+
+    The evidence hash is recomputed from the masked text, so the re-read that follows a
+    capture upgrade recognises the row instead of storing the masked copy beside it.
+    """
+    rows = conn.execute(
+        "SELECT id, source_id, locator, session_id, role, ts, content FROM entries").fetchall()
+    for entry_id, source_id, locator, session, role, ts, content in rows:
+        masked = _mask_secrets(content)
+        if masked == content:
+            continue
+        evidence = _evidence_sha(session, role, ts, masked)
+        conn.execute("INSERT INTO entries_fts(entries_fts, rowid, content) VALUES ('delete', ?, ?)",
+                     (entry_id, content))
+        # Two stored versions of one record that differed only in a secret become the same
+        # row once masked; the identity is unique, so the later copy is dropped, not kept.
+        twin = conn.execute("SELECT id FROM entries WHERE source_id = ? AND locator = ?"
+                            " AND evidence_sha256 = ? AND id != ?",
+                            (source_id, locator, evidence, entry_id)).fetchone()
+        if twin:
+            _merge_quarantine(conn, keep=twin[0], drop=entry_id)
+            conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            continue
+        conn.execute("UPDATE entries SET content = ?, content_sha256 = ?, evidence_sha256 = ?"
+                     " WHERE id = ?", (masked, _sha(masked.encode("utf-8")), evidence, entry_id))
+        conn.execute("INSERT INTO entries_fts(rowid, content) VALUES (?, ?)", (entry_id, masked))
+
+
+def _merge_quarantine(conn, keep, drop):
+    """Carry a dropped twin's visibility over to the row that stays.
+
+    The two rows hold the same masked text, so if either was visible (never quarantined,
+    or released by the owner) the kept one becomes visible too: a release is never lost.
+    """
+    def hidden(entry_id):
+        return conn.execute("SELECT 1 FROM quarantine WHERE entry_id = ? AND released_at IS NULL",
+                            (entry_id,)).fetchone() is not None
+    if hidden(keep) and not hidden(drop):
+        released = conn.execute("SELECT released_at FROM quarantine WHERE entry_id = ?",
+                                (drop,)).fetchone()
+        conn.execute("UPDATE quarantine SET released_at = ? WHERE entry_id = ?",
+                     ((released and released[0]) or _now(), keep))
+    conn.execute("DELETE FROM quarantine WHERE entry_id = ?", (drop,))
+
+
 def _collect_locked(db, home, config, backfill_path):
     started, clock = _now(), time.monotonic()
     limits = dict(config, bytes=config["max_bytes_per_run"],
@@ -1275,6 +1748,8 @@ def _collect_locked(db, home, config, backfill_path):
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("BEGIN IMMEDIATE")
         _prepare_write(conn)
+        _capture_upgrade(conn, summary)
+        _mask_upgrade(conn)
         conn.execute("COMMIT")
         tracked = {(row[0], row[1]): dict(zip(CURSOR_FIELDS, row[2:])) for row in conn.execute(
             f"SELECT s.client, s.path, {', '.join('c.' + f for f in CURSOR_FIELDS)}"
@@ -1331,7 +1806,8 @@ def _collect_locked(db, home, config, backfill_path):
             if stopped_by:
                 break
             visits += 1
-            _visit(conn, client, path, limits, summary[client], _now())
+            _visit(conn, client, path, limits, summary[client], _now(),
+                     config["roles"])
         if stopped_by is None:  # a budget may run out during the last visit
             if limits["records"] <= 0:
                 stopped_by = "record_budget"

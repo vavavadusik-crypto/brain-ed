@@ -486,7 +486,9 @@ fn insert(original: &str, block: &str) -> Result<String, &'static str> {
     let configured = format!("{original}{separator}{block}");
     // The result must stay readable by `unconfigure` (same 1 MiB bound).
     if configured.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("config.toml with the Brain block would exceed 1 MiB");
+        return Err(
+            "config.toml with the Brain block would exceed 1 MiB (the client config has grown unusually large; clean it up before configuring)",
+        );
     }
     Ok(configured)
 }
@@ -564,7 +566,9 @@ fn installed_binary(paths: &Paths, bin_dir_exists: bool) -> Result<Option<String
     if let Ok(metadata) = fs::symlink_metadata(&paths.binary) {
         use std::os::unix::fs::PermissionsExt;
         if metadata.file_type().is_file() && metadata.permissions().mode() & 0o100 == 0 {
-            return Err(refuse("the integration binary is not executable"));
+            return Err(refuse(
+                "the integration binary is not executable (check permissions on the installed brain binary and re-run `brain init --agents`)",
+            ));
         }
     }
     let bytes = read_owned(&paths.binary, MAX_BINARY_BYTES)
@@ -721,7 +725,7 @@ pub(crate) fn configure(ctx: &Context, label: &str, dry_run: bool) -> Result<Val
         && installed != source_sha
     {
         return Err(refuse(
-            "a different integration binary is already installed (no automatic upgrade)",
+            "a different integration binary is already installed (no automatic upgrade): run `brain uninstall` for that client, then configure again",
         ));
     }
     let target = read_target(&registered)?;
@@ -774,7 +778,7 @@ pub(crate) fn configure(ctx: &Context, label: &str, dry_run: bool) -> Result<Val
         (None, Some(manifest)) => {
             if manifest.binary_sha256 != source_sha {
                 return Err(refuse(
-                    "this label was configured by a different Brain executable (no automatic upgrade)",
+                    "this label was configured by a different Brain executable (no automatic upgrade): `brain clients unconfigure <label>` first, then configure again",
                 ));
             }
             if target.state != manifest.configured {
@@ -1066,13 +1070,12 @@ mod tests {
     }
 
     /// The synthetic HOME is `<private temp root>/<home_name>`.
-    fn fixture_named(label: &str, home_name: &str) -> Fixture {
-        let nonce = std::time::SystemTime::now()
+    fn fixture_named(_label: &str, home_name: &str) -> Fixture {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("brain-r1-{label}-{}-{nonce}", std::process::id()));
+        let root = crate::test_support::temp_path("brain-r1");
         let home = root.join(home_name);
         let codex = home.join("work-codex");
         fs::create_dir_all(&codex).unwrap();

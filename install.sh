@@ -1,152 +1,80 @@
 #!/usr/bin/env bash
-# Brain ED source installer for Linux (0.1.0 early preview).
-#
-# Builds the `brain` CLI from this checkout and asks the binary itself to write
-# the two desktop launchers (Graph and Settings). Nothing is downloaded by this
-# script beyond what `cargo build --locked` fetches for Cargo.lock; no model
-# weights, no sudo, no uploads, no background services.
-#
-#   ./install.sh             build, then `brain ui --install-shortcut`
-#   ./install.sh --dry-run   show what would happen; build nothing, change nothing
-#   ./install.sh --uninstall remove the launchers; ~/.brain data is kept
-#   ./install.sh --help
-
+# Download only data; verify SHA-256 before installing. Never execute the payload.
 set -euo pipefail
-
+fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 usage() {
-    cat <<'EOF'
-Usage: ./install.sh [--dry-run] [--uninstall] [--help]
-
-Builds Brain ED from this source checkout and installs desktop launchers
-for the current user only (Linux, XDG desktops).
-
-  (no option)   cargo build --locked --release -p brain-cli, then
-                target/release/brain ui --install-shortcut
-                (copies the binary to ~/.brain/bin/brain and writes the
-                "graph" and "settings" .desktop entries)
-  --dry-run     print the planned commands and paths; runs no cargo build,
-                downloads nothing, writes no file, starts no server
-  --uninstall   brain ui --remove-shortcut: removes the launchers and icons;
-                memory, settings and archives under ~/.brain are kept
-  -h, --help    show this help
-
-Not done by this script: sudo/system-wide install, model downloads
-(run `brain model install` explicitly), agent config changes
-(`brain init --agents`), the archive collector or its timer.
-EOF
+    cat <<'HELP'
+Usage: ./install.sh [--version VERSION] [--dry-run] [--uninstall]
+Linux x86_64 / aarch64 (including Android/Termux). No sudo or Rust required.
+Installs only ~/.local/bin/brain. No models, launchers, agent edits or services.
+--version VERSION  release version (default: 0.2.0; optional leading v)
+--dry-run          print plan; no network, temporary files, writes or payload execution
+--uninstall        remove only ~/.local/bin/brain; preserve all ~/.brain data
+BRAIN_RELEASE_BASE_URL overrides the HTTPS release directory (for mirrors).
+For source builds use packaging/install-source.sh instead.
+HELP
 }
-
+version=0.2.0
 dry_run=0
 uninstall=0
-for argument in "$@"; do
-    case "$argument" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version) [[ $# -ge 2 ]] || fail '--version needs a value'; version="${2#v}"; shift ;;
         --dry-run) dry_run=1 ;;
         --uninstall) uninstall=1 ;;
-        -h | --help)
-            usage
-            exit 0
-            ;;
-        *)
-            printf 'install.sh: unknown option: %s\n\n' "$argument" >&2
-            usage >&2
-            exit 2
-            ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown option: $1" ;;
     esac
+    shift
 done
-
-fail() {
-    printf 'install.sh: %s\n' "$*" >&2
-    exit 1
-}
-
-# Prints a command with shell quoting, then runs it unless this is a dry run.
-run() {
-    printf '+'
-    printf ' %q' "$@"
-    printf '\n'
-    if [ "$dry_run" -eq 0 ]; then
-        "$@"
-    fi
-}
-
-[ "$(uname -s)" = "Linux" ] || fail "this installer supports Linux only; see docs/INSTALL.md"
-[ "$(id -u)" -ne 0 ] || fail "do not run as root: Brain ED installs per user, without sudo"
-case "${HOME:-}" in
-    /*) ;;
-    *) fail "HOME must be set to an absolute path" ;;
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail 'invalid release version'
+[[ ${HOME:-} = /* ]] || fail 'HOME must be absolute'
+[[ $(uname -s) == Linux ]] || fail 'supported OS: Linux (including Android/Termux)'
+case "$(uname -m)" in
+    x86_64|amd64) arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) fail 'supported architectures: x86_64, aarch64' ;;
 esac
-
-repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-if [ ! -f "$repo_dir/Cargo.lock" ] || [ ! -d "$repo_dir/brain-cli" ]; then
-    fail "run install.sh from a Brain ED source checkout (Cargo.lock not found in $repo_dir)"
-fi
-
-# Pin the target directory so an inherited CARGO_TARGET_DIR cannot move the
-# build somewhere this script does not look.
-target_dir="$repo_dir/target"
-built_binary="$target_dir/release/brain"
-stable_binary="$HOME/.brain/bin/brain"
-
-if [ "$uninstall" -eq 1 ]; then
-    if [ -x "$built_binary" ]; then
-        brain="$built_binary"
-    elif [ -x "$stable_binary" ]; then
-        brain="$stable_binary"
-    else
-        fail "no brain binary found at $built_binary or $stable_binary; nothing to run --remove-shortcut with"
-    fi
-    if [ "$dry_run" -eq 1 ]; then
-        # The CLI's own dry run only reports paths; it removes nothing.
-        printf '+ %q ui --remove-shortcut --dry-run\n' "$brain"
-        "$brain" ui --remove-shortcut --dry-run
-        printf '\nDry run: nothing was removed. "would_remove" above lists what --uninstall would delete.\n'
-        printf 'Data under %q would be kept.\n' "$HOME/.brain"
-        exit 0
-    fi
-    run "$brain" ui --remove-shortcut
-    printf '\nThe paths listed under "removed" above were deleted (an empty list means nothing was installed).\n'
-    printf 'Data under %q was kept.\n' "$HOME/.brain"
-    printf 'Agent integrations, if any, are removed separately: brain uninstall --dry-run\n'
+binary="$HOME/.local/bin/brain"
+if [[ $uninstall == 1 ]]; then
+    printf 'Remove %s; keep ~/.brain data\n' "$binary"
+    [[ $dry_run == 1 ]] || rm -f -- "$binary"
     exit 0
 fi
-
-command -v cargo >/dev/null 2>&1 \
-    || fail "cargo not found: install Rust via rustup (rust-toolchain.toml pins the version)"
-if ! command -v python3 >/dev/null 2>&1; then
-    printf 'note: python3 not found; only the optional archive collector tools need it.\n' >&2
-fi
-
-printf 'Brain ED source install (early preview)\n  source: %s\n  binary: %s\n  stable copy: %s\n\n' \
-    "$repo_dir" "$built_binary" "$stable_binary"
-
-# Build from the checkout root so rust-toolchain.toml selects the pinned
-# toolchain even when install.sh is invoked from another directory.
-cd -- "$repo_dir"
-run cargo build --locked --release -p brain-cli \
-    --manifest-path "$repo_dir/Cargo.toml" --target-dir "$target_dir"
-
-if [ "$dry_run" -eq 1 ]; then
-    printf '+ %q ui --install-shortcut\n' "$built_binary"
-    if [ -x "$built_binary" ]; then
-        # Read-only plan from an existing build: paths only, nothing written.
-        "$built_binary" ui --install-shortcut --dry-run
-    else
-        printf '(no existing build; the shortcut plan is printed after a real build)\n'
-    fi
-    printf '\nDry run: nothing was built, downloaded or written.\n'
+asset="brain-$version-$arch-unknown-linux-musl"
+base="${BRAIN_RELEASE_BASE_URL:-https://github.com/vavavadusik-crypto/brain-ed/releases/download/v$version}"
+[[ "$base" == https://* && "$base" != *$'\n'* && "$base" != *$'\r'* ]] || fail 'release URL must use HTTPS'
+printf 'Download %s/%s and SHA256SUMS\nVerify SHA-256, then install %s\n' "${base%/}" "$asset" "$binary"
+if [[ $dry_run == 1 ]]; then
+    echo 'Dry run: no network, files written or payload executed.'
     exit 0
 fi
-
-[ -x "$built_binary" ] || fail "build reported success but $built_binary is missing"
-run "$built_binary" ui --install-shortcut
-
-cat <<EOF
-
-Installed. Next steps:
-  $stable_binary --help
-  $stable_binary init                # create ~/.brain/brain.sqlite
-  $stable_binary ui --page graph     # or use the "graph" launcher
-
-If a desktop icon shows as untrusted, right-click it and choose
-"Allow Launching". Embeddings are optional: brain model install
-EOF
+command -v curl >/dev/null || fail 'curl is required (Termux: pkg install curl)'
+if command -v sha256sum >/dev/null; then
+    checksum() { sha256sum "$1"; }
+elif command -v shasum >/dev/null; then
+    checksum() { shasum -a 256 "$1"; }
+else
+    fail 'sha256sum or shasum is required (Termux: pkg install coreutils)'
+fi
+work="$(mktemp -d)"
+staged=''
+cleanup() { rm -rf -- "$work"; [[ -z "$staged" ]] || rm -f -- "$staged"; }
+trap cleanup EXIT
+fetch() { curl --fail --location --retry 3 --connect-timeout 20 --proto '=https' --proto-redir '=https' --output "$2" "$1"; }
+fetch "${base%/}/SHA256SUMS" "$work/SHA256SUMS"
+fetch "${base%/}/$asset" "$work/$asset"
+# Select exactly one digest for this exact filename. Never run manifest content.
+expected="$(awk -v name="$asset" '$2 == name {print $1}' "$work/SHA256SUMS")"
+[[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || fail 'missing, duplicate or malformed checksum'
+actual="$(checksum "$work/$asset")"
+actual="${actual%% *}"
+[[ "${actual,,}" == "${expected,,}" ]] || fail 'SHA-256 mismatch; installed binary unchanged'
+mkdir -p -- "$(dirname "$binary")"
+staged="$(mktemp "$HOME/.local/bin/.brain-install.XXXXXX")"
+cp -- "$work/$asset" "$staged"
+chmod 755 "$staged"
+mv -f -- "$staged" "$binary"
+staged=''
+printf 'Installed %s (SHA-256 %s)\n' "$binary" "$actual"
+printf 'Next: export PATH="$HOME/.local/bin:$PATH"\nbrain init --agents --dry-run\n'

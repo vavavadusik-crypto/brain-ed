@@ -66,6 +66,8 @@ pub struct SearchQuery {
     pub memory_only: bool,
     /// Record hits as accessed (a write). Off for read-only retrieval.
     pub record_access: bool,
+    /// Match lexical token prefixes for incremental search boxes.
+    pub prefix_matching: bool,
 }
 
 impl SearchQuery {
@@ -79,6 +81,7 @@ impl SearchQuery {
             layers: SearchLayers::HOT,
             memory_only: false,
             record_access: true,
+            prefix_matching: false,
         }
     }
 
@@ -93,6 +96,13 @@ impl SearchQuery {
     #[must_use]
     pub const fn memory_only(mut self) -> Self {
         self.memory_only = true;
+        self
+    }
+
+    /// Enables prefix matching while keeping the ordinary hybrid ranking.
+    #[must_use]
+    pub const fn with_prefix_matching(mut self) -> Self {
+        self.prefix_matching = true;
         self
     }
 
@@ -468,7 +478,8 @@ where
         if self.embedder.is_none() && warnings.is_empty() {
             warnings.push("vector search unavailable; using BM25 + exact matches only".to_owned());
         }
-        if budget_tokens == 0 {
+        let fts = fts_query_with_prefix(&query.text, query.prefix_matching);
+        if budget_tokens == 0 || fts.is_empty() {
             return Ok(SearchOutput {
                 hits: Vec::new(),
                 used_tokens: 0,
@@ -479,7 +490,6 @@ where
         }
 
         let seed_terms = graph_seed_terms(&query.text);
-        let fts = fts_query(&query.text);
         let mut lexical_hits = if fts.is_empty() {
             Vec::new()
         } else {
@@ -765,8 +775,10 @@ where
             let Some(next_used) = used_tokens.checked_add(candidate.node.token_len) else {
                 break;
             };
+            // A hit that no longer fits is skipped, not the end of the list: lower-ranked
+            // shorter hits still fill the rest of the budget.
             if next_used > budget_tokens {
-                break;
+                continue;
             }
             used_tokens = next_used;
             hits.push(HybridSearchHit {
@@ -909,7 +921,10 @@ fn expansion_terms(query: &str, hits: &[crate::SearchHit]) -> Vec<String> {
             let term = normalized_term(word);
             // Short words are mostly grammar, and anything already asked about
             // widens nothing.
-            if term.chars().count() < EXPANSION_MIN_TERM_CHARS || asked.contains(&term) {
+            if term.chars().count() < EXPANSION_MIN_TERM_CHARS
+                || asked.contains(&term)
+                || crate::lexical::is_stop_word(&term)
+            {
                 continue;
             }
             if seen.insert(term.clone()) {
@@ -984,19 +999,22 @@ fn length_penalty(token_len: usize) -> f64 {
 }
 
 fn fts_query(query: &str) -> String {
+    // Borrowed corpus vocabulary remains literal: stemming it would compound
+    // the widening of the user's own query and amplify unrelated neighbours.
     lexical_terms(query)
         .into_iter()
-        .filter(|term| !term.is_empty())
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .filter(|term| !crate::lexical::is_stop_word(term))
+        .map(|term| format!("\"{term}\""))
         .collect::<Vec<_>>()
         .join(" OR ")
 }
 
+fn fts_query_with_prefix(query: &str, prefix: bool) -> String {
+    crate::lexical::bm25_query(query, prefix)
+}
+
 fn lexical_terms(text: &str) -> Vec<String> {
-    text.split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .filter(|term| !term.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+    crate::lexical::terms(text)
 }
 
 /// Terms a lexical match must cover before it is trusted to seed the graph.
@@ -1100,6 +1118,32 @@ mod tests {
             } else {
                 vector[1] = 1.0;
             }
+            Ok(vector)
+        }
+    }
+
+    /// One-hot by text length, so texts of different lengths never look like duplicates.
+    struct LengthEmbedder;
+
+    impl Embedder for LengthEmbedder {
+        fn model_id(&self) -> &str {
+            "test-length-256"
+        }
+
+        fn dimensions(&self) -> usize {
+            256
+        }
+
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            // The query and the text mentioning "filler" share a direction, so the vector
+            // signal can lift a longer text above shorter ones.
+            let mut vector = vec![0.0; 256];
+            let slot = if text == "compiler" || text.contains("filler") {
+                0
+            } else {
+                1 + text.len() % 255
+            };
+            vector[slot] = 1.0;
             Ok(vector)
         }
     }
@@ -1217,6 +1261,76 @@ mod tests {
     }
 
     #[test]
+    fn morphology_retrieves_without_exact_bonus_or_graph_authority() {
+        let (storage, attribution) = setup();
+        storage.insert_nodes(&[
+            graph_node("forms", "Agent policy", "Агенты соблюдают правило: работать аккуратно, проверять изменения перед сохранением результата.", &attribution),
+            graph_node("neighbour", "Unrelated", "Banana orchard irrigation calendar and rainfall measurements.", &attribution),
+        ]).unwrap();
+        storage
+            .insert_edges(&[graph_edge(
+                "edge",
+                "forms",
+                "neighbour",
+                10,
+                10,
+                &attribution,
+            )])
+            .unwrap();
+        let search = HybridSearch::without_vectors(&storage, "synthetic lexical test");
+        let query = SearchQuery::new(SPACE_ID, "правила работы агентов", AsOf::new(20, 20));
+        let output = search.search(&query, 12000).unwrap();
+        let hit = output
+            .hits
+            .iter()
+            .find(|hit| hit.node.id == "forms")
+            .expect("cross-form BM25");
+        assert!(hit.matched_bm25);
+        assert!(!hit.matched_exact);
+        assert!(!covers_graph_seed_terms(
+            &hit.node,
+            &graph_seed_terms(&query.text)
+        ));
+        assert_eq!(output.graph_reached, 0);
+        assert!(!output.hits.iter().any(|hit| hit.node.id == "neighbour"));
+        // The literal phrase still receives its exact signal.
+        let exact = search
+            .search(
+                &SearchQuery::new(SPACE_ID, "Agent policy", AsOf::new(20, 20)),
+                12000,
+            )
+            .unwrap();
+        assert!(
+            exact
+                .hits
+                .iter()
+                .any(|hit| hit.node.id == "forms" && hit.matched_exact)
+        );
+    }
+
+    #[test]
+    fn stop_only_queries_do_not_use_exact_or_vector_fallbacks() {
+        let (storage, attribution) = setup();
+        storage
+            .insert_nodes(&[graph_node(
+                "grammar",
+                "what",
+                "что как где и на the and",
+                &attribution,
+            )])
+            .unwrap();
+        let search = HybridSearch::new(&storage, &KeywordEmbedder);
+        for text in ["what", "что как где", "и на в а", "the and to", "!!!"] {
+            let output = search
+                .search(&SearchQuery::new(SPACE_ID, text, AsOf::new(20, 20)), 12000)
+                .unwrap();
+            assert!(output.hits.is_empty(), "{text}");
+            assert!(!output.vector_search);
+            assert_eq!(output.graph_reached, 0);
+        }
+    }
+
+    #[test]
     fn search_never_exceeds_token_budget() {
         let (storage, attribution) = setup();
         storage
@@ -1280,6 +1394,70 @@ mod tests {
                 .map(|hit| hit.node.token_len)
                 .sum::<usize>()
         );
+    }
+
+    #[test]
+    fn a_hit_that_does_not_fit_leaves_room_for_shorter_ones_below_it() {
+        let (storage, attribution) = setup();
+        let node = |id: &str, label: &str, body: &str| NewNode {
+            id: id.to_owned(),
+            space_id: SPACE_ID.to_owned(),
+            kind: NodeKind::Decision,
+            label: label.to_owned(),
+            body: body.to_owned(),
+            source: None,
+            metadata_json: "{}".to_owned(),
+            valid_from: 10,
+            valid_to: None,
+            attribution: attribution.clone(),
+            salience: 1.0,
+            source_weight: 1.0,
+        };
+        storage
+            .insert_nodes(&[
+                node("top", "Compiler compiler", "compiler compiler compiler"),
+                node(
+                    "long",
+                    "Compiler compiler notes",
+                    "compiler compiler with several unrelated filler words",
+                ),
+                node("short", "Compiler", "compiler compiler"),
+            ])
+            .expect("insert search nodes");
+        let embedder = LengthEmbedder;
+        let search = HybridSearch::new(&storage, &embedder);
+        for node_id in ["top", "long", "short"] {
+            let stored = storage
+                .node_as_of(SPACE_ID, node_id, AsOf::new(20, 20))
+                .expect("load node")
+                .expect("node exists");
+            search
+                .index_node(&stored, attribution.clone(), 20)
+                .expect("index node");
+        }
+        let query = SearchQuery::new(SPACE_ID, "compiler", AsOf::new(20, 20));
+        let ranked = search.search(&query, 100_000).expect("full ranking").hits;
+        let lens = ranked
+            .iter()
+            .map(|hit| (hit.node.id.clone(), hit.node.token_len))
+            .collect::<Vec<_>>();
+        // The budget holds the second-ranked hit on its own, and the first with the third,
+        // but not the first with the second: the second is skipped, the third still packed.
+        assert_eq!(lens.len(), 3, "{lens:?}");
+        let budget = lens[1].1.max(lens[0].1 + lens[2].1);
+        assert!(
+            budget < lens[0].1 + lens[1].1,
+            "fixture must rank a longer hit second: {lens:?}"
+        );
+
+        let output = search.search(&query, budget).expect("hybrid search");
+        let ids = output
+            .hits
+            .iter()
+            .map(|hit| hit.node.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![lens[0].0.clone(), lens[2].0.clone()], "{lens:?}");
+        assert_eq!(output.used_tokens, lens[0].1 + lens[2].1);
     }
 
     #[test]

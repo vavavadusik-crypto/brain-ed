@@ -27,3 +27,6 @@ sqlite-vec.c:68: error: unknown type name 'u_int8_t'
 
 Однострочный фикс отправляется в апстрим. Когда он выйдет в релизе, эта копия
 удаляется, а зависимость возвращается на crates.io.
+
+Public export: upstream URI examples in sqlite3.h use /example/fred instead of
+a home-directory prefix. Comments only; SQLite behavior is unchanged.

@@ -1825,11 +1825,10 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        pub fn new(tag: &str) -> Dir {
+        pub fn new(_tag: &str) -> Dir {
             static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let dir =
-                std::env::temp_dir().join(format!("brain-coord-{tag}-{}-{n}", std::process::id()));
+            let _n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir = crate::test_support::temp_path("brain-coord");
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("temp dir");
             Dir(dir)

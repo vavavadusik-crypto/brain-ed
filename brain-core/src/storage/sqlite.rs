@@ -3125,7 +3125,7 @@ mod tests {
 
     #[test]
     fn read_only_open_never_creates_migrates_or_writes() {
-        let dir = std::env::temp_dir().join(format!("brain-ro-open-{}", std::process::id()));
+        let dir = crate::test_support::temp_path("brain-ro-open");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
 
@@ -3187,7 +3187,7 @@ mod tests {
     /// checkpoint) are visible — an unlocked immutable open would miss them.
     #[test]
     fn read_only_reader_follows_a_live_writer_with_checkpoints() {
-        let dir = std::env::temp_dir().join(format!("brain-ro-live-{}", std::process::id()));
+        let dir = crate::test_support::temp_path("brain-ro-live");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("live.sqlite");

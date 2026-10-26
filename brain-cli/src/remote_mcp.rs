@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn config_file_is_owner_only_regular_and_bounded() {
-        let dir = std::env::temp_dir().join(format!("brain-remote-cfg-{}", std::process::id()));
+        let dir = crate::test_support::temp_path("brain-remote-cfg");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("dir");
         let file = dir.join("remote.json");

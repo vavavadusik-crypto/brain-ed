@@ -215,15 +215,8 @@ pub(crate) mod tests {
         assert!(!base.exists(), "the guard performs no I/O");
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "brain-private-fs-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn scratch(_tag: &str) -> PathBuf {
+        let dir = crate::test_support::temp_path("brain-private-fs");
         fs::create_dir_all(&dir).unwrap();
         dir
     }

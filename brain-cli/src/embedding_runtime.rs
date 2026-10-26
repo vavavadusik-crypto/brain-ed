@@ -351,11 +351,7 @@ mod tests {
     /// staging empty ones is enough to exercise the decision without a download.
     #[cfg(feature = "model2vec")]
     fn cache_with_only(model_id: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "brain-models-{}-{}",
-            std::process::id(),
-            model_id.replace('/', "-")
-        ));
+        let root = crate::test_support::temp_path("brain-models");
         let repository = root.join(format!("models--{}", model_id.replace('/', "--")));
         let snapshot = repository.join("snapshots").join("test");
         std::fs::create_dir_all(&snapshot).expect("create model snapshot");
@@ -413,13 +409,7 @@ mod tests {
 
     #[test]
     fn backlog_counts_both_queue_files_and_ignores_blank_lines() {
-        let home = std::env::temp_dir().join(format!(
-            "brain-embedding-runtime-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
+        let home = crate::test_support::temp_path("brain-embedding-runtime");
         fs::create_dir_all(&home).expect("create temp brain home");
         let mine = home.join("mine.sqlite");
         let other = home.join("other.sqlite");

@@ -58,6 +58,7 @@ pub(crate) enum ShareCommand {
 pub(crate) struct SpaceArgs {
     #[command(flatten)]
     state: StateDirArg,
+    /// Space this command enables or disables.
     #[arg(long)]
     space: String,
 }
@@ -66,10 +67,13 @@ pub(crate) struct SpaceArgs {
 pub(crate) struct GrantArgs {
     #[command(flatten)]
     state: StateDirArg,
+    /// Machine (installation) id of the granted principal.
     #[arg(long)]
     machine: String,
+    /// Agent id of the granted principal.
     #[arg(long)]
     agent_id: String,
+    /// Space the principal may read shared memory from.
     #[arg(long)]
     space: String,
 }
@@ -78,8 +82,10 @@ pub(crate) struct GrantArgs {
 pub(crate) struct FactRef {
     #[command(flatten)]
     state: StateDirArg,
+    /// Space the fact lives in.
     #[arg(long)]
     space: String,
+    /// Fact id this command applies to.
     #[arg(long)]
     fact_id: String,
 }
@@ -106,10 +112,13 @@ pub(crate) struct PublishArgs {
 pub(crate) struct FactsArgs {
     #[command(flatten)]
     state: StateDirArg,
+    /// Space whose facts are listed.
     #[arg(long)]
     space: String,
+    /// Also list retracted facts.
     #[arg(long)]
     include_retracted: bool,
+    /// Page size (1-100, default 100).
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=MAX_PAGE as i64))]
     limit: u32,
 }
@@ -119,6 +128,7 @@ pub(crate) struct PullArgs {
     /// Local state directory whose share store receives the events.
     #[arg(long, value_name = "DIR")]
     state_dir: std::path::PathBuf,
+    /// Space to pull events for.
     #[arg(long)]
     space: String,
     /// Local label of the peer we pull from (trusted host context, recorded with each fact).
@@ -313,8 +323,8 @@ fn pull(args: &PullArgs) -> (Exit, Value) {
         Ok(store) => store,
         Err(error) => return share_failure(&error),
     };
-    let tls = match client(&args.connect) {
-        Ok(client) => client,
+    let (tls, _from_endpoint) = match client(&args.connect) {
+        Ok(found) => found,
         Err(failed) => return failed,
     };
     let endpoint = transport(&tls, &args.connect);
@@ -382,7 +392,7 @@ fn pull(args: &PullArgs) -> (Exit, Value) {
 
 /// Validates one `share_pull` response: the pinned origin and space, a
 /// strictly parsed event list (digest checked per event) and `has_more`.
-fn parse_page(
+pub(super) fn parse_page(
     body: &Value,
     origin: &str,
     space: &str,

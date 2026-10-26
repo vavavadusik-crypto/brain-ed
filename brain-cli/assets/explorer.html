@@ -29,6 +29,10 @@ a.btn, button { font: inherit; font-size: 13px; color: var(--ink); background: t
   border-radius: 7px; padding: 4px 10px; cursor: pointer; text-decoration: none; }
 button:disabled { opacity: .45; cursor: default; }
 button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Dark theme turns the accent light: white text on it fails contrast, the
+   near-black theme background passes (10.8:1). */
+html[data-theme="dark"] button.primary { color: #10131a; }
+@media (prefers-color-scheme: dark) { html[data-theme="auto"] button.primary { color: #10131a; } }
 main { flex: 1; display: grid; grid-template-columns: 300px 1fr 360px; min-height: 0; }
 aside, section.center { min-height: 0; overflow: auto; }
 aside { background: var(--panel); padding: 12px; }

@@ -6,6 +6,10 @@ below, ten `work_*` tools (see [coordination.md](coordination.md)), and
 `map_status`, `map_timeline`, `map_packet`, `map_ingest_coordinator` (see
 [graph-explorer.md](graph-explorer.md)). An explicitly configured remote
 MCP client adds the five read tools described in [remote-mcp.md](remote-mcp.md).
+When team mode is configured, three additional read-only tools are exposed:
+`team_ask`, `team_manifest` and `team_peers`. Their arguments, trust labels and
+configuration boundaries are described in [team facts](team-mode-facts.md).
+
 The memory/archive tools are:
 
 1. `memory_search`
@@ -51,18 +55,21 @@ past that return as `deferred_ids`); read those in a further call.
 cl100k token always contains at least one byte, the reported byte count is a
 conservative upper bound below the 600-token contract.
 
-`brain hook --event NAME --client claude|codex|cursor` reads one JSON payload
-from stdin. The fast path performs no model, network, Git, or SQLite work. A
-SessionStart returns `{}`, as do all other events. Automatic brief injection was
-disabled so mutable memory cannot cross into a system-priority channel. Request
-`memory_brief` explicitly as a tool result instead. Sanitized events are appended below `~/.brain/`; raw user prompts,
-secret-like fields, high-entropy strings, and denylisted personal paths are not
-queued. The current journal captures event metadata, not conversation history.
+`brain hook --event NAME --client claude|codex|cursor` reads one bounded JSON
+payload from stdin. It does not run a model or network request. For Claude Code
+and Codex, SessionStart returns a fixed memory notice when `session_start_notice`
+is enabled (default). Setting `session_start_brief` to `brief` explicitly adds
+an available cached project brief, bounded by the project's 2000-token estimate;
+no cache rebuild or archive text is injected. Cached records are marked untrusted
+evidence. Other responses are `{}`. Activity metadata is sanitized and recorded
+best-effort. Conversation/journal collection is a separate opt-in subsystem:
+see [session archive](session-archive.md) and [journal](journal.md).
 
 ### Hook process contract
 
-Whatever stdin or the filesystem holds, the hook writes exactly `{}` followed by
-a newline to stdout, nothing to stderr, and exits 0. Command-line usage errors
+The hook writes one JSON response followed by a newline to stdout, nothing to
+stderr, and exits 0. This is `{}` except for the SessionStart response above.
+Command-line usage errors
 (an unknown `--client`, a missing `--event`) still fail as normal CLI errors.
 
 - Input is bytes. Only the first 256 KiB are kept and parsed. Empty input,
@@ -103,8 +110,8 @@ a newline to stdout, nothing to stderr, and exits 0. Command-line usage errors
   are never opened. Client configuration, transcripts, auth files and history
   are not read either.
 - `~/.brain` must already exist as a real directory owned by the current user,
-  with no group or other permission bits, inside a parent that is not group- or
-  world-writable. Otherwise the event is dropped. The hook never creates,
+  with no group or other permission bits, inside a parent that is not world-writable
+  and permits group writes only for a verified owner-private group. Otherwise the event is dropped. The hook never creates,
   chmods or follows a Brain home. Run `brain init` to create one.
 - `hook-events.jsonl` and `hook-dedupe.json` are checked with `lstat` before
   any content is opened. Each must be a regular file owned by the user, with
@@ -125,7 +132,7 @@ capture. It is not evidence that any client actually invoked the hook.
 `brain doctor` reads only bounded configuration and journal snapshots. It reports
 malformed records, future timestamps, partial tails and configuration markers.
 It does not start services or models and does not claim that configuration proves
-a successful connection. Conversation capture remains explicitly unimplemented;
+a successful connection. Conversation capture is opt-in and partial; see [session archive](session-archive.md).
 Hermes operational-graph import is not a transcript adapter.
 
 `brain init --agents --dry-run` previews user-scope MCP, hook, and instruction

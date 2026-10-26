@@ -11,9 +11,9 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -57,6 +57,7 @@ const MAP3D_SCRIPT: &str = include_str!("../assets/map3d.js");
 /// older window — whose HTML hands its key to any local reader — is replaced.
 const API_REVISION: u64 = 7;
 const VIEWER_APP: &str = include_str!("../assets/viewer/app.js");
+const BRAIN_VIEWER_PAGE: &str = include_str!("../assets/viewer/brain.html");
 const GRAPH3D_SCRIPT: &str = include_str!("../assets/graph3d.js");
 const VIEWER_STYLE: &str = include_str!("../assets/viewer/style.css");
 const VIEWER_THREE: &str = include_str!("../assets/viewer/three.min.js");
@@ -142,12 +143,27 @@ impl UiArgs {
 struct Server {
     space: String,
     brain_home: PathBuf,
+    client_home: PathBuf,
     database: PathBuf,
     token: String,
     /// Public, random per-process tag that the ping reports; ties a private
     /// owner file to exactly one running window.
     generation: String,
+    /// The whole-space clustering, memoised per database generation: the label
+    /// propagation reads every node and edge, the overview asks on every open,
+    /// and the base rarely moves between opens. The persistent connection
+    /// makes PRAGMA data_version meaningful across requests.
+    clusters_cache: Mutex<
+        Option<(
+            rusqlite::Connection,
+            String,
+            Arc<crate::graph_view::ClusterIndex>,
+        )>,
+    >,
     address: SocketAddr,
+    /// The executable install connects hooks to; the settings window is the
+    /// only consumer. Tests point it at a temp copy so nothing real is read.
+    binary: PathBuf,
 }
 
 impl Server {
@@ -337,10 +353,13 @@ pub(crate) fn run(config: &RuntimeConfig, args: &UiArgs) -> Result<(), Box<dyn E
     let server = Arc::new(Server {
         space: config.space.clone(),
         brain_home: brain_home(),
+        client_home: crate::user_home(),
         database: config.database.clone(),
         token: fresh_token()?,
         generation: fresh_token()?[..32].to_owned(),
+        clusters_cache: Mutex::new(None),
         address: listener.local_addr()?,
+        binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("brain")),
     });
     let status = StatusService::spawn(config.database.clone());
     let owner = write_owner_file(&server)?;
@@ -845,6 +864,15 @@ fn route(server: &Server, status: &StatusRequester, request: &Request) -> Respon
             }
             json_response(200, "OK", &state_document(server, status))
         }
+        // The ported New Generation Brain viewer (docs/e4-viewer-port-plan.md,
+        // task T1). The shell is public markup like every page here; the data
+        // it asks for stays behind the window key.
+        ("GET", "/graph/brain") => Response {
+            status: 200,
+            reason: "OK",
+            content_type: "text/html; charset=utf-8",
+            body: BRAIN_VIEWER_PAGE.as_bytes().to_vec(),
+        },
         ("GET", "/brain-viewer/app.js" | "/graph/brain-viewer/app.js") => Response {
             status: 200,
             reason: "OK",
@@ -869,11 +897,12 @@ fn route(server: &Server, status: &StatusRequester, request: &Request) -> Respon
             if !authorized {
                 return problem(403, "Forbidden", "нет ключа окна настроек");
             }
-            match crate::graph_view::document(
-                &server.database,
-                &server.space,
-                crate::graph_view::DEFAULT_LIMIT,
-            ) {
+            let params = crate::explore::parse_query(&request.query);
+            let limit = params
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(crate::graph_view::DEFAULT_LIMIT);
+            match crate::graph_view::document(&server.database, &server.space, limit) {
                 Ok(document) => json_response(200, "OK", &document),
                 Err(error) => json_response(
                     200,
@@ -881,6 +910,127 @@ fn route(server: &Server, status: &StatusRequester, request: &Request) -> Respon
                     &json!({"format": "brain-data-v2", "nodes": [], "links": [],
                             "error": error.to_string()}),
                 ),
+            }
+        }
+        // The ported viewer's data routes (docs/e4-viewer-port-plan.md, tasks
+        // T3-T5). Same key rule as the data they read: node text is memory.
+        ("GET", "/brain-details.json") | ("GET", "/graph/brain-details.json") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            match crate::graph_view::details_document(
+                &server.database,
+                &server.space,
+                crate::graph_view::DEFAULT_LIMIT,
+            ) {
+                Ok(document) => json_response(200, "OK", &document),
+                Err(error) => {
+                    json_response(200, "OK", &json!({"nodes": [], "error": error.to_string()}))
+                }
+            }
+        }
+        // The whole brain folded into communities (E4.5): every live node in
+        // exactly one cluster, whatever the drawn sample shows. Same key rule
+        // as the data it summarises: membership is memory metadata.
+        ("GET", "/brain-clusters.json") | ("GET", "/graph/brain-clusters.json") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            match cached_cluster_index(server) {
+                Ok(index) => json_response(200, "OK", &index.clusters_document()),
+                Err(error) => json_response(
+                    200,
+                    "OK",
+                    &json!({"format": "brain-clusters-v1", "clusters": [], "links": [],
+                            "node_clusters": {}, "error": error.to_string()}),
+                ),
+            }
+        }
+        // One cluster expanded by id: its members, strongest first, each row
+        // carrying its id so the viewer can load a node further by itself.
+        ("GET", "/api/cluster") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            let params = crate::explore::parse_query(&request.query);
+            let Some(id) = params.get("id").and_then(|id| id.parse::<usize>().ok()) else {
+                return problem(400, "Bad Request", "нужен числовой параметр id");
+            };
+            let offset = params
+                .get("offset")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let index = match cached_cluster_index(server) {
+                Ok(index) => index,
+                Err(error) => return problem(500, "Internal Server Error", &error.to_string()),
+            };
+            if params
+                .get("generation")
+                .is_some_and(|g| g != &index.generation)
+            {
+                return problem(409, "Conflict", "Граф изменился; вернитесь к кластерам");
+            }
+            let Some(mut document) = index.cluster_detail(id, offset) else {
+                return problem(404, "Not Found", "кластера с таким номером нет");
+            };
+            let ids: Vec<String> = document["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_str().unwrap().to_owned())
+                .collect();
+            match crate::graph_view::selected_document(
+                &server.database,
+                &server.space,
+                500,
+                Some(&ids),
+            ) {
+                Ok(graph) => {
+                    document["graph"] = graph;
+                    json_response(200, "OK", &document)
+                }
+                Err(error) => problem(500, "Internal Server Error", &error.to_string()),
+            }
+        }
+        ("GET", "/api/node") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            let params = crate::explore::parse_query(&request.query);
+            let Some(id) = params.get("id").cloned() else {
+                return problem(400, "Bad Request", "нужен параметр id");
+            };
+            match crate::graph_view::node_document(&server.database, &server.space, &id) {
+                Ok(Some(document)) => json_response(200, "OK", &document),
+                Ok(None) => problem(404, "Not Found", "узла с таким id в этом пространстве нет"),
+                Err(error) => json_response(
+                    200,
+                    "OK",
+                    &json!({"available": false, "error": error.to_string()}),
+                ),
+            }
+        }
+        ("GET", "/api/search") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            let params = crate::explore::parse_query(&request.query);
+            let Some(query) = params.get("q").cloned() else {
+                return problem(400, "Bad Request", "нужен параметр q");
+            };
+            if query.trim().is_empty() {
+                return problem(400, "Bad Request", "нужен непустой параметр q");
+            }
+            let limit = params
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(10);
+            match crate::graph_view::search_document(&server.database, &server.space, &query, limit)
+            {
+                Ok(results) => json_response(200, "OK", &results),
+                Err(error) => {
+                    json_response(200, "OK", &json!({"available": false, "error": error}))
+                }
             }
         }
         ("GET", "/api/graph") => {
@@ -948,6 +1098,123 @@ fn route(server: &Server, status: &StatusRequester, request: &Request) -> Respon
                 return problem(403, "Forbidden", "нет ключа окна настроек");
             }
             archive_backfill_action(server, &request.body)
+        }
+        // The settings-window panels (E6.4): agents connect/disconnect,
+        // archive privacy, coordinator state. Reads need the window key;
+        // changes additionally need an explicit same-origin Origin and a
+        // `confirm` in the body — nothing is written without both.
+        ("GET", "/api/agents") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            json_response(
+                200,
+                "OK",
+                &crate::installer::agents_document(&server.client_home, &server.brain_home),
+            )
+        }
+        ("GET", "/api/agents/preview") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            agents_preview_response(server, request)
+        }
+        ("POST", "/api/agents/apply") => {
+            let same_origin = request
+                .header("origin")
+                .is_some_and(|origin| server.accepts_origin(origin));
+            if !authorized || !same_origin {
+                return problem(
+                    403,
+                    "Forbidden",
+                    "нет ключа окна настроек или чужой источник",
+                );
+            }
+            agents_apply_response(server, &request.body)
+        }
+        ("GET", "/api/archive/privacy") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            json_response(
+                200,
+                "OK",
+                &crate::archive::privacy_document(&server.brain_home, &server.client_home),
+            )
+        }
+        ("POST", "/api/archive/privacy") => {
+            let same_origin = request
+                .header("origin")
+                .is_some_and(|origin| server.accepts_origin(origin));
+            if !authorized || !same_origin {
+                return problem(
+                    403,
+                    "Forbidden",
+                    "нет ключа окна настроек или чужой источник",
+                );
+            }
+            privacy_apply_response(server, &request.body)
+        }
+        ("GET", "/api/net/state") => {
+            if !authorized {
+                return problem(403, "Forbidden", "нет ключа окна настроек");
+            }
+            json_response(
+                200,
+                "OK",
+                &crate::net::window_state_document(&server.brain_home),
+            )
+        }
+        ("POST", "/api/team/toggle") => {
+            let same_origin = request
+                .header("origin")
+                .is_some_and(|origin| server.accepts_origin(origin));
+            if !authorized || !same_origin {
+                return problem(
+                    403,
+                    "Forbidden",
+                    "нет ключа окна настроек или чужой источник",
+                );
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Toggle {
+                space: String,
+                class: Option<String>,
+                field: Option<String>,
+                enabled: bool,
+            }
+            let Ok(args) = serde_json::from_slice::<Toggle>(&request.body) else {
+                return problem(400, "Bad Request", "неверная схема манифеста");
+            };
+            let state = crate::net::window_state_dir(&server.brain_home);
+            let result = if let Some(field) = args.field {
+                match args.class {
+                    Some(class) => crate::net::team::toggle_field_at(
+                        &state,
+                        &args.space,
+                        &class,
+                        &field,
+                        args.enabled,
+                    ),
+                    None => Err(brain_core::team::bad()),
+                }
+            } else {
+                crate::net::team::toggle_at(
+                    &state,
+                    &args.space,
+                    args.class.as_deref(),
+                    args.enabled,
+                )
+            };
+            match result {
+                Ok(value) => json_response(200, "OK", &value),
+                Err(_) => problem(
+                    403,
+                    "Forbidden",
+                    "манифест недоступен или изменение запрещено",
+                ),
+            }
         }
         ("GET", "/api/work/board") => {
             if !authorized {
@@ -1125,7 +1392,7 @@ fn archive_response(server: &Server, request: &Request) -> Response {
     };
     let text = |key: &str| params.get(key).filter(|value| !value.is_empty()).cloned();
     let result = match request.path.as_str() {
-        "/api/archive/status" => Ok(archive::status(&server.brain_home, &crate::user_home())),
+        "/api/archive/status" => Ok(archive::status(&server.brain_home, &server.client_home)),
         "/api/archive/search" => number("limit").and_then(|limit| {
             archive::search(
                 &server.brain_home,
@@ -1137,6 +1404,8 @@ fn archive_response(server: &Server, request: &Request) -> Response {
                     project_root: text("project_root"),
                     limit,
                     budget_tokens: number("budget_tokens")?,
+                    match_any: false,
+                    period: None,
                 },
             )
         }),
@@ -1166,6 +1435,137 @@ fn archive_response(server: &Server, request: &Request) -> Response {
 /// JSON object with `action` of `start` or `stop` and, for `start`, an integer
 /// `files_per_run` in 1..=20; any extra key or wrong type is refused before
 /// anything is written, so an invalid request never touches the config.
+/// GET /api/agents/preview?agent=id&action=connect|disconnect — the exact
+/// plan the corresponding CLI dry-run would show, with basename file headers.
+fn agents_preview_response(server: &Server, request: &Request) -> Response {
+    let params = crate::explore::parse_query(&request.query);
+    let agent = params.get("agent").map(String::as_str).unwrap_or_default();
+    let action = params.get("action").map(String::as_str).unwrap_or_default();
+    if agent.is_empty() || !matches!(action, "connect" | "disconnect") {
+        return problem(
+            400,
+            "Bad Request",
+            "нужны agent и action=connect|disconnect",
+        );
+    }
+    let home = server.client_home.clone();
+    let result = match action {
+        "connect" => crate::installer::install_preview_document(
+            &home,
+            &server.brain_home,
+            &server.binary,
+            agent,
+        ),
+        _ => crate::installer::disconnect_preview_document(&home, &server.brain_home, agent),
+    };
+    match result {
+        Ok(document) => json_response(200, "OK", &document),
+        Err(error) => problem(400, "Bad Request", &error.to_string()),
+    }
+}
+
+/// POST /api/agents/apply {agent, action, confirm, preview_revision} — runs the same install or
+/// uninstall code as the CLI for that one agent. Without `confirm: true`
+/// nothing runs at all.
+fn agents_apply_response(server: &Server, body: &[u8]) -> Response {
+    let payload: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return problem(400, "Bad Request", "тело должно быть JSON-объектом"),
+    };
+    if payload.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return problem(
+            400,
+            "Bad Request",
+            "подтверждение обязательно: подтвердите изменение в окне",
+        );
+    }
+    let Some(agent) = payload.get("agent").and_then(Value::as_str) else {
+        return problem(400, "Bad Request", "нужно имя агента (agent)");
+    };
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(action, "connect" | "disconnect") {
+        return problem(
+            400,
+            "Bad Request",
+            "action должен быть connect или disconnect",
+        );
+    }
+    // Unknown ids are refused before any filesystem work.
+    if !crate::installer::agent_id_known(agent) {
+        return problem(
+            400,
+            "Bad Request",
+            "неизвестный агент: агенты должны быть из списка окна",
+        );
+    }
+    let preview = match action {
+        "connect" => crate::installer::install_preview_document(
+            &server.client_home,
+            &server.brain_home,
+            &server.binary,
+            agent,
+        ),
+        _ => crate::installer::disconnect_preview_document(
+            &server.client_home,
+            &server.brain_home,
+            agent,
+        ),
+    };
+    let preview = match preview {
+        Ok(value) => value,
+        Err(error) => return problem(400, "Bad Request", &error.to_string()),
+    };
+    let Some(revision) = payload.get("preview_revision").and_then(Value::as_str) else {
+        return problem(400, "Bad Request", "сначала просмотрите план изменений");
+    };
+    if preview["revision"].as_str() != Some(revision) {
+        return problem(
+            409,
+            "Conflict",
+            "план изменился: просмотрите и подтвердите новый дифф",
+        );
+    }
+    let home = server.client_home.clone();
+    let result = match action {
+        "connect" => {
+            crate::installer::install_agent(&home, &server.brain_home, &server.binary, agent)
+        }
+        _ => crate::installer::uninstall_agent(&home, &server.brain_home, agent),
+    };
+    match result {
+        Ok(applied) => json_response(
+            200,
+            "OK",
+            &json!({"status": "ok", "agent": agent, "action": action, "changed_files": applied}),
+        ),
+        Err(error) => problem(400, "Bad Request", &error.to_string()),
+    }
+}
+
+/// POST /api/archive/privacy {confirm, enabled?, since_days?, clients?, roles?}
+/// — through the same set_enabled the `brain archive enable` CLI uses; fields
+/// left out keep their current values, invalid ones are refused whole.
+fn privacy_apply_response(server: &Server, body: &[u8]) -> Response {
+    let payload: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return problem(400, "Bad Request", "тело должно быть JSON-объектом"),
+    };
+    if payload.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return problem(
+            400,
+            "Bad Request",
+            "подтверждение обязательно: подтвердите изменение в окне",
+        );
+    }
+    match crate::archive::apply_privacy(&server.brain_home, &payload) {
+        Ok(document) => json_response(200, "OK", &document),
+        Err(error) => problem(400, "Bad Request", &error.to_string()),
+    }
+}
+
 fn archive_backfill_action(server: &Server, body: &[u8]) -> Response {
     let payload = match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(map)) => map,
@@ -1215,7 +1615,7 @@ fn apply(server: &Server, status: &StatusRequester, body: &[u8]) -> Response {
     if let Err(message) = candidate.validate() {
         return problem(400, "Bad Request", &message);
     }
-    if let Err(error) = settings::save(&server.brain_home, &candidate) {
+    if let Err(error) = crate::settings_history::save(&server.brain_home, &candidate, "window") {
         return problem(
             500,
             "Internal Server Error",
@@ -1237,6 +1637,17 @@ fn apply(server: &Server, status: &StatusRequester, body: &[u8]) -> Response {
     json_response(200, "OK", &document)
 }
 
+/// The window posts typed JSON; the shared parser takes text, so booleans
+/// and numbers become their plain text form first.
+fn json_value_as_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 /// Folds a submitted document into the stored one.
 ///
 /// A missing key keeps the stored value and an explicit null clears an
@@ -1256,6 +1667,20 @@ fn merge(current: &StoredSettings, payload: &Value) -> Result<StoredSettings, St
             .ok_or_else(|| "режим модели должен быть строкой".to_owned())?
             .parse::<EmbeddingMode>()
             .map_err(|_| "режим модели: ожидается always, on-demand или off".to_owned())?;
+    }
+    // The memory keys go through the one parser `brain config set` uses, so
+    // the window shows exactly the texts the CLI would print.
+    for key in [
+        "include_archive",
+        "session_start_notice",
+        "archive_min_age_minutes",
+        "session_start_brief",
+    ] {
+        if let Some(value) = payload.get(key) {
+            let raw = json_value_as_text(value)
+                .ok_or_else(|| format!("{key} must be a boolean or a whole number"))?;
+            settings::apply_memory_setting(&mut next, key, &raw)?;
+        }
     }
     if let Some(overrides) = payload.get("overrides") {
         if !overrides.is_object() {
@@ -1338,6 +1763,15 @@ fn state_document(server: &Server, status: &StatusRequester) -> Value {
         "profile": stored.profile().to_string(),
         "manual": stored.is_manual(),
         "embedding_mode": stored.embedding_mode.to_string(),
+        // The window edits the same fields `brain config set` writes; the page
+        // must see them from the same source the CLI reads.
+        "include_archive": stored.include_archive,
+        "archive_min_age_minutes": stored.archive_min_age_minutes,
+        "session_start_notice": stored.session_start_notice,
+        "backup_dir": stored.backup_dir,
+        "backup_keep": stored.backup_keep,
+        "backup_timer_enabled": stored.backup_timer_enabled,
+        "session_start_brief": stored.session_start_brief,
         "embedding_runtime_implemented": EMBEDDING_RUNTIME_IMPLEMENTED,
         "settings_warnings": loaded.warnings,
         "profiles": profiles,
@@ -1367,7 +1801,7 @@ fn state_document(server: &Server, status: &StatusRequester) -> Value {
         "work": work_document(server, &server.space),
         // The same read-only observations `brain doctor` prints: configured,
         // observed and imported are different claims and stay separate.
-        "capture": crate::doctor::document(&crate::user_home(), &server.brain_home, crate::now_unix_seconds()),
+        "capture": crate::doctor::document(&server.client_home, &server.brain_home, crate::now_unix_seconds()),
         "api_revision": API_REVISION,
     })
 }
@@ -1516,6 +1950,61 @@ fn find_marker(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// The cached whole-space clustering, rebuilt only when the database
+/// generation moves. The generation fingerprint is read on every request —
+/// SQLite commit version plus temporal boundaries — so a changed base refolds instead
+/// of serving yesterday's communities.
+fn cached_cluster_index(server: &Server) -> rusqlite::Result<Arc<crate::graph_view::ClusterIndex>> {
+    cached_cluster_index_with_clock(server, crate::now_unix_seconds)
+}
+
+fn cached_cluster_index_with_clock(
+    server: &Server,
+    clock: impl FnOnce() -> i64,
+) -> rusqlite::Result<Arc<crate::graph_view::ClusterIndex>> {
+    let mut cache = server
+        .clusters_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Sample once, after waiting for the cache lock. SQLite's transaction
+    // freezes the data, not time: the key and fold must share this instant,
+    // even if a scheduled boundary passes while either query is running.
+    let now = clock();
+    if cache.is_none() {
+        let connection = crate::graph_view::open_read_only(&server.database)?;
+        let transaction = connection.unchecked_transaction()?;
+        let generation = crate::graph_view::database_generation(&transaction, &server.space, now)?;
+        let index = Arc::new(crate::graph_view::cluster_index(
+            &transaction,
+            &server.space,
+            crate::graph_view::DEFAULT_LIMIT,
+            &generation,
+            now,
+        )?);
+        transaction.commit()?;
+        *cache = Some((connection, generation, Arc::clone(&index)));
+        return Ok(index);
+    }
+    let (connection, cached, index) = cache.as_mut().expect("cache initialized");
+    let transaction = connection.unchecked_transaction()?;
+    let generation = crate::graph_view::database_generation(&transaction, &server.space, now)?;
+    if *cached == generation {
+        return Ok(Arc::clone(index));
+    }
+    let rebuilt = Arc::new(crate::graph_view::cluster_index(
+        &transaction,
+        &server.space,
+        crate::graph_view::DEFAULT_LIMIT,
+        &generation,
+        now,
+    )?);
+    transaction.commit()?;
+    *cached = generation;
+    *index = Arc::clone(&rebuilt);
+    let index = rebuilt;
+    Ok(index)
+}
+
 fn json_response(status: u16, reason: &'static str, value: &Value) -> Response {
     Response {
         status,
@@ -1577,10 +2066,13 @@ mod tests {
         Server {
             space: "default".to_owned(),
             brain_home: PathBuf::from("/nonexistent-brain-home"),
+            client_home: PathBuf::from("/nonexistent-client-home"),
             database: PathBuf::from("/nonexistent-brain-home/brain.sqlite"),
             token: "0123456789abcdef".to_owned(),
             generation: "feedfacefeedfacefeedfacefeedface".to_owned(),
+            clusters_cache: Mutex::new(None),
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 41_234)),
+            binary: PathBuf::from("brain"),
         }
     }
 
@@ -1811,6 +2303,244 @@ mod tests {
     }
 
     #[test]
+    fn cached_clusters_follow_scheduled_visibility_without_a_write() {
+        let (_scratch, database) = crate::explore::tests::chain_database(3);
+        let mut live = server();
+        live.database = database;
+        // Fixture versions start at 1. Use a fixed clock, independent of CPU
+        // scheduling and the host clock. The old now+1 deadline could pass
+        // before even the first fold, making its three-node assertion flaky.
+        let boundary = 100;
+        let connection = rusqlite::Connection::open(&live.database).unwrap();
+        connection
+            .execute(
+                "UPDATE node_versions SET valid_to=?1 WHERE node_id='n2'",
+                [boundary],
+            )
+            .unwrap();
+        drop(connection);
+        let clock = std::cell::Cell::new(boundary - 1);
+        // Model a boundary passing immediately after the request samples time.
+        // Both the key and the fold must still describe boundary - 1.
+        let before = cached_cluster_index_with_clock(&live, || {
+            let now = clock.get();
+            clock.set(boundary);
+            now
+        })
+        .unwrap();
+        assert_eq!((before.total_nodes, before.total_edges), (3, 2));
+        let unchanged = cached_cluster_index_with_clock(&live, || boundary - 1).unwrap();
+        assert!(Arc::ptr_eq(&before, &unchanged));
+
+        // No database writes between these reads. valid_to is exclusive:
+        // exactly at the boundary, n2 and its incident edge disappear.
+        let after = cached_cluster_index_with_clock(&live, || clock.get()).unwrap();
+        assert_eq!((after.total_nodes, after.total_edges), (2, 1));
+        assert_ne!(before.generation, after.generation);
+        assert!(!Arc::ptr_eq(&before, &after));
+        let unchanged = cached_cluster_index_with_clock(&live, || boundary + 1).unwrap();
+        assert!(Arc::ptr_eq(&after, &unchanged));
+
+        // Wall clocks may also move backwards; this must invalidate the fold.
+        let rewound = cached_cluster_index_with_clock(&live, || boundary - 1).unwrap();
+        assert_eq!((rewound.total_nodes, rewound.total_edges), (3, 2));
+        assert_eq!(before.generation, rewound.generation);
+        assert!(!Arc::ptr_eq(&after, &rewound));
+    }
+
+    #[test]
+    fn cached_clusters_follow_every_temporal_boundary() {
+        for table in ["node_versions", "edge_versions"] {
+            for column in ["valid_from", "recorded_at", "valid_to", "superseded_at"] {
+                let (_scratch, database) = crate::explore::tests::chain_database(3);
+                let mut live = server();
+                live.database = database;
+                let (id_column, id) = if table == "node_versions" {
+                    ("node_id", "n2")
+                } else {
+                    ("edge_id", "e2")
+                };
+                let boundary = 100;
+                let connection = rusqlite::Connection::open(&live.database).unwrap();
+                connection
+                    .execute(
+                        &format!("UPDATE {table} SET {column}=?1 WHERE {id_column}=?2"),
+                        rusqlite::params![boundary, id],
+                    )
+                    .unwrap();
+                drop(connection);
+                let before = cached_cluster_index_with_clock(&live, || boundary - 1).unwrap();
+                let after = cached_cluster_index_with_clock(&live, || boundary).unwrap();
+                let visible = (3, 2);
+                let hidden = if table == "node_versions" {
+                    (2, 1)
+                } else {
+                    (3, 1)
+                };
+                let (expected_before, expected_after) =
+                    if matches!(column, "valid_from" | "recorded_at") {
+                        (hidden, visible)
+                    } else {
+                        (visible, hidden)
+                    };
+                assert_eq!(
+                    (before.total_nodes, before.total_edges),
+                    expected_before,
+                    "before {table}.{column}"
+                );
+                assert_eq!(
+                    (after.total_nodes, after.total_edges),
+                    expected_after,
+                    "at {table}.{column}"
+                );
+                assert_ne!(before.generation, after.generation, "{table}.{column}");
+            }
+        }
+    }
+
+    /// The cluster routes (E4.5) sit behind the same window key, fold the
+    /// whole space, expand one cluster by id, and refold when the base moves.
+    #[test]
+    fn the_cluster_routes_need_the_key_fold_everything_and_refold_on_change() {
+        let (_scratch, database) = crate::explore::tests::chain_database(8);
+        let mut live = server();
+        live.database = database;
+        let host = ("host", "127.0.0.1:41234");
+        let token = ("x-brain-token", "0123456789abcdef");
+        for path in [
+            "/brain-clusters.json",
+            "/graph/brain-clusters.json",
+            "/api/cluster?id=0",
+        ] {
+            assert_eq!(
+                route(&live, &status(), &request("GET", path, &[host])).status,
+                403,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/cluster", &[host, token])
+            )
+            .status,
+            400,
+            "a cluster expansion needs an id"
+        );
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/cluster?id=x", &[host, token])
+            )
+            .status,
+            400,
+            "the id must be a number"
+        );
+
+        let body = |path: &str| {
+            let response = route(&live, &status(), &request("GET", path, &[host, token]));
+            assert_eq!(response.status, 200, "{path}");
+            let document: Value = serde_json::from_slice(&response.body).unwrap();
+            document
+        };
+        let template = body("/brain-data.json?limit=1");
+        assert_eq!(template["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(template["stats"]["total_nodes"], 8);
+        let document = body("/brain-clusters.json");
+        assert_eq!(document["format"], "brain-clusters-v1");
+        let clusters = document["clusters"].as_array().unwrap();
+        let folded: u64 = clusters
+            .iter()
+            .map(|cluster| cluster["size"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            folded,
+            document["total_nodes"].as_u64().unwrap(),
+            "the fold covers the whole space"
+        );
+        assert_eq!(
+            clusters
+                .iter()
+                .map(|cluster| cluster["id"].as_u64().unwrap())
+                .sum::<u64>(),
+            (clusters.len() * (clusters.len() - 1) / 2) as u64,
+            "cluster ids are consecutive from zero"
+        );
+
+        let detail = body("/api/cluster?id=0");
+        assert_eq!(detail["format"], "brain-cluster-v1");
+        assert_eq!(detail["id"], 0);
+        assert!(!detail["nodes"].as_array().unwrap().is_empty());
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/cluster?id=99", &[host, token])
+            )
+            .status,
+            404
+        );
+
+        // The cache must notice the base moving: a new node refolds the space.
+        {
+            let connection = rusqlite::Connection::open(&live.database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO nodes(id, space_id, created_by_agent_id, created_in_session_id,
+                                       created_at, last_accessed, degree)
+                     VALUES ('n8', 'default', 't', 's', 1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO node_versions(node_id, space_id, revision, kind, label, body, source,
+                                               valid_from, recorded_at, agent_id, session_id)
+                     VALUES ('n8', 'default', 1, 'concept', 'latecomer', 'body', 'synthetic', 1, 1, 't', 's')",
+                    [],
+                )
+                .unwrap();
+        }
+        let refolded = body("/brain-clusters.json");
+        assert_eq!(
+            refolded["total_nodes"].as_u64().unwrap(),
+            folded + 1,
+            "the new node joined the fold"
+        );
+        let again = body("/brain-clusters.json");
+        assert_eq!(
+            refolded.to_string(),
+            again.to_string(),
+            "stable while the base is still"
+        );
+        let first = cached_cluster_index(&live).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &cached_cluster_index(&live).unwrap()),
+            "unchanged generation reuses the index"
+        );
+        let connection = rusqlite::Connection::open(&live.database).unwrap();
+        connection
+            .execute("UPDATE node_versions SET valid_to=2 WHERE node_id='n8'", [])
+            .unwrap();
+        let forgotten = body("/brain-clusters.json");
+        assert_ne!(
+            forgotten["generation"], again["generation"],
+            "in-place updates invalidate cache"
+        );
+        assert_eq!(forgotten["total_nodes"].as_u64().unwrap(), folded);
+        let stale = format!(
+            "/api/cluster?id=0&generation={}",
+            again["generation"].as_str().unwrap()
+        );
+        assert_eq!(
+            route(&live, &status(), &request("GET", &stale, &[host, token])).status,
+            409
+        );
+    }
+
+    #[test]
     fn the_drawn_graph_api_needs_the_token_and_links_need_the_origin_too() {
         let (_scratch, database) = crate::explore::tests::chain_database(8);
         let mut live = server();
@@ -1975,6 +2705,9 @@ mod tests {
         let body: Value = serde_json::from_slice(&saved.body).unwrap();
         assert_eq!(body["saved"], true);
         assert_eq!(body["profile"], "fast");
+        let audit = crate::settings_history::history(&live.brain_home, 1).unwrap();
+        let audit = serde_json::to_value(audit).unwrap();
+        assert_eq!(audit[0]["source"], "window");
         let stored = settings::load(&live.brain_home);
         assert_eq!(stored.embedding_mode.to_string(), "off");
         assert_eq!(stored.overrides.graph_hops, Some(1));
@@ -1997,6 +2730,77 @@ mod tests {
         assert_eq!(
             std::fs::read(settings::settings_path(&live.brain_home)).unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn memory_controls_round_trip_through_the_same_files_as_the_cli() {
+        let (scratch, _) = crate::explore::tests::chain_database(1);
+        let mut live = server();
+        live.brain_home = scratch.0.clone();
+        let headers = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+            ("origin", "http://127.0.0.1:41234"),
+        ];
+
+        // The page loads the values from the same reader the CLI uses.
+        let state = route(&live, &status(), &request("GET", "/api/state", &headers));
+        assert_eq!(state.status, 200);
+        let body: Value = serde_json::from_slice(&state.body).unwrap();
+        assert_eq!(body["include_archive"], true);
+        assert_eq!(body["archive_min_age_minutes"], 120);
+        assert_eq!(body["session_start_notice"], true);
+
+        // Saving changes settings.json through the same validation as config set.
+        let mut good = request("POST", "/api/settings", &headers);
+        good.body = br#"{"include_archive":false,"archive_min_age_minutes":45,"session_start_notice":false}"#
+            .to_vec();
+        let saved = route(&live, &status(), &good);
+        assert_eq!(saved.status, 200);
+        let stored = settings::load(&live.brain_home);
+        assert!(!stored.include_archive);
+        assert_eq!(stored.archive_min_age_minutes, 45);
+        assert!(!stored.session_start_notice);
+        let before = std::fs::read(settings::settings_path(&live.brain_home)).unwrap();
+
+        // Bad input is refused whole; other settings stay exactly as they were.
+        for payload in [
+            &br#"{"include_archive":"nope"}"#[..],
+            br#"{"archive_min_age_minutes":-5}"#,
+            br#"{"archive_min_age_minutes":"soon"}"#,
+            br#"{"archive_min_age_minutes":99999999999}"#,
+            br#"{"session_start_notice":1}"#,
+        ] {
+            let mut bad = request("POST", "/api/settings", &headers);
+            bad.body = payload.to_vec();
+            assert_eq!(
+                route(&live, &status(), &bad).status,
+                400,
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+        assert_eq!(
+            std::fs::read(settings::settings_path(&live.brain_home)).unwrap(),
+            before
+        );
+        assert_eq!(settings::load(&live.brain_home).archive_min_age_minutes, 45);
+
+        // The backfill switch rides the same commands as the CLI and writes
+        // the config the collector reads.
+        let mut start = request("POST", "/api/archive/backfill", &headers);
+        start.body = br#"{"action":"start","files_per_run":3}"#.to_vec();
+        assert_eq!(route(&live, &status(), &start).status, 200);
+        let running = crate::archive::backfill_status(&live.brain_home);
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["files_per_run"], 3);
+        let mut stop = request("POST", "/api/archive/backfill", &headers);
+        stop.body = br#"{"action":"stop"}"#.to_vec();
+        assert_eq!(route(&live, &status(), &stop).status, 200);
+        assert_eq!(
+            crate::archive::backfill_status(&live.brain_home)["state"],
+            "stopped"
         );
     }
 
@@ -2122,7 +2926,7 @@ mod tests {
             "not_configured"
         );
 
-        let home = std::env::temp_dir().join(format!("brain-ui-work-{}", std::process::id()));
+        let home = crate::test_support::temp_path("brain-ui-work");
         let _ = std::fs::remove_dir_all(&home);
         let db = brain_core::coordination::database_path(&home);
         let actor = brain_core::coordination::Actor::new("default", "codex", "m-aaa").unwrap();
@@ -2179,7 +2983,10 @@ mod tests {
         let work = html
             .split("const WORK_STATES")
             .nth(1)
-            .expect("work renderer");
+            .expect("work renderer")
+            .split("// ---- panels:")
+            .next()
+            .expect("end of work renderer");
         assert!(
             !work.contains("innerHTML"),
             "workboard must use textContent"
@@ -2190,6 +2997,78 @@ mod tests {
     fn tokens_of_different_length_never_match() {
         assert!(!tokens_match("abc", "abcd"));
         assert!(tokens_match("abcd", "abcd"));
+    }
+
+    #[test]
+    fn the_ui_archive_search_route_keeps_strict_and_semantics() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::test_support::temp_path("brain-ui-strict");
+        let _ = std::fs::remove_dir_all(&home);
+        let directory = home.join(".brain/archive");
+        std::fs::create_dir_all(&directory).expect("dir");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod dir");
+        let database = directory.join("sessions.sqlite");
+        let connection = rusqlite::Connection::open(&database).expect("open");
+        connection.execute_batch(
+            "CREATE TABLE archive_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO archive_meta VALUES ('schema', 'brain_session_archive:2');
+             CREATE TABLE sources(id INTEGER PRIMARY KEY, client TEXT, path_sha256 TEXT);
+             INSERT INTO sources VALUES (1, 'codex', 'synthetic');
+             CREATE TABLE entries(id INTEGER PRIMARY KEY, source_id INTEGER, session_id TEXT, role TEXT,
+                 locator TEXT, source_offset INTEGER, ts TEXT, content TEXT, content_sha256 TEXT,
+                 evidence_sha256 TEXT, record_sha256 TEXT, imported_at TEXT);
+             CREATE VIRTUAL TABLE entries_fts USING fts5(content, content='entries', content_rowid='id');
+             CREATE TABLE quarantine(entry_id INTEGER, reason TEXT, released_at TEXT);",
+        )
+        .expect("schema");
+        for (index, text) in ["alpha", "beta", "alpha beta"].iter().enumerate() {
+            let id = index as i64 + 1;
+            connection
+                .execute(
+                    "INSERT INTO entries VALUES (?1,1,'session-a','assistant','synthetic',0,'2026-01-01T00:00:00Z',?2,'synthetic','synthetic','synthetic','2026-01-01T00:00:01Z')",
+                    rusqlite::params![id, text],
+                )
+                .expect("entry");
+            connection
+                .execute(
+                    "INSERT INTO entries_fts(rowid,content) VALUES (?1,?2)",
+                    rusqlite::params![id, text],
+                )
+                .expect("fts");
+        }
+        drop(connection);
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod db");
+        std::fs::write(directory.join("collector.json"), r#"{"enabled":true}"#).expect("collector");
+        std::fs::set_permissions(
+            directory.join("collector.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod collector");
+
+        let mut live = server();
+        live.brain_home = home.join(".brain");
+        let headers = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+        ];
+        let response = route(
+            &live,
+            &status(),
+            &request("GET", "/api/archive/search?q=alpha%20beta", &headers),
+        );
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: Value = serde_json::from_slice(&response.body).expect("json");
+        let hits = body["results"].as_array().expect("results");
+        assert_eq!(hits.len(), 1, "the UI route must keep strict AND: {body}");
+        assert_eq!(hits[0]["excerpt"], "alpha beta");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2222,9 +3101,717 @@ mod tests {
     }
 
     #[test]
+    fn the_ported_viewer_page_and_its_assets_serve_with_their_invariants() {
+        let host = [("host", "127.0.0.1:41234")];
+        let page = route(&server(), &status(), &request("GET", "/graph/brain", &host));
+        assert_eq!(page.status, 200);
+        let body = String::from_utf8(page.body).expect("utf-8 page");
+        assert!(
+            body.contains("<title>New Generation Brain</title>"),
+            "title"
+        );
+        // Offline and self-contained: no external URL anywhere on the page.
+        assert!(!body.contains("http://") && !body.contains("https://"));
+        // The token wrapper (task T2) stamps the window key and attaches it.
+        assert!(body.contains("brain-ui-token"));
+        assert!(body.contains("X-Brain-Token"));
+        for path in [
+            "/brain-viewer/app.js",
+            "/brain-viewer/style.css",
+            "/vendor/three.min.js",
+            "/graph/brain-data.json",
+        ] {
+            let unauthorized = route(&server(), &status(), &request("GET", path, &host));
+            if path.ends_with(".json") {
+                assert_eq!(unauthorized.status, 403, "{path}");
+            } else {
+                assert_eq!(unauthorized.status, 200, "{path}");
+            }
+        }
+        // The vendored three.js stays r124 and nothing pulls EffectComposer in.
+        assert!(VIEWER_THREE.contains("REVISION=\"124\""));
+        assert!(!VIEWER_APP.contains("new EffectComposer"));
+        assert!(!VIEWER_APP.contains("UnrealBloomPass"));
+        // No external URL inside the ported script either.
+        assert!(!VIEWER_APP.contains("http://"));
+        assert!(!VIEWER_APP.contains("https://"));
+    }
+
+    fn viewer_get(database: &std::path::Path, path: &str) -> Response {
+        let mut live = server();
+        live.database = database.to_owned();
+        route(
+            &live,
+            &status(),
+            &request(
+                "GET",
+                path,
+                &[
+                    ("host", "127.0.0.1:41234"),
+                    ("x-brain-token", "0123456789abcdef"),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn viewer_search_get_preserves_access_and_salience() {
+        let (_scratch, database) = crate::explore::tests::chain_database(11);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE nodes SET salience = 0.25", [])
+            .unwrap();
+        let snapshot = || {
+            connection
+                .prepare("SELECT id, access_count, salience, last_accessed FROM nodes ORDER BY id")
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = snapshot();
+        for _ in 0..2 {
+            let response = viewer_get(&database, "/api/search?q=zebra");
+            assert_eq!(response.status, 200);
+            let value: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(value[0]["id"], "n10", "{value}");
+        }
+        assert_eq!(snapshot(), before, "GET must never heat memories");
+    }
+
+    #[test]
+    fn viewer_search_does_not_create_a_missing_database() {
+        let (_scratch, database) = crate::explore::tests::chain_database(1);
+        let missing = database.with_file_name("missing.sqlite");
+        viewer_get(&missing, "/api/search?q=zebra");
+        assert!(
+            !missing.exists(),
+            "a GET must not create or migrate storage"
+        );
+    }
+
+    #[test]
+    fn viewer_search_matches_an_incomplete_word() {
+        let (_scratch, database) = crate::explore::tests::chain_database(11);
+        let response = viewer_get(&database, "/api/search?q=zeb");
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value[0]["id"], "n10", "prefix search: {value}");
+    }
+
+    #[test]
+    fn viewer_search_rejects_blank_and_finds_prefixes() {
+        let (_scratch, database) = crate::explore::tests::chain_database(11);
+        for path in ["/api/search?q=", "/api/search?q=%20%20"] {
+            assert_eq!(viewer_get(&database, path).status, 400);
+        }
+        let response = viewer_get(&database, "/api/search?q=zeb");
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value[0]["id"], "n10", "prefix search: {value}");
+    }
+
+    #[test]
+    fn viewer_excludes_forgotten_and_future_versions() {
+        use brain_core::Storage;
+        let (_scratch, database) = crate::explore::tests::chain_database(11);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute("UPDATE node_versions SET metadata = '{\"brain_memory\":true}' WHERE node_id = 'n10'", []).unwrap();
+        let now = crate::now_unix_seconds();
+        let storage = SqliteStorage::open(&database).unwrap();
+        storage
+            .forget_memory("default", "n10", "t", "s", now, now)
+            .unwrap();
+        drop(storage);
+        connection
+            .execute(
+                "UPDATE node_versions SET valid_from = ?1 WHERE node_id = 'n9'",
+                [now + 3600],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE node_versions SET recorded_at = ?1 WHERE node_id = 'n8'",
+                [now + 3600],
+            )
+            .unwrap();
+        for id in ["n10", "n9", "n8"] {
+            assert_eq!(
+                viewer_get(&database, &format!("/api/node?id={id}")).status,
+                404,
+                "{id}"
+            );
+        }
+        for path in ["/brain-data.json", "/brain-details.json"] {
+            let value: Value = serde_json::from_slice(&viewer_get(&database, path).body).unwrap();
+            let rows = value["nodes"].as_array().unwrap();
+            assert_eq!(rows.len(), 8, "{path}");
+            assert!(
+                !String::from_utf8(viewer_get(&database, path).body)
+                    .unwrap()
+                    .contains("file10.rs")
+            );
+        }
+    }
+
+    #[test]
+    fn viewer_details_include_ids_and_stats_report_total_above_limit() {
+        let (_scratch, database) = crate::explore::tests::chain_database(4001);
+        let data: Value =
+            serde_json::from_slice(&viewer_get(&database, "/brain-data.json").body).unwrap();
+        assert_eq!(data["nodes"].as_array().unwrap().len(), 4000);
+        assert_eq!(data["stats"]["total_nodes"], 4001);
+        assert!(data["stats"]["note"].as_str().unwrap().contains("4001"));
+        let details: Value =
+            serde_json::from_slice(&viewer_get(&database, "/brain-details.json").body).unwrap();
+        let id_column = details["schema"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|v| v == "id")
+            .expect("detail id schema");
+        for (node, detail) in data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(details["nodes"].as_array().unwrap())
+        {
+            assert_eq!(detail[id_column], node[0]);
+        }
+    }
+
+    #[test]
+    fn viewer_details_node_and_search_serve_the_stored_graph() {
+        let (scratch, database) = crate::explore::tests::chain_database(11);
+        let mut live = server();
+        live.database = database.clone();
+        let host = ("host", "127.0.0.1:41234");
+        let token = ("x-brain-token", "0123456789abcdef");
+
+        // The memory text these routes carry stays behind the window key.
+        for path in [
+            "/brain-details.json",
+            "/api/node?id=n10",
+            "/api/search?q=body",
+        ] {
+            assert_eq!(
+                route(&live, &status(), &request("GET", path, &[host])).status,
+                403,
+                "{path}"
+            );
+        }
+
+        // Details line up with the data document, row by row.
+        let data: Value = serde_json::from_slice(
+            &route(
+                &live,
+                &status(),
+                &request("GET", "/brain-data.json", &[host, token]),
+            )
+            .body,
+        )
+        .unwrap();
+        let details: Value = serde_json::from_slice(
+            &route(
+                &live,
+                &status(),
+                &request("GET", "/graph/brain-details.json", &[host, token]),
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(details["format"], "brain-details-v1");
+        assert_eq!(
+            details["nodes"].as_array().unwrap().len(),
+            data["nodes"].as_array().unwrap().len()
+        );
+        let row = &details["nodes"][0].as_array().unwrap();
+        assert_eq!(row[0], "/home/someone/projects/alpha/file0.rs");
+        assert_eq!(row[4], "2023-11-14 22:13"); // last_accessed of node n0
+        assert_eq!(row[5].as_f64(), Some(0.0)); // newest node: same data clock
+        assert_eq!(row[7], 0);
+        assert_eq!(row[8], 11); // degree of the most connected node
+
+        // Search runs the same engine ask runs; the viewer gets ids and scores.
+        let search: Value = serde_json::from_slice(
+            &route(
+                &live,
+                &status(),
+                &request("GET", "/api/search?q=zebra", &[host, token]),
+            )
+            .body,
+        )
+        .unwrap();
+        let results = search.as_array().unwrap();
+        assert!(!results.is_empty(), "{search}");
+        assert_eq!(results[0]["id"], "n10");
+        assert_eq!(results[0]["type"], "memory");
+        assert!(results[0]["score"].as_f64().is_some());
+
+        // The node card reads the stored version of the found id.
+        let node: Value = serde_json::from_slice(
+            &route(
+                &live,
+                &status(),
+                &request("GET", "/api/node?id=n10", &[host, token]),
+            )
+            .body,
+        )
+        .unwrap();
+        assert_eq!(node["label"], "node number 10");
+        assert_eq!(node["text"], "the hidden zebra fact");
+        assert_eq!(node["type"], "memory");
+        assert_eq!(
+            node["source_file"],
+            "/home/someone/projects/alpha/file10.rs"
+        );
+        assert_eq!(node["tags"], json!([]));
+
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/node?id=absent", &[host, token]),
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/node", &[host, token])
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            route(
+                &live,
+                &status(),
+                &request("GET", "/api/search", &[host, token])
+            )
+            .status,
+            400
+        );
+        drop(scratch);
+    }
+
+    #[test]
+    fn the_viewer_stats_line_counts_what_the_database_holds() {
+        let (scratch, database) = crate::explore::tests::chain_database(9);
+        let mut live = server();
+        live.database = database.clone();
+        let headers = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+        ];
+        let response = route(
+            &live,
+            &status(),
+            &request("GET", "/brain-data.json", &headers),
+        );
+        let data: Value = serde_json::from_slice(&response.body).expect("json");
+        // The picture and its counters come from one query: the line the
+        // viewer shows cannot drift from the rows it drew.
+        assert_eq!(
+            data["stats"]["nodes"],
+            data["nodes"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            data["stats"]["links"],
+            data["links"].as_array().unwrap().len()
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open scratch database");
+        let stored_nodes: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM nodes WHERE space_id = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count nodes");
+        let stored_edges: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM edges WHERE space_id = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count edges");
+        drop(connection);
+        assert_eq!(data["stats"]["total_nodes"], stored_nodes);
+        assert_eq!(data["stats"]["total_edges"], stored_edges);
+        // The sample is said out loud, never passed off as the whole memory.
+        assert!(data["stats"]["note"].as_str().unwrap().contains("9"));
+        drop(scratch);
+    }
+
+    #[test]
+    fn memory_keys_survive_a_profile_save_and_refuse_garbage() {
+        let (scratch, _) = crate::explore::tests::chain_database(1);
+        let mut live = server();
+        live.brain_home = scratch.0.clone();
+        let headers = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+            ("origin", "http://127.0.0.1:41234"),
+        ];
+        let post = |body: &str| {
+            let mut request = request("POST", "/api/settings", &headers);
+            request.body = body.as_bytes().to_vec();
+            route(&live, &status(), &request)
+        };
+
+        // The keys were set through the same save `brain config set` uses.
+        let mut cli_written = settings::load(&live.brain_home);
+        cli_written.include_archive = false;
+        cli_written.archive_min_age_minutes = 45;
+        cli_written.session_start_notice = false;
+        settings::save(&live.brain_home, &cli_written).expect("save like the CLI");
+
+        // A profile-only save from the window must not smuggle them back.
+        assert_eq!(post(r#"{"profile":"fast"}"#).status, 200);
+        let after = settings::load(&live.brain_home);
+        assert!(
+            !after.include_archive,
+            "profile save touched include_archive"
+        );
+        assert_eq!(after.archive_min_age_minutes, 45);
+        assert!(!after.session_start_notice);
+
+        // Each key accepts its valid values, boundaries included.
+        for (body, expect) in [
+            (r#"{"include_archive":true}"#, true),
+            (r#"{"include_archive":false}"#, false),
+        ] {
+            assert_eq!(post(body).status, 200, "{body}");
+            assert_eq!(settings::load(&live.brain_home).include_archive, expect);
+        }
+        for (body, expect) in [
+            (r#"{"session_start_notice":true}"#, true),
+            (r#"{"session_start_notice":false}"#, false),
+        ] {
+            assert_eq!(post(body).status, 200, "{body}");
+            assert_eq!(
+                settings::load(&live.brain_home).session_start_notice,
+                expect
+            );
+        }
+        for (body, expect) in [
+            (r#"{"archive_min_age_minutes":0}"#, 0),
+            (r#"{"archive_min_age_minutes":4294967295}"#, u32::MAX),
+            (r#"{"archive_min_age_minutes":7}"#, 7),
+        ] {
+            assert_eq!(post(body).status, 200, "{body}");
+            assert_eq!(
+                settings::load(&live.brain_home).archive_min_age_minutes,
+                expect
+            );
+        }
+
+        // Garbage is refused whole and never rewrites the file.
+        let before = std::fs::read(settings::settings_path(&live.brain_home)).unwrap();
+        for body in [
+            r#"{"include_archive":"often"}"#,
+            r#"{"session_start_notice":7}"#,
+            r#"{"archive_min_age_minutes":-5}"#,
+            r#"{"archive_min_age_minutes":1.5}"#,
+            r#"{"archive_min_age_minutes":"soon"}"#,
+            r#"{"archive_min_age_minutes":4294967296}"#,
+            r#"{"archive_min_age_minutes":null}"#,
+            r#"{"include_archive":[true]}"#,
+        ] {
+            let response = post(body);
+            assert_eq!(response.status, 400, "{body}");
+            let message = String::from_utf8_lossy(&response.body).into_owned();
+            assert!(message.contains("must be"), "{body}: {message}");
+            assert_eq!(
+                std::fs::read(settings::settings_path(&live.brain_home)).unwrap(),
+                before,
+                "{body} rewrote the file"
+            );
+        }
+        drop(scratch);
+    }
+
+    #[test]
+    fn team_toggle_requires_key_origin_and_closed_schema() {
+        let mut live = server();
+        live.brain_home = crate::test_support::temp_path("team-ui-key");
+        let host = ("host", "127.0.0.1:41234");
+        let token = ("x-brain-token", "0123456789abcdef");
+        let origin = ("origin", "http://127.0.0.1:41234");
+        let post = |headers: &[(&str, &str)], body: &str| {
+            let mut r = request("POST", "/api/team/toggle", headers);
+            r.body = body.as_bytes().to_vec();
+            route(&live, &status(), &r)
+        };
+        let valid = r#"{"space":"team.p","class":null,"enabled":true}"#;
+        assert_eq!(post(&[host, origin], valid).status, 403);
+        assert_eq!(post(&[host, token], valid).status, 403);
+        assert_eq!(
+            post(&[host, token, ("origin", "http://evil.example")], valid).status,
+            403
+        );
+        assert!(!live.brain_home.exists());
+        assert_eq!(
+            post(
+                &[host, token, origin],
+                r#"{"space":"team.p","enabled":true,"root":"/untrusted"}"#
+            )
+            .status,
+            400
+        );
+        assert!(!live.brain_home.exists());
+    }
+
+    #[test]
+    fn panel_gets_require_the_window_key() {
+        let mut live = server();
+        live.brain_home = crate::test_support::temp_path("brain-ui-panels-key");
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+        for path in ["/api/agents", "/api/archive/privacy", "/api/net/state"] {
+            let response = route(
+                &live,
+                &status(),
+                &request("GET", path, &[("host", "127.0.0.1:41234")]),
+            );
+            assert_eq!(
+                response.status, 403,
+                "{path} without a key must be forbidden"
+            );
+        }
+        let good = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+        ];
+        let agents = route(&live, &status(), &request("GET", "/api/agents", &good));
+        assert_eq!(agents.status, 200);
+        let document: Value = serde_json::from_slice(&agents.body).expect("agents json");
+        let ids = document["agents"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .filter_map(|agent| agent["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["claude", "codex", "cursor", "opencode", "openclaw", "kimi"]
+        );
+        let net = route(&live, &status(), &request("GET", "/api/net/state", &good));
+        assert_eq!(net.status, 200);
+        let net_document: Value = serde_json::from_slice(&net.body).expect("net json");
+        // A nonexistent brain home reports honestly and leaks nothing.
+        assert_eq!(net_document["coordination_database"], json!(false));
+        assert_eq!(net_document["principals"], json!(null));
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+    }
+
+    #[test]
+    fn panel_posts_reject_missing_key_foreign_origin_and_missing_confirm() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut live = server();
+        live.brain_home = crate::test_support::temp_path("brain-ui-panels-post");
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+        std::fs::create_dir_all(live.brain_home.join("archive")).expect("archive dir");
+        std::fs::set_permissions(
+            live.brain_home.join("archive"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("chmod archive");
+        let post = |path: &str, headers: &[(&str, &str)], raw: &str| {
+            let mut request = request("POST", path, headers);
+            request.body = raw.as_bytes().to_vec();
+            route(&live, &status(), &request)
+        };
+        let host = ("host", "127.0.0.1:41234");
+        let token = ("x-brain-token", "0123456789abcdef");
+        let origin = ("origin", "http://127.0.0.1:41234");
+        let foreign = ("origin", "http://evil.example");
+        let body = r#"{"agent":"claude","action":"connect"}"#;
+        for path in ["/api/agents/apply", "/api/archive/privacy"] {
+            assert_eq!(
+                post(path, &[("host", "evil.example"), token, origin], body).status,
+                403,
+                "{path}"
+            );
+            // No key: forbidden, before the body is even looked at.
+            assert_eq!(post(path, &[host, origin], body).status, 403, "{path}");
+            // Key but a foreign Origin: forbidden.
+            assert_eq!(
+                post(path, &[host, token, foreign], body).status,
+                403,
+                "{path}"
+            );
+            // Key but no Origin at all: still forbidden for these actions.
+            assert_eq!(post(path, &[host, token], body).status, 403, "{path}");
+        }
+        // Without confirm nothing runs, with the right key and origin: the
+        // response names the confirmation, not a later filesystem failure.
+        let unconfirmed = post(
+            "/api/agents/apply",
+            &[host, token, origin],
+            r#"{"agent":"claude","action":"connect"}"#,
+        );
+        assert_eq!(unconfirmed.status, 400);
+        assert!(String::from_utf8_lossy(&unconfirmed.body).contains("подтверждение обязательно"));
+        let unconfirmed_privacy = post(
+            "/api/archive/privacy",
+            &[host, token, origin],
+            r#"{"enabled":true}"#,
+        );
+        assert_eq!(unconfirmed_privacy.status, 400);
+        assert!(
+            String::from_utf8_lossy(&unconfirmed_privacy.body)
+                .contains("подтверждение обязательно")
+        );
+        assert_eq!(
+            post(
+                "/api/archive/privacy",
+                &[host, token, origin],
+                r#"{"confirm":true,"roles":[]}"#
+            )
+            .status,
+            400,
+            "empty roles must be refused whole"
+        );
+        // Unknown agent is a bad request, never a filesystem attempt.
+        assert_eq!(
+            post(
+                "/api/agents/apply",
+                &[host, token, origin],
+                r#"{"agent":"stranger","action":"connect","confirm":true}"#
+            )
+            .status,
+            400
+        );
+        // A confirmed privacy change goes through the same set_enabled the
+        // CLI uses and lands in collector.json.
+        let applied = post(
+            "/api/archive/privacy",
+            &[host, token, origin],
+            r#"{"confirm":true,"enabled":true,"roles":["user","assistant"],"since_days":14}"#,
+        );
+        assert_eq!(
+            applied.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&applied.body)
+        );
+        let collector = std::fs::read_to_string(live.brain_home.join("archive/collector.json"))
+            .expect("collector.json written");
+        assert!(collector.contains("\"user\"",) || collector.contains("user"));
+        assert!(collector.contains("assistant"));
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+    }
+
+    #[test]
+    fn agent_routes_preview_confirm_reject_drift_and_restore_only_selected_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::temp_path("agent-route-roundtrip");
+        let mut live = server();
+        live.client_home = root.join("home");
+        live.brain_home = live.client_home.join(".brain");
+        live.binary = root.join("build/brain");
+        std::fs::create_dir_all(live.client_home.join(".cursor")).unwrap();
+        std::fs::create_dir_all(live.binary.parent().unwrap()).unwrap();
+        std::fs::write(&live.binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&live.binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let headers = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+            ("origin", "http://127.0.0.1:41234"),
+        ];
+        let config = live.client_home.join(".cursor/mcp_config.json");
+        let preview = |action: &str| {
+            let response = route(
+                &live,
+                &status(),
+                &request(
+                    "GET",
+                    &format!("/api/agents/preview?agent=cursor&action={action}"),
+                    &headers,
+                ),
+            );
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            serde_json::from_slice::<Value>(&response.body).unwrap()
+        };
+        let apply = |action: &str, confirm: bool, revision: &Value| {
+            let mut request = request("POST", "/api/agents/apply", &headers);
+            request.body = serde_json::to_vec(&json!({"agent":"cursor", "action":action,
+                "confirm":confirm, "preview_revision":revision}))
+            .unwrap();
+            route(&live, &status(), &request)
+        };
+        let plan = preview("connect");
+        assert!(!config.exists());
+        assert!(!live.brain_home.exists(), "preview creates no Brain home");
+        assert_eq!(apply("connect", false, &plan["revision"]).status, 400);
+        assert!(!config.exists());
+        std::fs::write(&config, b"{\"theme\":\"dark\"}\n").unwrap();
+        assert_eq!(apply("connect", true, &plan["revision"]).status, 409);
+        let fresh = preview("connect");
+        assert_eq!(apply("connect", true, &fresh["revision"]).status, 200);
+        let connected: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert!(connected.pointer("/mcpServers/brain").is_some());
+        let disconnect = preview("disconnect");
+        assert!(
+            disconnect["plans"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("mcpServers")
+        );
+        assert_eq!(
+            apply("disconnect", true, &disconnect["revision"]).status,
+            200
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), b"{\"theme\":\"dark\"}\n");
+        assert!(!live.brain_home.join("install-manifest.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agents_preview_rejects_unknown_agents_and_actions() {
+        let mut live = server();
+        live.brain_home = crate::test_support::temp_path("brain-ui-panels-preview");
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+        let good = [
+            ("host", "127.0.0.1:41234"),
+            ("x-brain-token", "0123456789abcdef"),
+        ];
+        for query in [
+            "?agent=stranger&action=connect",
+            "?agent=claude&action=delete",
+            "?agent=&action=connect",
+        ] {
+            let response = route(
+                &live,
+                &status(),
+                &request("GET", &format!("/api/agents/preview{query}"), &good),
+            );
+            assert_eq!(response.status, 400, "{query}");
+        }
+        let _ = std::fs::remove_dir_all(&live.brain_home);
+    }
+
+    #[test]
     fn archive_backfill_post_requires_token_and_origin_and_writes_only_via_start() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let home = std::env::temp_dir().join(format!("brain-ui-backfill-{}", std::process::id()));
+        let home = crate::test_support::temp_path("brain-ui-backfill");
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("archive")).expect("dir");
         std::fs::set_permissions(home.join("archive"), std::fs::Permissions::from_mode(0o700))
@@ -2303,8 +3890,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    fn map_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("brain-ui-map-{tag}-{}", std::process::id()));
+    fn map_home(_tag: &str) -> PathBuf {
+        let dir = crate::test_support::temp_path("brain-ui-map");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2686,14 +4273,7 @@ mod tests {
     #[test]
     fn a_stale_or_unprivate_owner_file_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
-        let home = std::env::temp_dir().join(format!(
-            "brain-ui-owner-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let home = crate::test_support::temp_path("brain-ui-owner");
         let live = Server {
             brain_home: home.clone(),
             token: "a".repeat(64),

@@ -1,3 +1,5 @@
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,14 +10,11 @@ use brain_core::embeddings::DEFAULT_MODEL2VEC_MODEL;
 use serde_json::{Value, json};
 
 fn isolated_home() -> PathBuf {
-    let nonce = SystemTime::now()
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-embedding-mode-process-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-embedding-mode-process");
     let brain_home = root.join(".brain");
     fs::create_dir_all(&brain_home).expect("create isolated Brain home");
     fs::write(

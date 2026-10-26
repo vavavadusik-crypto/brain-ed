@@ -1,182 +1,241 @@
 # Brain ED
 
-
 ![Brain-shaped project map on synthetic example data](docs/images/brain-map-synthetic.png)
 
 The image uses twelve synthetic projects. It illustrates the project map; it
 does not show a deployed fleet or complete conversation-history graph.
-[Русская версия](README.ru.md)
+[Русская версия](README.ru.md) · [Documentation](docs/README.md)
 
-**0.1.4 — early preview. Linux x86_64 only.** Use a matching prebuilt
-bundle when it is listed on the [release page](https://github.com/vavavadusik-crypto/brain-ed/releases);
-a bundle installs the version it was built from. Otherwise build from source.
-[Verification and limits](docs/release-0.1.4-verification.md).
+**Brain ED is a local-first memory and task coordinator for AI coding agents:
+your agents remember what happened, share a task board, and answer from your
+own history — everything stays on your machine.** Written in Rust on SQLite;
+the command and package are named `brain`.
 
+- **Durable memory with provenance.** Attributed, bi-temporal records, a code
+  graph, full-text and optional vector search — no more "what did we decide
+  last week".
+- **Team mode over end-to-end TLS.** Several machines publish typed facts
+  (errors, decisions, plans) to a coordinator and query each other; enroll →
+  join → publish is four commands, revoked with one.
+- **Honest boundaries.** Opt-in capture, masked secrets, explicit network
+  opt-ins, and limits stated in the documentation instead of hidden.
 
-Brain ED is a local-first personal memory and task-coordination engine for AI
-coding agents, written in Rust on SQLite. The command and package are named
-`brain`. No model weights, provider credentials or personal archives ship with
-the source.
+**0.2.0 — early preview. Linux x86_64 and aarch64 musl release targets**
+(including Android/Termux aarch64). See [verification limits](docs/VALIDATION.md).
+Binaries and `SHA256SUMS` are attached to each [release](https://github.com/vavavadusik-crypto/brain-ed/releases).
+macOS and Windows are planned, not supported yet — see the
+[portability map](docs/portability.md).
 
-## What it is
+## Quick start in 5 minutes
 
-- **Personal owner memory.** A single-user SQLite store (`~/.brain/brain.sqlite`)
-  with attributed, bi-temporal records, BM25 + exact-entity search, optional
-  vector search, and a code graph built from `brain index`.
-- **Memory graph and explorer.** `brain ui --page graph` opens a loopback-only
-  page over what is stored.
-- **Work map (`/map`).** A 2D/3D project map with an eight-region brain
-  overview. Only *Projects*, *Active work*, *Plans* and *Coordination* show
-  counts, and only for the page of projects actually loaded; the other regions
-  say "not here" and link to the graph or the archive. The regions are a way to
-  sort memory, not anatomy.
-- **Settings UI.** `brain ui` (default page) shows configuration, status and
-  agent activity.
-- **Tasks, claims and leases.** `brain work …` and the `work_*` MCP tools give
-  cooperating agents tasks, claims, fences and leases in
-  `~/.brain/coordination/coord.sqlite`. It does not intercept edits: an agent
-  that never asks is not stopped.
-- **Coordinator over TLS.** `brain net …` serves `brain-coord/1` over loopback
-  TLS with enrolled `0600` credentials; opt-in fact sharing (`brain net share`)
-  is default-deny per space.
-- **Conversation archive.** `brain archive …` keeps visible user/assistant text
-  from Claude Code, Codex and Hermes, with opt-in collection.
-- **MCP server.** `brain serve` runs a stdio JSON-RPC MCP server.
-- **Explicit client profiles.** `brain clients register` records a client home.
-  A registered Codex home can opt into MCP with `brain clients configure`;
-  registration alone does not connect or capture. See [client profiles](docs/client-profiles.md)
-  and [Codex MCP setup](docs/registered-codex-mcp.md).
+Needs Bash, curl and `sha256sum` (or `shasum`), Linux x86_64/aarch64.
+On Android, use Termux (`pkg install bash curl coreutils`); install into Termux's
+private HOME, not shared Android storage. This path needs no Rust or sudo.
+Five minutes is the target for the basic setup, excluding optional model downloads;
+it is not a measured promise for every network or device.
 
-## Capability limits (read before relying on it)
+Download `install.sh` from the same reviewed source tag or checkout as the release.
+Inspect the script before running it. From a checkout:
+
+<!-- quickstart:begin -->
+```sh
+git clone https://github.com/vavavadusik-crypto/brain-ed.git
+cd brain-ed
+bash ./install.sh --version 0.1.4 --dry-run
+bash ./install.sh --version 0.1.4
+export PATH="$HOME/.local/bin:$PATH"
+brain init --agents --dry-run       # inspect agent config changes first
+brain init --agents                # review, then confirm interactively
+# For explicit non-interactive approval after review: brain init --agents --yes
+brain remember "Build uses cargo --locked" --kind decision --tag demo
+brain --offline recall "cargo locked"  # find the memory just written
+brain ui
+```
+<!-- quickstart:end -->
+
+The installer downloads the matching static ELF and `SHA256SUMS` over HTTPS,
+checks the digest, then installs only `~/.local/bin/brain`. It never runs the
+downloaded binary. Checksums detect corrupted downloads; the manifest from the
+same release is not an independent signature. Installation does not configure
+agents, collect archives, start services or download models. `brain init --agents`
+is a separate confirmed step; client conflicts and supported integrations are
+listed by the preview before anything is written.
+
+## What it does
+
+- **Memory and search.** A single-user SQLite store (`~/.brain/brain.sqlite`)
+  with attributed, bi-temporal records (`brain remember`, `brain recall`),
+  BM25 + exact-entity search and optional vector search (`brain ask`), a code
+  graph from `brain index`, and per-source counts and freshness (`brain stats`).
+- **Agent session journal.** `brain archive …` keeps the visible conversation
+  text of Claude Code, Codex and Hermes (every Hermes profile) plus bounded,
+  secret-masked journal rows — tool calls, results, errors, visible reasoning.
+  Collection is opt-in and role-filtered; see [docs/journal.md](docs/journal.md)
+  and [docs/session-archive.md](docs/session-archive.md).
+- **Distillation.** `brain distill …` turns selected archived sessions into
+  attributed, versioned facts through a configured LLM (local llama.cpp, an
+  HTTPS gateway, or Claude Code/Codex subscription adapters — the latter have
+  no tools and a read-only sandbox respectively). Bounded batches, persisted
+  cursors, provider fallback, an optional timer. Verified walkthrough:
+  [docs/distill-guide.md](docs/distill-guide.md); data flow and limits:
+  [docs/distiller.md](docs/distiller.md).
+- **Task board.** `brain work …` and the `work_*` MCP tools give cooperating
+  agents tasks, claims, fences and leases in
+  `~/.brain/coordination/coord.sqlite`. It never intercepts edits: an agent
+  that never asks is not stopped. See [docs/coordination.md](docs/coordination.md).
+- **Team mode and demo.** `brain net init` → `net serve` → `net enroll` →
+  `net join` connects machines over TLS (LAN, VPN or a company relay) with `0600` credentials;
+  `brain team …` publishes opt-in typed facts per space and answers queries
+  across machines. Ten-minute walkthrough with verified output:
+  [docs/team-mode.md](docs/team-mode.md); one-command synthetic demo:
+  `tools/team-demo.sh` (see [docs/team-mode-facts.md](docs/team-mode-facts.md)).
+- **Settings window.** `brain ui` serves a loopback-only settings page (search
+  profile, memory knobs, agent connect/disconnect with a diff and explicit
+  confirmation, archive privacy, coordinator state) plus the memory graph
+  (`--page graph`) and the 3D viewer with energy-saving modes.
+  See [docs/graph-explorer.md](docs/graph-explorer.md).
+- **Backup.** `brain backup …` creates consistent snapshots (`0600`), lists,
+  prunes and atomically restores them; a daily timer is opt-in.
+  See [docs/backup.md](docs/backup.md).
+- **OpenTelemetry export.** `brain archive export` renders the journal as
+  OpenTelemetry GenAI JSON (sessions as traces, entries as spans, no network).
+  See [docs/otel-export.md](docs/otel-export.md) ([in English](docs/otel-export.en.md)).
+- **MCP server.** `brain serve` runs a stdio JSON-RPC MCP server; the tool
+  surface is the same one the agents use. See [docs/mcp-and-hooks.md](docs/mcp-and-hooks.md).
+
+## Connecting agents
+
+`brain init --agents --dry-run` previews every change; nothing is written
+without review and confirmation. Step-by-step guides per client (setup, checking, rollback):
+[Claude Code](docs/integrations/claude-code.en.md) · [Codex](docs/integrations/codex.en.md) ·
+[Cursor](docs/integrations/cursor.en.md) · [OpenCode](docs/integrations/opencode.en.md) ·
+[OpenClaw](docs/integrations/openclaw.en.md) · [Kimi Code](docs/integrations/kimi-code.en.md). Supported integrations:
+
+- **Claude Code** — user-scoped MCP registration, seven fast-path hooks, memory
+  instructions in `~/.claude/CLAUDE.md`;
+- **Codex** — MCP server and hooks in `~/.codex/config.toml` plus a hooks file
+  and memory instructions;
+- **Cursor** — MCP registration and memory rules (Cursor has no supported
+  global hook config);
+- **OpenCode** — MCP registration and memory instructions (plugins only);
+- **OpenClaw** — MCP registration;
+- **Kimi Code** — MCP registration (its hooks cannot add context).
+
+`brain clients register`/`configure` record a client home explicitly; a
+registered Codex home can opt into MCP. Registration alone does not connect or
+capture. See [docs/client-profiles.md](docs/client-profiles.md),
+[docs/registered-codex-mcp.md](docs/registered-codex-mcp.md) and
+[docs/mcp-and-hooks.md](docs/mcp-and-hooks.md).
+`brain doctor` reports the whole picture read-only (integrations, timers,
+providers, disk space).
+
+## Security and privacy, briefly
+
+- **Local first.** Everything lives under `~/.brain`; no telemetry, no model
+  weights, no credentials ship with the source.
+- **Secrets are masked on write** into the archive journal — pattern-based,
+  with a shared Python/Rust test corpus; masking **can miss** secrets, so treat
+  the archive as sensitive anyway.
+- **The network is always an explicit opt-in**: the coordinator serves loopback
+  TLS with enrolled credentials, LAN listening is experimental and separate,
+  fact sharing is default-deny per space, and distillation sends selected text
+  only to the provider you configured.
+- **Capability limits are stated**, not hidden: see the list below and
+  [docs/SECURITY.md](docs/SECURITY.md).
+
+### Capability limits (read before relying on it)
 
 - **Tested locally, not a fleet.** Coordination and sharing are tested with
-  local processes and loopback TLS. That is not evidence of a real distributed
+  local processes and on a three-machine stand (Linux laptop, ARM phone in
+  Termux, cloud VM) over a private overlay network. That is not evidence of a large
   fleet, LAN deployment or enterprise readiness. LAN listening exists only as
-  an experimental, TLS-only, explicit opt-in for one private IP
-  (`brain net serve --listen <IP> --allow-lan`, IP SAN = listen IP = client
-  `--server-name`, operator firewall required); see
-  `docs/network-transport.md`. It is not production-proven.
+  an experimental, TLS-only, explicit opt-in for one private IP; see
+  [docs/network-transport.md](docs/network-transport.md).
 - **Activity is agent-declared.** The activity view and "active work" show
   what agents reported through hooks and claims. Brain ED does not watch the
   screen, keystrokes or file system.
-- **Archive capture is partial.** For all three clients the collector stores
-  only visible, allowed message text after you enable it. Thinking/reasoning,
-  tool calls and tool output are dropped. It cannot guarantee a complete
-  history (missed rotations, deleted or out-of-window files, format changes).
-- **Archive is personal and global.** The archive belongs to the owner of the
-  account. It is **not** scoped by project and has **no** project ACL. Search
-  and read results are marked untrusted; retrieval treats archived text as data,
-  never as instructions.
-- **Map counts are partial.** Counts cover loaded projects and tasks only;
-  memory-record counts per region are not implemented.
-- **Security is engineered, not proven.** There are tests for the boundaries
-  below; there is no formal verification or external audit. See
-  [SECURITY.md](SECURITY.md) and [docs/SECURITY.md](docs/SECURITY.md).
-
-## Install on Linux x86_64
-
-There are two ways in. Both install the same two launchers — **Brain ED
-Settings** and **Brain ED Graph** — in the application menu, and also on the
-desktop when an XDG desktop directory exists.
-
-1. **From source (works today).** Needs Rust and a C compiler; see
-   [Install from source](#install-from-source-linux) below.
-2. **Prebuilt bundle (only if the release you use lists one).** Check that
-   release on the repository's GitHub *Releases* page. If it lists an asset
-   named `brain-ed-<version>-linux-x86_64.tar.gz`, you can use it; if not,
-   build from source. A bundle needs no Rust or compiler:
-
-   ```console
-   tar -xzf brain-ed-<version>-linux-x86_64.tar.gz
-   cd brain-ed-<version>-linux-x86_64
-   ./install-linux.sh --dry-run    # checks the bundle, writes nothing
-   ./install-linux.sh              # checks again, then installs for this user
-   ./install-linux.sh --uninstall  # launchers out; ~/.brain data kept
-   ```
-
-   The bundle's binary is linked dynamically against glibc. If it was built by
-   the manual workflow, it was built on Ubuntu 24.04 (glibc 2.39), and its
-   `MANIFEST.json` records the highest glibc symbol version it needs. Older
-   glibc and other distributions are **untested**, so portability is not
-   proven. Windows, macOS and non-x86_64 machines are not supported. The
-   bundle's `SHA256SUMS` and manifest come from the same download and are not
-   signed: they detect a damaged or partial download, but they do not
-   authenticate the bundle or prove who built it. Details:
-   [docs/linux-download.md](docs/linux-download.md).
-
-Neither path sets up agent integration, the archive collector, a network
-listener or a model download. Each stays a separate explicit step: for
-example, MCP setup for Claude Code, Codex or Cursor is
-`brain init --agents --dry-run`, then `--yes` after review (see
-[Connecting agents](docs/INSTALL.md#connecting-agents-claude-code-codex-cursor)).
-
-Maintainers: `.github/workflows/linux-bundle.yml` is a manual, build-only
-workflow. It is started by hand, has read-only repository access, uploads the
-bundle as a workflow artifact and publishes nothing. Its behaviour on GitHub,
-the bundle's ABI on other systems and any provenance are not verified by
-these docs.
+- **Archive capture is partial and masked, not safe.** The collector stores the
+  visible conversation text plus bounded (2 KB) journal rows, masked at write
+  time. System prompts, injected instructions, sidechains, hidden or encrypted
+  reasoning are never stored. A complete history is not guaranteed.
+- **Archive is personal and global.** It belongs to the account owner, is not
+  scoped by project and has no project ACL. Search results are marked untrusted.
+- **Security is engineered, not proven.** There are tests for the boundaries;
+  there is no formal verification or external audit. See
+  [SECURITY.md](SECURITY.md).
 
 ## Install from source (Linux)
 
-Prerequisites: a Rust toolchain via rustup (`rust-toolchain.toml` pins the
-exact version; the workspace uses edition 2024), a C compiler for the bundled
-SQLite, and `python3` only if you want the optional archive tools.
-
-```console
-git clone https://github.com/vavavadusik-crypto/brain-ed.git && cd brain-ed
-./install.sh --dry-run     # shows the plan; builds and writes nothing
-./install.sh               # cargo build --locked --release -p brain-cli + launchers
-./install.sh --uninstall   # removes launchers; keeps ~/.brain
-```
-
-Details, desktop-launcher behaviour and manual steps: [docs/INSTALL.md](docs/INSTALL.md).
-
-After installation, add the stable copy to this terminal session:
+Use pinned Rust from `rust-toolchain.toml`, C/C++ compilers and Cargo.lock:
 
 ```sh
-export PATH="$HOME/.brain/bin:$PATH"
+cargo build --locked --release -p brain-cli
+mkdir -p "$HOME/.local/bin"
+cp "${CARGO_TARGET_DIR:-target}/release/brain" "$HOME/.local/bin/brain"
 ```
+
+The previous source/desktop installer is retained as
+`packaging/install-source.sh --dry-run`, then `packaging/install-source.sh`.
+It installs the desktop copy in `~/.brain/bin`; see [source installation](docs/INSTALL.md).
+Old dynamic glibc bundles have a separate [bundle contract](docs/linux-download.md).
+Maintainers: [static release build instructions](docs/build-release.md).
+
+## Platforms
+
+- **Linux x86_64 and aarch64** — supported release targets (static musl).
+- **Android/Termux aarch64** — supported; install into Termux's private HOME.
+- **macOS and Windows** — planned, not supported. The full portability survey
+  (every Linux-specific place, the replacement APIs, effort and risk) is in
+  [docs/portability.md](docs/portability.md).
 
 ## Quick commands
 
 All examples use synthetic data. `brain --help` and `brain <command> --help`
-are authoritative.
+are authoritative; the generated reference is in
+[docs/cli-reference.md](docs/cli-reference.md).
 
 ```console
 brain init                                   # create/migrate ~/.brain/brain.sqlite
 brain remember "Build uses cargo --locked" --kind decision --tag build
 brain recall "cargo locked"                  # search records written with remember
 brain index ./example-project                # code graph
-brain ask "where is the config parser"       # code + memory search
-brain status                                 # counts, layers, size, freshness
-brain doctor                                 # integration/capture coverage, read-only
+brain ask "where is the config parser"       # code + memory + archive search
+brain stats                                  # per-source counts and freshness
+brain doctor                                 # integrations, timers, providers, disk
 brain ui                                     # settings page on 127.0.0.1
-brain ui --page graph                        # memory graph
 brain work board --ready                     # tasks ready to claim
-brain work whoami                            # agent + machine identity
 brain archive status                         # what the collector saw and stored
-brain archive search "example error" --limit 5
+brain archive search "example error" --limit 5 --role tool_error
+brain backup create                          # consistent snapshot
+brain distill run --dry-run                  # preview fact extraction
 brain init --agents --dry-run                # preview agent-config changes
-brain uninstall --dry-run                    # preview removal of agent integrations
-brain model install                          # optional: explicit embedding download
 ```
 
 ## Documentation
 
 - [docs/VALIDATION.md](docs/VALIDATION.md) — release checks and verification limits
-- [docs/release-0.1.4-verification.md](docs/release-0.1.4-verification.md) — 0.1.4 source checks as reported, and their limits
 - [docs/INSTALL.md](docs/INSTALL.md) — install, launchers, uninstall
-- [docs/linux-download.md](docs/linux-download.md) — Linux x86_64 bundle format, checks and limits
 - [docs/SECURITY.md](docs/SECURITY.md) — threat model and data boundaries
+- [docs/cli-reference.md](docs/cli-reference.md) — every command and option, generated from `--help`
 - [docs/coordination.md](docs/coordination.md), [docs/network-transport.md](docs/network-transport.md),
-  [docs/shared-memory.md](docs/shared-memory.md) — coordination, TLS, sharing
-- [docs/session-archive.md](docs/session-archive.md) — archive
-- [docs/memory-map.md](docs/memory-map.md) — work map
+  [docs/team-mode.md](docs/team-mode.md), [docs/team-mode-facts.md](docs/team-mode-facts.md),
+  [docs/shared-memory.md](docs/shared-memory.md) — coordination, TLS, team mode, sharing
+- [docs/session-archive.md](docs/session-archive.md), [docs/journal.md](docs/journal.md),
+  [docs/otel-export.md](docs/otel-export.md) — archive, journal, OTel export
+- [docs/distill-guide.md](docs/distill-guide.md), [docs/distiller.md](docs/distiller.md) — distillation
+- [docs/backup.md](docs/backup.md) — backup and restore
+- [docs/portability.md](docs/portability.md) — macOS/Windows portability map
+- [docs/memory-map.md](docs/memory-map.md), [docs/graph-explorer.md](docs/graph-explorer.md) — work map and graph pages
 - [CHANGELOG.md](CHANGELOG.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
-## Licence
+## Licence and contributing
 
 Apache-2.0 (see [LICENSE](LICENSE)). Third-party components keep their own
-licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributions
+are welcome: read [CONTRIBUTING.md](CONTRIBUTING.md) and
+[docs/VALIDATION.md](docs/VALIDATION.md) first — every user-visible change is
+expected to come with tests that fail without it.
 
 [Memory brain explorer: controls, regions and limits](docs/graph-explorer.md) · [Experimental remote MCP reads](docs/remote-mcp.md)
+
+[Development roadmap](ROADMAP.md)

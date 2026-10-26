@@ -22,14 +22,21 @@ use brain_core::{NewNode, NodeKind};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
+use archive_rank::{ArchiveRanking, fuse_conversations};
+
 mod activity;
 mod archive;
+mod archive_rank;
 mod background;
+mod backup;
 mod brief;
+mod bundle;
 mod client_home;
 mod client_integration;
 mod client_registry;
 mod desktop;
+mod distill;
+mod distill_schedule;
 mod doctor;
 mod embedding_runtime;
 mod explore;
@@ -37,17 +44,27 @@ mod graph_view;
 mod hook;
 mod import;
 mod installer;
+mod llm;
+mod llm_command;
+mod maintenance;
+
 mod map;
 mod mcp;
 mod net;
+mod otel_export;
 mod private_fs;
+mod redact;
 mod reindex;
 mod remote_mcp;
 mod settings;
+mod settings_history;
+mod stats;
+#[cfg(test)]
+mod test_support;
 mod ui;
+mod when_phrase;
 mod work;
 
-const DEFAULT_BUDGET_TOKENS: usize = 600;
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_MEMORY_SCAN: usize = 1_000_000;
 
@@ -109,7 +126,7 @@ enum Command {
     /// Store an attributed, bi-temporal memory record.
     Remember(RememberArgs),
 
-    /// Search code and memory with BM25, exact entities, and optional vectors.
+    /// Search code, memory, and the private conversation archive.
     Ask(SearchArgs),
 
     /// Search only records written through the memory command.
@@ -170,8 +187,65 @@ enum Command {
         action: ConfigAction,
     },
 
+    /// Inspect settings history or restore only search profile/overrides.
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+
     /// Report database counts, salience layers, size, and freshness.
     Status,
+
+    /// Consistent snapshots of the brain with rotation and restore.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+
+    /// One-off repairs over the stored database.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
+
+    /// Plug-in LLM providers (compute nodes).
+    Llm {
+        #[command(subcommand)]
+        command: LlmCommand,
+    },
+
+    /// Distill durable decisions and errors from archived sessions.
+    Distill {
+        #[command(subcommand)]
+        command: DistillCommand,
+    },
+
+    /// What the brain holds per source (Graphify, Markdown folders, agent
+    /// memory, conversation archive) and how fresh each source is.
+    Stats,
+
+    /// Graphify: search the code/knowledge graph (runs `graphify query`).
+    Query {
+        /// Words to look for.
+        question: String,
+        /// Extra arguments passed to graphify unchanged.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+
+    /// Graphify: shortest path between two graph nodes (runs `graphify path`).
+    Path {
+        from: String,
+        to: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+
+    /// Graphify graph commands that share a name with a Brain command.
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
+    },
 
     /// Inspect integration and capture coverage without writing or starting services.
     Doctor,
@@ -183,6 +257,7 @@ enum Command {
     },
 
     /// Run the MCP server over newline-delimited stdio JSON-RPC.
+    #[command(visible_alias = "mcp")]
     Serve {
         /// Opt-in: an owner-only JSON file naming remote coordinators (absolute path).
         /// Adds five read-only remote_* tools; without it the tool list is unchanged.
@@ -209,10 +284,13 @@ enum Command {
         command: map::MapCommand,
     },
 
-    /// The coordinator over loopback TLS (brain-coord/1): serve, enroll, revoke, call.
-    ///
-    /// Loopback only; LAN binding is a separate deployment gate. Tokens live
-    /// in 0600 credential files or inherited descriptors, never in argv.
+    /// Publish and query opt-in, typed facts for a team.
+    Team {
+        #[command(subcommand)]
+        command: net::team::TeamCommand,
+    },
+
+    /// The coordinator over TLS: serve, enroll, revoke, call.
     Net {
         #[command(subcommand)]
         command: net::NetCommand,
@@ -269,11 +347,14 @@ enum Command {
         yes: bool,
     },
 
+    /// Internal: process pending background jobs (embedding queue).
     #[command(name = "__worker", hide = true)]
     Worker,
 
+    /// Internal: download one embedding model into the models directory.
     #[command(name = "__model-download", hide = true)]
     ModelDownload {
+        /// Model identifier to download (see `brain model list`).
         #[arg(long)]
         model_id: String,
     },
@@ -315,8 +396,17 @@ struct SearchArgs {
     query: String,
 
     /// Hard upper bound for persisted conservative token estimates.
-    #[arg(long, default_value_t = DEFAULT_BUDGET_TOKENS)]
-    budget_tokens: usize,
+    #[arg(long)]
+    budget_tokens: Option<usize>,
+
+    /// Skip the private conversation archive for this call.
+    #[arg(long)]
+    no_archive: bool,
+
+    /// Restrict archive hits to this role; repeatable. One of user, assistant,
+    /// tool_call, tool_result, tool_error, reasoning. Default: every role.
+    #[arg(long, value_name = "ROLE")]
+    archive_role: Vec<String>,
 
     /// Quality profile: fast, balanced, precise, or max.
     #[arg(long, value_name = "PROFILE")]
@@ -393,7 +483,8 @@ enum ArchiveCommand {
         #[arg(long)]
         client: Option<String>,
 
-        /// Only user or assistant messages.
+        /// Only this role: user, assistant, tool_call, tool_result, tool_error
+        /// or reasoning.
         #[arg(long)]
         role: Option<String>,
 
@@ -412,6 +503,29 @@ enum ArchiveCommand {
         /// Upper bound on the estimated tokens of the answer (500-4000).
         #[arg(long)]
         budget_tokens: Option<usize>,
+    },
+
+    /// Export the journal as OpenTelemetry GenAI JSON (no network).
+    Export {
+        /// Only this format is supported; the flag exists for future formats.
+        #[arg(long, value_parser = ["otlp-json"], default_value = "otlp-json")]
+        format: String,
+
+        /// Only this session id.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Only entries said at or after this UTC time (ISO-8601 or Unix seconds).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Only entries said before this UTC time (ISO-8601 or Unix seconds).
+        #[arg(long)]
+        until: Option<String>,
+
+        /// Export metadata without the (already masked) text content.
+        #[arg(long)]
+        no_content: bool,
     },
 
     /// Read one entry, a bounded slice at a time, with its provenance.
@@ -448,6 +562,9 @@ enum ArchiveCommand {
         /// current selection; a config that never had one reads all three.
         #[arg(long, value_delimiter = ',')]
         clients: Option<Vec<String>>,
+        /// Comma-separated roles to collect. Omitted keeps all roles.
+        #[arg(long, value_delimiter = ',')]
+        roles: Option<Vec<String>>,
     },
 
     /// Pause the collector; runs exit without reading any source.
@@ -473,6 +590,7 @@ enum BackfillCommand {
 
     /// Start or restart backfill, admitting up to N older files per run (1-20).
     Start {
+        /// How many older files per run may newly enter the archive (1-20).
         #[arg(long)]
         files_per_run: u64,
     },
@@ -511,14 +629,14 @@ enum MemoryCommand {
 }
 
 #[derive(Clone)]
-struct RuntimeConfig {
-    database: PathBuf,
-    models_dir: PathBuf,
-    space: String,
-    agent: String,
-    offline: bool,
+pub(crate) struct RuntimeConfig {
+    pub(crate) database: PathBuf,
+    pub(crate) models_dir: PathBuf,
+    pub(crate) space: String,
+    pub(crate) agent: String,
+    pub(crate) offline: bool,
     /// Host-configured share state directory; `None` reads no shared facts.
-    share_state_dir: Option<PathBuf>,
+    pub(crate) share_state_dir: Option<PathBuf>,
 }
 
 struct EmbedderLoad {
@@ -586,6 +704,182 @@ fn humanize(error: &dyn Error) -> String {
         return text;
     };
     format!("{hint} ({text})")
+}
+
+/// Plug-in LLM providers ("compute nodes").
+#[derive(Debug, Subcommand)]
+enum LlmCommand {
+    /// List configured providers in fallback order.
+    List,
+    /// Add a provider; the API key stays in an environment variable.
+    Add {
+        /// Provider name (referenced by llm test/remove).
+        name: String,
+        /// Base URL: https://… or http://127.0.0.1[:port].
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Model name as the provider expects it.
+        #[arg(long)]
+        model: Option<String>,
+        /// Built-in subscription CLI adapter (no shell).
+        #[arg(long, value_parser = ["claude", "codex"], conflicts_with_all = ["base_url", "api_key_env"])]
+        command: Option<String>,
+        /// Reasoning effort for the adapter (low, medium or high; requires --command).
+        #[arg(long, value_parser = ["low", "medium", "high"], requires = "command")]
+        effort: Option<String>,
+        /// Environment variable NAME holding the API key (never the key).
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Fallback order: lower is tried first (default 100).
+        #[arg(long)]
+        priority: Option<u32>,
+        /// Context window including output (HTTP default 16384; command default 128000).
+        #[arg(long)]
+        context_tokens: Option<u32>,
+        /// Request timeout for this provider (10..=3600 seconds; default 120).
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+    },
+    /// Remove a provider by name.
+    Remove { name: String },
+    /// Send a short fixed request and print availability/latency counters.
+    Test {
+        /// Provider name; omitted = all configured, in fallback order.
+        name: Option<String>,
+        /// Seconds until the request times out (default 20).
+        #[arg(long, default_value_t = 20)]
+        timeout_seconds: u64,
+        /// Print the response text (default: counters only).
+        #[arg(long)]
+        show: bool,
+    },
+}
+
+/// Distillation commands.
+#[derive(Debug, Subcommand)]
+enum DistillCommand {
+    /// Extract and persist facts from visible archive sessions.
+    Run {
+        /// Distill only this archive session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Skip sessions whose latest entry is older than this ISO date or Unix timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Comma-separated provider names to use (default: all configured, priority order).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Stop after this many sessions (1-1000, default 20).
+        #[arg(long, default_value_t = 20)]
+        max_sessions: usize,
+        /// Maximum whole sessions per provider request (bounded by actual payload size).
+        #[arg(long, default_value_t = 50)]
+        batch_sessions: usize,
+        /// Process sessions oldest first (default: newest first).
+        #[arg(long)]
+        oldest_first: bool,
+        /// Comma-separated archive roles to include (default user,assistant,tool_error).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "user,assistant,tool_error"
+        )]
+        roles: Vec<String>,
+        /// Count and plan without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Save archive-derived provider responses locally for debugging (private files).
+        #[arg(long)]
+        keep_raw: Option<PathBuf>,
+        /// Internal timer invocation: persist status and suppress progress output.
+        #[arg(long, hide = true, conflicts_with = "dry_run")]
+        scheduled: bool,
+        /// Local HH-HH window in which no provider is invoked (requires --scheduled).
+        #[arg(long, requires = "scheduled")]
+        quiet_hours: Option<String>,
+    },
+    /// Manage the opt-in systemd user timer.
+    Schedule {
+        #[command(subcommand)]
+        command: distill_schedule::ScheduleCommand,
+    },
+    /// Show distillation progress and active fact counts.
+    Status {
+        /// Comma-separated archive roles to include (default user,assistant,tool_error).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "user,assistant,tool_error"
+        )]
+        roles: Vec<String>,
+    },
+}
+/// Repairs under `brain backup`; each is safe to re-run.
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Take a consistent snapshot of brain.sqlite, the archive and settings.
+    Create {
+        /// Target directory (default: $BRAIN_HOME/backups).
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// List snapshot directories.
+    List {
+        /// Snapshot directory (default: $BRAIN_HOME/backups).
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// Keep only the newest N snapshot directories.
+    Prune {
+        /// Snapshot directory (default: $BRAIN_HOME/backups).
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// How many snapshots to keep (default 14, minimum 1).
+        #[arg(long, default_value_t = 14)]
+        keep: usize,
+    },
+    /// Replace the live files with a snapshot's contents.
+    Restore {
+        /// Path to a brain-YYYYMMDD-HHMMSS snapshot directory.
+        snapshot: PathBuf,
+        /// Apply; without this flag only the plan is shown.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Install or remove the daily backup timer (systemd user).
+    Timer {
+        #[arg(value_parser = ["install", "remove"])]
+        action: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCommand {
+    /// Mask secrets already stored in node_versions (history included).
+    Redact {
+        /// Rewrite the database; without this flag only counters are printed.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SettingsAction {
+    /// Print the recent settings changes (who, when, which keys).
+    History {
+        /// How many recent changes to show (1-10000, default 20).
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
+    },
+    /// Restore one settings revision (search profile and overrides only).
+    Revert {
+        /// Exact timestamp from `brain settings history` (Unix nanoseconds).
+        #[arg(long)]
+        to: String,
+        /// Apply the restore; without this flag only the plan is shown.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
@@ -676,7 +970,259 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }),
         },
         Command::Config { action } => command_config(action),
+        Command::Settings { action } => match action {
+            SettingsAction::History { limit } => print_json(&json!(settings_history::history(
+                &brain_home(),
+                limit as usize
+            )?)),
+            SettingsAction::Revert { to, yes } => {
+                settings_history::revert(&brain_home(), &to, yes)?;
+                print_json(
+                    &json!({"status": "ok", "reverted_to": to, "scope": "profile/overrides"}),
+                )
+            }
+        },
         Command::Status => command_status(&config),
+        Command::Stats => print_json(&stats::document(
+            &config.database,
+            &config.space,
+            &archive::status(&brain_home(), &user_home()),
+            now_unix_seconds(),
+        )?),
+        Command::Backup { command } => match command {
+            BackupCommand::Create { to } => print_json(&backup::create(&brain_home(), to)?),
+            BackupCommand::List { to } => print_json(&backup::list(&brain_home(), to)?),
+            BackupCommand::Prune { to, keep } => {
+                print_json(&backup::prune(&brain_home(), to, keep)?)
+            }
+            BackupCommand::Restore { snapshot, yes } => {
+                print_json(&backup::restore(&brain_home(), &snapshot, yes)?)
+            }
+            BackupCommand::Timer { action } => {
+                let install = action == "install";
+                let binary = stable_brain_binary()?;
+                let systemctl = |args: &[&str]| {
+                    std::process::Command::new("systemctl")
+                        .arg("--user")
+                        .args(args)
+                        .stdin(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                };
+                let (files, switched, reloaded) = if install {
+                    let files = backup::write_timer_units(&user_home(), &binary, true)?;
+                    let reloaded = systemctl(&["daemon-reload"]);
+                    (
+                        files,
+                        systemctl(&["enable", "--now", backup::TIMER_UNIT]),
+                        reloaded,
+                    )
+                } else {
+                    let switched = systemctl(&["disable", "--now", backup::TIMER_UNIT]);
+                    let files = backup::write_timer_units(&user_home(), &binary, false)?;
+                    (files, switched, systemctl(&["daemon-reload"]))
+                };
+                let stored = settings::load(&brain_home());
+                let mut stored = stored;
+                stored.backup_timer_enabled = install;
+                settings::save(&brain_home(), &stored)?;
+                print_json(&json!({
+                    "status": "ok",
+                    "action": action,
+                    "unit_files": files,
+                    "systemctl_switched": switched,
+                    "systemctl_reloaded": reloaded,
+                    "note": "systemd user units; the timer must be enabled by systemd",
+                }))?;
+                Ok(())
+            }
+        },
+        Command::Maintenance { command } => match command {
+            MaintenanceCommand::Redact { apply } => {
+                let document = maintenance::redact_document(&config.database, apply)?;
+                print_json(&document)?;
+                Ok(())
+            }
+        },
+        Command::Llm { command } => match command {
+            LlmCommand::List => {
+                let stored = settings::load(&brain_home());
+                print_json(&llm::list_document(&stored.llm_providers))?;
+                Ok(())
+            }
+            LlmCommand::Add {
+                command,
+                effort,
+                name,
+                base_url,
+                model,
+                api_key_env,
+                priority,
+                context_tokens,
+                timeout_seconds,
+            } => {
+                let mut fields: Vec<(String, String)> = vec![
+                    ("name".to_owned(), name),
+                    ("base_url".to_owned(), base_url.unwrap_or_default()),
+                    ("model".to_owned(), model.unwrap_or_default()),
+                ];
+                if let Some(command) = command {
+                    fields.push(("command".into(), command));
+                }
+                if let Some(effort) = effort {
+                    fields.push(("effort".into(), effort));
+                }
+                if let Some(api_key_env) = api_key_env {
+                    fields.push(("api_key_env".to_owned(), api_key_env));
+                }
+                if let Some(priority) = priority {
+                    fields.push(("priority".to_owned(), priority.to_string()));
+                }
+                if let Some(tokens) = context_tokens {
+                    fields.push(("context_tokens".into(), tokens.to_string()));
+                }
+                if let Some(seconds) = timeout_seconds {
+                    fields.push(("timeout_seconds".into(), seconds.to_string()));
+                }
+                let provider = llm::llm_provider_from_fields(&fields)?;
+                let mut stored = settings::load(&brain_home());
+                if stored
+                    .llm_providers
+                    .iter()
+                    .any(|existing| existing.name == provider.name)
+                {
+                    return Err(format!(
+                        "provider {:?} already exists; remove it first",
+                        provider.name
+                    )
+                    .into());
+                }
+                stored.llm_providers.push(provider);
+                settings::save(&brain_home(), &stored)?;
+                print_json(&json!({
+                    "status": "saved",
+                    "note": "the API key itself is never stored; only the environment variable name",
+                }))?;
+                Ok(())
+            }
+            LlmCommand::Remove { name } => {
+                let mut stored = settings::load(&brain_home());
+                let before = stored.llm_providers.len();
+                stored.llm_providers.retain(|p| p.name != name);
+                if stored.llm_providers.len() == before {
+                    return Err(format!("provider {name:?} is not configured").into());
+                }
+                settings::save(&brain_home(), &stored)?;
+                print_json(&json!({"status": "removed", "name": name}))?;
+                Ok(())
+            }
+            LlmCommand::Test {
+                name,
+                timeout_seconds,
+                show: _,
+            } => {
+                let stored = settings::load(&brain_home());
+                let mut providers: Vec<llm::LlmProvider> = stored
+                    .llm_providers
+                    .iter()
+                    .filter(|p| name.as_deref().is_none_or(|want| p.name == want))
+                    .cloned()
+                    .collect();
+                if name.is_some() && providers.is_empty() {
+                    return Err(format!("provider {name:?} is not configured").into());
+                }
+                providers.sort_by_key(|p| p.priority);
+                if providers.is_empty() {
+                    print_json(&json!({
+                        "status": "empty",
+                        "note": "no providers configured; use brain llm add",
+                    }))?;
+                    return Ok(());
+                }
+                let timeout = std::time::Duration::from_secs(timeout_seconds.max(1));
+                let prompt = r#"Reply with exactly this JSON and nothing else: {"ok": true}"#;
+                let schema = json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                });
+                let (attempts, winner) = llm::chat_with_fallback(
+                    &providers,
+                    prompt,
+                    64,
+                    0.0,
+                    Some(&schema),
+                    Some(timeout),
+                );
+                let attempts_json: Vec<Value> = attempts
+                    .iter()
+                    .map(|attempt| {
+                        json!({
+                            "provider": attempt.provider,
+                            "model": attempt.model,
+                            "ok": attempt.ok,
+                            "elapsed_ms": attempt.elapsed_ms,
+                            "tokens_per_second": attempt.tokens_per_second,
+                            "json_valid": attempt.json_valid,
+                            "error": attempt.error,
+                        })
+                    })
+                    .collect();
+                print_json(&json!({
+                    "status": if winner.is_some() { "ok" } else { "unavailable" },
+                    "attempts": attempts_json,
+                    "answered_by": winner.as_ref().map(|w| json!({
+                        "provider": w.provider,
+                        "model": w.model,
+                        "elapsed_ms": w.elapsed_ms,
+                        "tokens_per_second": w.tokens_per_second,
+                        "json_valid": w.json_valid,
+                    })),
+                    "note": "the response text is not printed unless --show; API keys are read from the environment and never printed",
+                }))?;
+                Ok(())
+            }
+        },
+        Command::Distill { command } => match command {
+            DistillCommand::Run {
+                session,
+                since,
+                provider,
+                max_sessions,
+                batch_sessions,
+                oldest_first,
+                roles,
+                dry_run,
+                keep_raw,
+                scheduled,
+                quiet_hours,
+            } => print_json(&distill_schedule::run(
+                &config,
+                distill::RunArgs {
+                    session,
+                    since,
+                    provider,
+                    max_sessions,
+                    batch_sessions,
+                    oldest_first,
+                    roles,
+                    dry_run,
+                    keep_raw,
+                    quiet: scheduled,
+                },
+                scheduled,
+                quiet_hours.as_deref(),
+            )?),
+            DistillCommand::Schedule { command } => {
+                print_json(&distill_schedule::command(&config, command)?)
+            }
+            DistillCommand::Status { roles } => print_json(&distill::status(&config, roles)?),
+        },
+        Command::Query { question, rest } => run_graphify("query", &[question], &rest),
+        Command::Path { from, to, rest } => run_graphify("path", &[from, to], &rest),
+        Command::Graph {
+            command: GraphCommand::Explain { node, rest },
+        } => run_graphify("explain", &[node], &rest),
         Command::Doctor => print_json(&doctor::document(
             &user_home(),
             &brain_home(),
@@ -693,6 +1239,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Work { command } => work::run(&config, command),
         Command::Map { command } => map::run(&config, command),
         Command::Net { command } => net::run(&config, command),
+        Command::Team { command } => net::team::run(&config, command),
         Command::Hook(args) => Ok(hook::run(&args, &brain_home())?),
         Command::Brief(args) => command_brief(&config, &args),
         Command::Model { command } => command_model(&config, command),
@@ -740,8 +1287,37 @@ fn command_archive(command: ArchiveCommand) -> Result<(), Box<dyn Error>> {
                 project_root,
                 limit,
                 budget_tokens,
+                match_any: false,
+                period: None,
             };
             print_json(&archive::search(&brain_home, &request)?)
+        }
+        ArchiveCommand::Export {
+            format,
+            session,
+            since,
+            until,
+            no_content,
+        } => {
+            if format != "otlp-json" {
+                return Err(format!("unsupported export format {format:?}; only otlp-json").into());
+            }
+            let since = since
+                .as_deref()
+                .map(crate::mcp::parse_iso8601_or_unix)
+                .transpose()?;
+            let until = until
+                .as_deref()
+                .map(crate::mcp::parse_iso8601_or_unix)
+                .transpose()?;
+            print_json(&otel_export::export_otlp_json(
+                &brain_home,
+                session.as_deref(),
+                since,
+                until,
+                no_content,
+            )?)?;
+            Ok(())
         }
         ArchiveCommand::Read {
             id,
@@ -784,14 +1360,16 @@ fn command_archive(command: ArchiveCommand) -> Result<(), Box<dyn Error>> {
         ArchiveCommand::Enable {
             since_days,
             clients,
+            roles,
         } => print_json(&archive::set_enabled(
             &brain_home,
             true,
             since_days,
             clients.as_deref(),
+            roles.as_deref(),
         )?),
         ArchiveCommand::Disable => {
-            print_json(&archive::set_enabled(&brain_home, false, None, None)?)
+            print_json(&archive::set_enabled(&brain_home, false, None, None, None)?)
         }
         ArchiveCommand::Backfill { action } => match action {
             BackfillCommand::Status => print_json(&archive::backfill_document(&brain_home)),
@@ -899,7 +1477,7 @@ fn command_model_install(
     #[cfg(not(feature = "model2vec"))]
     {
         let _ = (model_id, bytes, yes);
-        Err("embedding support was not compiled into this binary".into())
+        Err("embedding support was not compiled into this binary (build with the default features, not --no-default-features)".into())
     }
 
     #[cfg(feature = "model2vec")]
@@ -999,7 +1577,7 @@ fn command_model_download(config: &RuntimeConfig, model_id: &str) -> Result<(), 
 
 #[cfg(not(feature = "model2vec"))]
 fn command_model_download(_config: &RuntimeConfig, _model_id: &str) -> Result<(), Box<dyn Error>> {
-    Err("embedding support was not compiled into this binary".into())
+    Err("embedding support was not compiled into this binary (build with the default features, not --no-default-features)".into())
 }
 
 fn command_remember(config: &RuntimeConfig, args: RememberArgs) -> Result<(), Box<dyn Error>> {
@@ -1093,8 +1671,8 @@ fn command_search(
         None => (stored.profile(), stored.effective()),
     };
     // An explicit budget always wins over the profile default.
-    if args.budget_tokens != DEFAULT_BUDGET_TOKENS {
-        quality.budget_tokens = args.budget_tokens;
+    if let Some(budget) = args.budget_tokens {
+        quality.budget_tokens = budget;
     }
 
     // Loading the model costs about 2.5 seconds against 0.4 for the whole
@@ -1123,7 +1701,7 @@ fn command_search(
             (search.search_with(&query, &quality)?, loaded)
         }
     };
-    emit_warnings(&output.warnings);
+    let mut warnings = output.warnings.clone();
     let results = output
         .hits
         .iter()
@@ -1131,9 +1709,14 @@ fn command_search(
             let memory_kind = MemoryRecord::from_node(hit.node.clone())
                 .ok()
                 .map(|memory| memory.kind.to_string());
+            let metadata: Value = serde_json::from_str(&hit.node.metadata_json).unwrap_or_default();
+            let distilled_kind = metadata.get("distilled_fact").and_then(Value::as_bool)
+                .filter(|v| *v).and_then(|_| metadata.get("kind").and_then(Value::as_str));
             json!({
                 "id": hit.node.id,
-                "kind": memory_kind.unwrap_or_else(|| hit.node.kind.to_string()),
+                "type": distilled_kind,
+                "status": metadata.get("status"),
+                "kind": distilled_kind.map(str::to_owned).or(memory_kind).unwrap_or_else(|| hit.node.kind.to_string()),
                 "text": hit.node.body,
                 "source": hit.node.source,
                 "score": hit.score,
@@ -1150,7 +1733,59 @@ fn command_search(
             })
         })
         .collect::<Vec<_>>();
-    let hint = if results.is_empty() && loaded.as_dyn().is_none() {
+    let parsed = when_phrase::parse(&args.query, now);
+    let mut archive = if memory_only {
+        ArchiveSearch::default()
+    } else {
+        // The role restriction is the caller's own choice, unlike the hygiene
+        // filters inside search_conversations, so a typo is an error rather
+        // than a silent empty archive.
+        for role in &args.archive_role {
+            if !archive::ROLES.contains(&role.as_str()) {
+                return Err(format!(
+                    "--archive-role must be one of {}",
+                    archive::ROLES.join(", ")
+                )
+                .into());
+            }
+        }
+        let mut found = search_conversations(
+            &brain_home(),
+            &args.query,
+            stored.include_archive && !args.no_archive,
+            stored.archive_min_age_minutes,
+            // Asking the archive for the period itself: filtering 20 all-time
+            // candidates afterwards leaves one or two, chosen by other dates.
+            parsed.as_ref().map(|(period, _)| (period.from, period.to)),
+        );
+        if !args.archive_role.is_empty() {
+            found.results.retain(|hit| {
+                hit["role"]
+                    .as_str()
+                    .is_some_and(|role| args.archive_role.iter().any(|want| want.as_str() == role))
+            });
+        }
+        found
+    };
+    let (results, period_json, period_empty, period_hint) =
+        apply_question_period(&args.query, parsed.as_ref(), &mut archive, results);
+    warnings.extend(archive.warnings.iter().cloned());
+    let archive_included = archive.included;
+    let archive_filtered = json!({
+        "recent": archive.filtered_recent,
+        "self_reference": archive.filtered_self_reference,
+    });
+    let (results, used_tokens, archive_hits) = fuse_conversations(
+        results,
+        archive,
+        quality.budget_tokens,
+        usize::MAX,
+        ArchiveRanking::for_question(&args.query, parsed.is_some()),
+    );
+    emit_warnings(&warnings);
+    let hint = if let Some(hint) = period_hint {
+        Some(hint)
+    } else if results.is_empty() && loaded.as_dyn().is_none() {
         loaded.warning.clone().or_else(|| {
             Some("semantic search is unavailable; try broader BM25 or exact terms".to_owned())
         })
@@ -1166,14 +1801,243 @@ fn command_search(
         "budget_tokens": quality.budget_tokens,
         "profile": profile.to_string(),
         "candidates_per_signal": quality.candidates_per_signal,
-        "used_tokens": output.used_tokens,
+        "used_tokens": used_tokens,
+        "period": period_json,
+        "period_empty": period_empty,
+        "archive_included": archive_included,
+        "archive_hits": archive_hits,
+        "archive_filtered": archive_filtered,
         "token_estimator": "utf8-bytes-upper-bound",
         "vector_search": output.vector_search,
         "graph_reached": output.graph_reached,
-        "warnings": output.warnings,
+        "warnings": warnings,
         "hint": hint,
     }))?;
     Ok(())
+}
+
+/// Archive data stays outside Brain spaces and is always untrusted evidence.
+#[derive(Default)]
+struct ArchiveSearch {
+    results: Vec<Value>,
+    included: bool,
+    warnings: Vec<String>,
+    filtered_recent: usize,
+    filtered_self_reference: usize,
+}
+
+/// Drops archive hits that restate the question back at the asker.
+///
+/// The conversation an agent is having right now is collected within minutes
+/// and quotes the very `brain ask "…"` invocation that triggered the search,
+/// so without these gates its own messages outrank the weeks-old fact the
+/// question is about. `recent` counts hits younger than `min_age_minutes`
+/// (age by event time, falling back to when the collector observed the entry;
+/// an entry whose time cannot be read counts as brand new); `self_reference`
+/// counts hits quoting the search command itself, whatever their age.
+fn filter_archive_hits(
+    hits: Vec<Value>,
+    min_age_minutes: u32,
+    now: i64,
+) -> (Vec<Value>, usize, usize) {
+    let min_age_seconds = i64::from(min_age_minutes) * 60;
+    let mut kept = Vec::with_capacity(hits.len());
+    let mut recent = 0;
+    let mut self_reference = 0;
+    for hit in hits {
+        if min_age_seconds > 0 {
+            let event = hit["timestamp"]
+                .as_str()
+                .and_then(archive::epoch_seconds)
+                .or_else(|| hit["observed_at"].as_str().and_then(archive::epoch_seconds));
+            let age = event.map_or(0, |seconds| now - seconds);
+            if age < min_age_seconds {
+                recent += 1;
+                continue;
+            }
+        }
+        let text = hit["excerpt"].as_str().unwrap_or_default();
+        // The search quoting itself: typed, run from a tool call (quotes escaped), or
+        // its own JSON output read back from a tool result.
+        if text.contains("brain ask")
+            || text.contains("brain recall")
+            || text.contains("archive_hits")
+        {
+            self_reference += 1;
+            continue;
+        }
+        kept.push(hit);
+    }
+    (kept, recent, self_reference)
+}
+
+fn search_conversations(
+    home: &Path,
+    query: &str,
+    enabled: bool,
+    min_age_minutes: u32,
+    period: Option<(i64, i64)>,
+) -> ArchiveSearch {
+    let mut found = ArchiveSearch::default();
+    let disabled = if !enabled {
+        Some("conversation archive search disabled by include_archive or --no-archive")
+    } else {
+        match archive::collector_switch(home) {
+            "archive_collector_paused" => {
+                Some("conversation archive is disabled; using core results")
+            }
+            "archive_config_invalid" => {
+                Some("conversation archive configuration is invalid; using core results")
+            }
+            _ => None,
+        }
+    };
+    if let Some(warning) = disabled {
+        found.warnings.push(warning.to_owned());
+        return found;
+    }
+    // Fetch a bounded candidate window; fusion below applies the user's smaller
+    // quota. archive::search's public API requires at least 500 tokens.
+    match archive::search(
+        home,
+        &archive::SearchRequest {
+            query: query.to_owned(),
+            limit: Some(20),
+            budget_tokens: Some(4000),
+            match_any: true,
+            period,
+            ..archive::SearchRequest::default()
+        },
+    ) {
+        Ok(document) => {
+            found.included = true;
+            let hits = document["results"].as_array().cloned().unwrap_or_default();
+            let (kept, recent, self_reference) =
+                filter_archive_hits(hits, min_age_minutes, now_unix_seconds());
+            found.results = conversation_first(distinct_excerpts(kept));
+            found.filtered_recent = recent;
+            found.filtered_self_reference = self_reference;
+        }
+        Err(error) => found.warnings.push(format!(
+            "conversation archive unavailable: {error}; using core results"
+        )),
+    }
+    found
+}
+
+/// One hit per (client, role, excerpt): a Claude session repeats the same
+/// thinking block on several transcript lines, and each copy would take one
+/// of the few archive places in the budget. The first (best-ranked) is kept.
+fn distinct_excerpts(hits: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            seen.insert((
+                hit["client"].as_str().unwrap_or_default().to_owned(),
+                hit["role"].as_str().unwrap_or_default().to_owned(),
+                hit["excerpt"].as_str().unwrap_or_default().to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Raw tool calls and tool output rank after what was said, thought or failed.
+///
+/// Archive hits arrive in bm25 order, and a long tool dump that repeats the
+/// question's words outranks the sentence that answers it, while the archive
+/// share of the budget holds only a few hits. The order inside each group is kept.
+fn conversation_first(hits: Vec<Value>) -> Vec<Value> {
+    let (mut said, tools): (Vec<Value>, Vec<Value>) = hits
+        .into_iter()
+        .partition(|hit| !matches!(hit["role"].as_str(), Some("tool_call" | "tool_result")));
+    said.extend(tools);
+    said
+}
+
+/// Escape URI path components without losing the original provenance fields.
+fn archive_uri_component(text: &str) -> String {
+    let mut encoded = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Applies the question's date phrase to archive and core hits alike.
+///
+/// One implementation serves `brain ask` and the MCP `memory_search`: an agent
+/// and a person asking the same words must get the same period, the same
+/// ranking and the same honest "empty period" answer. Archive hits outside the
+/// period are dropped; when the question asks how it began, in-period archive
+/// hits go oldest first with conversation ahead of tool traffic; core hits keep
+/// their relevance order with in-period ones ahead of the rest. Returns the
+/// reordered core results, the `period` JSON value, whether the named period
+/// turned out empty, and the hint that must replace the default one.
+pub(crate) fn apply_question_period(
+    query: &str,
+    parsed: Option<&(when_phrase::Period, String)>,
+    archive: &mut ArchiveSearch,
+    results: Vec<Value>,
+) -> (Vec<Value>, Value, bool, Option<String>) {
+    let period_json = parsed.as_ref().map_or(
+        Value::Null,
+        |(period, phrase)| json!({"from": period.from, "to": period.to, "phrase": phrase}),
+    );
+    let mut results = results;
+    let mut in_period = 0;
+    if let Some((period, _)) = parsed {
+        archive.results.retain(|hit| {
+            hit["timestamp"]
+                .as_str()
+                .and_then(archive::epoch_seconds)
+                .is_some_and(|ts| ts >= period.from && ts < period.to)
+        });
+        in_period = archive.results.len();
+        if when_phrase::asks_for_earliest(query) {
+            archive.results.sort_by(|a, b| {
+                let said_at =
+                    |hit: &Value| hit["timestamp"].as_str().and_then(archive::epoch_seconds);
+                // What was said comes before raw tool traffic, then oldest first.
+                let tool =
+                    |hit: &Value| matches!(hit["role"].as_str(), Some("tool_call" | "tool_result"));
+                match tool(a).cmp(&tool(b)) {
+                    std::cmp::Ordering::Equal => {}
+                    other => return other,
+                }
+                match (said_at(a), said_at(b)) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+        }
+        let mut out_of_period = Vec::new();
+        let mut within = Vec::new();
+        for hit in results {
+            let inside = hit["valid_from"]
+                .as_i64()
+                .is_some_and(|ts| ts >= period.from && ts < period.to);
+            if inside {
+                within.push(hit);
+            } else {
+                out_of_period.push(hit);
+            }
+        }
+        in_period += within.len();
+        within.extend(out_of_period);
+        results = within;
+    }
+    let period_empty = parsed.is_some() && in_period == 0;
+    let hint = period_empty.then(|| {
+        "nothing is stored in the archive for that period; the words match only other dates"
+            .to_owned()
+    });
+    (results, period_json, period_empty, hint)
 }
 
 fn command_index(config: &RuntimeConfig, path: &Path, force: bool) -> Result<(), Box<dyn Error>> {
@@ -1438,17 +2302,22 @@ fn command_config(action: ConfigAction) -> Result<(), Box<dyn Error>> {
     let home = brain_home();
     match action {
         ConfigAction::Set { key, value } => {
-            if key != "profile" {
-                return Err(format!("unknown setting {key:?}; supported: profile").into());
-            }
-            let profile: brain_core::profile::Profile = value.parse()?;
             let mut stored = settings::load(&home);
-            stored.profile = profile.to_string();
+            match key.as_str() {
+                "profile" => {
+                    let profile: brain_core::profile::Profile = value.parse()?;
+                    stored.profile = profile.to_string();
+                }
+                // One parser for the CLI and the settings window alike.
+                other => settings::apply_memory_setting(&mut stored, other, &value)?,
+            }
             settings::save(&home, &stored)?;
             let effective = stored.effective();
             print_json(&json!({
                 "status": "saved",
-                "profile": profile.to_string(),
+                "profile": stored.profile,
+                "include_archive": stored.include_archive,
+                "archive_min_age_minutes": stored.archive_min_age_minutes,
                 "candidates_per_signal": effective.candidates_per_signal,
                 "graph_hops": effective.graph_hops,
                 "budget_tokens": effective.budget_tokens,
@@ -1489,12 +2358,61 @@ fn command_config(action: ConfigAction) -> Result<(), Box<dyn Error>> {
                     "min_bm25": effective.min_bm25,
                 },
                 "embedding_mode": stored.embedding_mode.to_string(),
+                "include_archive": stored.include_archive,
+                "archive_min_age_minutes": stored.archive_min_age_minutes,
                 "profiles": profiles,
                 "hint": "higher profiles widen candidate pools, walk further in the graph, and admit weaker matches",
             }))?;
             Ok(())
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum GraphCommand {
+    /// Plain-language explanation of a graph node and its neighbours
+    /// (`brain explain` is Brain's own: why a decision was taken).
+    Explain {
+        node: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+}
+
+/// Graphify keeps its own graph; Brain only forwards these commands so agents
+/// have one `brain` command. Arguments go to the process directly, never
+/// through a shell. `GRAPHIFY_GRAPH_JSON` selects the graph when it is set.
+fn run_graphify(
+    command: &str,
+    positional: &[String],
+    rest: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let mut process = std::process::Command::new("graphify");
+    process.arg(command).args(positional);
+    let explicit_graph = rest
+        .iter()
+        .any(|arg| arg == "--graph" || arg.starts_with("--graph="));
+    if let Some(graph) = std::env::var_os("GRAPHIFY_GRAPH_JSON")
+        && !explicit_graph
+    {
+        process.arg("--graph").arg(graph);
+    }
+    process.args(rest);
+    let status = process.status().map_err(|error| {
+        format!("graphify could not be started ({error}); install it or put it on PATH")
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    // Forward graphify's own status so scripts can tell its failures apart;
+    // a child killed by a signal exits as a shell would report it (128 + signal).
+    use std::os::unix::process::ExitStatusExt;
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1);
+    eprintln!("graphify {command} exited with {status}");
+    std::process::exit(code);
 }
 
 fn command_status(config: &RuntimeConfig) -> Result<(), Box<dyn Error>> {
@@ -1665,7 +2583,7 @@ fn memory_json(record: &MemoryRecord) -> Value {
     })
 }
 
-fn ensure_context(
+pub(crate) fn ensure_context(
     storage: &SqliteStorage,
     config: &RuntimeConfig,
     now: Timestamp,
@@ -1877,7 +2795,7 @@ fn validate_scope(space: &str, agent: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn now_unix_seconds() -> Timestamp {
+pub(crate) fn now_unix_seconds() -> Timestamp {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -1918,8 +2836,84 @@ fn print_json(value: &Value) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_excerpts_keep_only_their_best_ranked_copy() {
+        let hit = |role: &str, text: &str, rank: u32| json!({"client": "claude", "role": role, "excerpt": text, "rank": rank});
+        let kept = super::distinct_excerpts(vec![
+            hit("reasoning", "same thought", 0),
+            hit("reasoning", "same thought", 1),
+            hit("assistant", "same thought", 2),
+            hit("reasoning", "other thought", 3),
+        ]);
+        let ranks: Vec<_> = kept.iter().map(|h| h["rank"].as_u64().unwrap()).collect();
+        assert_eq!(ranks, [0, 2, 3]);
+    }
+
+    #[test]
+    fn the_search_quoting_itself_is_filtered_in_every_form() {
+        let old = "2026-08-01T00:00:00Z";
+        let hits = [
+            r#"for q in \"x\"; do $B ask \"$q\"; done; brain ask \"8803\""#,
+            r#"{"archive_hits": 3, "archive_included": true}"#,
+            "ran brain recall today",
+            "the brain viewer runs on port 8765",
+        ]
+        .iter()
+        .map(|text| json!({"excerpt": text, "timestamp": old}))
+        .collect::<Vec<_>>();
+        let (kept, recent, self_reference) = super::filter_archive_hits(hits, 120, 1_900_000_000);
+        assert_eq!((recent, self_reference), (0, 3));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["excerpt"], "the brain viewer runs on port 8765");
+    }
+
+    #[test]
+    fn tool_dumps_rank_after_conversation_errors_and_reasoning_in_stable_order() {
+        let hits = [
+            "tool_call",
+            "assistant",
+            "tool_result",
+            "tool_error",
+            "user",
+            "reasoning",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(rank, role)| json!({"role": role, "rank": rank}))
+        .collect::<Vec<_>>();
+        let order: Vec<_> = super::conversation_first(hits)
+            .iter()
+            .map(|hit| hit["role"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "assistant",
+                "tool_error",
+                "user",
+                "reasoning",
+                "tool_call",
+                "tool_result"
+            ]
+        );
+    }
+
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn e65_settings_commands_parse_and_limit_is_bounded() {
+        assert!(Cli::try_parse_from(["brain", "settings", "history"]).is_ok());
+        assert!(Cli::try_parse_from(["brain", "settings", "history", "--limit", "10"]).is_ok());
+        for limit in ["0", "10001", "-1", "bad"] {
+            assert!(
+                Cli::try_parse_from(["brain", "settings", "history", "--limit", limit]).is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["brain", "settings", "revert", "--to", "123", "--yes"]).is_ok()
+        );
+    }
 
     #[test]
     fn parses_required_a5_commands() {
@@ -1967,5 +2961,77 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("gotcha, error, or note"));
+    }
+
+    /// Every command and subcommand in the tree carries a description (G2):
+    /// clap's built-in `help` subcommand is the only exempt one.
+    #[test]
+    fn every_subcommand_has_a_description() {
+        fn check(command: &clap::Command, path: &str, problems: &mut Vec<String>) {
+            let name = if path.is_empty() {
+                command.get_name().to_string()
+            } else {
+                format!("{path} {}", command.get_name())
+            };
+            if command
+                .get_about()
+                .map(|about| about.to_string().trim().is_empty())
+                .unwrap_or(true)
+                && command.get_name() != "help"
+                && !path.is_empty()
+            {
+                problems.push(name.clone());
+            }
+            for sub in command.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                check(sub, &name, problems);
+            }
+        }
+        let mut problems = Vec::new();
+        check(&Cli::command(), "", &mut problems);
+        assert!(
+            problems.is_empty(),
+            "subcommands without a description: {problems:?}"
+        );
+    }
+
+    /// Every option (flag) of every command carries help text (G2).
+    #[test]
+    fn every_option_has_help() {
+        fn check(command: &clap::Command, path: &str, problems: &mut Vec<String>) {
+            let name = if path.is_empty() {
+                command.get_name().to_string()
+            } else {
+                format!("{path} {}", command.get_name())
+            };
+            for argument in command.get_arguments() {
+                if argument.is_positional() || argument.get_long() == Some("help") {
+                    continue;
+                }
+                let documented = argument
+                    .get_help()
+                    .is_some_and(|help| !help.to_string().trim().is_empty())
+                    || argument
+                        .get_long_help()
+                        .is_some_and(|help| !help.to_string().trim().is_empty());
+                if !documented {
+                    problems.push(format!("{name} --{}", argument.get_long().unwrap_or("?")));
+                }
+            }
+            for sub in command.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                check(sub, &name, problems);
+            }
+        }
+        let mut problems = Vec::new();
+        check(&Cli::command(), "", &mut problems);
+        assert!(
+            problems.is_empty(),
+            "options without help text: {problems:?}"
+        );
     }
 }

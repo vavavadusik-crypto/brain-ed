@@ -407,7 +407,7 @@ impl SharedFact {
         sorted_json(&self.payload)
     }
 
-    fn validate(&self) -> ShareResult<()> {
+    pub(crate) fn validate(&self) -> ShareResult<()> {
         validate_id(&self.fact_id, MAX_FACT_ID_BYTES, "fact_id")?;
         validate_space(&self.space)?;
         if !self.payload.is_object() {
@@ -606,7 +606,7 @@ impl ShareEvent {
         Ok(event)
     }
 
-    fn validate(&self) -> ShareResult<()> {
+    pub(crate) fn validate(&self) -> ShareResult<()> {
         validate_id(&self.origin, MAX_ID_BYTES, "origin")?;
         validate_space(&self.space)?;
         if self.seq == 0 || self.seq > MAX_SEQ {
@@ -839,7 +839,7 @@ CREATE TABLE IF NOT EXISTS pull_cursor(
 /// The shared-memory store: one `share.sqlite`, parameterized by path.
 /// Read-only openings never create or migrate anything.
 pub struct ShareStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
     path: PathBuf,
     install_id: String,
 }
@@ -884,6 +884,7 @@ impl ShareStore {
             conn.pragma_update(None, "foreign_keys", "ON")?;
         }
         conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(crate::team::store::SQL)?;
         let install_id = Self::ensure_install_id(&conn, &path)?;
         Ok(Self {
             conn,
@@ -1013,6 +1014,9 @@ impl ShareStore {
     /// host-enabled space ∩ authenticated credential grants.
     pub fn authorize_read(&self, principal: &Principal, space: &str) -> ShareResult<()> {
         validate_space(space)?;
+        if crate::team::is_team(space) {
+            self.team_authorize(principal, space)?;
+        }
         if !self.space_enabled(space)? {
             return Err(ShareError::SpaceNotEnabled(space.to_string()));
         }
@@ -1032,6 +1036,9 @@ impl ShareStore {
         fact: SharedFact,
         claimed_agent: Option<&str>,
     ) -> ShareResult<u64> {
+        if crate::team::is_team(space) {
+            return Err(crate::team::bad());
+        }
         if fact.space != space {
             return Err(ShareError::InvalidData(format!(
                 "fact space `{}` does not match publish space `{space}`",
@@ -1081,6 +1088,9 @@ impl ShareStore {
         replacement: SharedFact,
         claimed_agent: Option<&str>,
     ) -> ShareResult<u64> {
+        if crate::team::is_team(space) {
+            return Err(crate::team::bad());
+        }
         if replacement.fact_id != fact_id {
             return Err(ShareError::InvalidData(format!(
                 "supersede cannot rename: `{fact_id}` != `{}`",
@@ -1456,6 +1466,9 @@ impl ShareStore {
         after_seq: u64,
         limit: u32,
     ) -> ShareResult<OwnPage> {
+        if crate::team::is_team(space) {
+            return self.team_page(principal, space, after_seq, limit);
+        }
         if limit == 0 || limit > MAX_WIRE_PAGE {
             self.authorize_read(principal, space)?;
             return Err(ShareError::PageLimit { requested: limit });
@@ -1500,6 +1513,9 @@ impl ShareStore {
         limit: u32,
     ) -> ShareResult<Vec<FactRow>> {
         self.authorize_read(principal, space)?;
+        if crate::team::is_team(space) {
+            return Err(crate::team::bad());
+        }
         if limit == 0 || limit > MAX_WIRE_PAGE {
             return Err(ShareError::PageLimit { requested: limit });
         }
@@ -1793,7 +1809,7 @@ fn fact_from_raw(raw: RawFactRow) -> ShareResult<FactRow> {
     })
 }
 
-fn apply_event_tx(
+pub(crate) fn apply_event_tx(
     tx: &rusqlite::Transaction<'_>,
     event: &ShareEvent,
     digest: &str,

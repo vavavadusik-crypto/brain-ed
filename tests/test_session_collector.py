@@ -114,15 +114,39 @@ class CollectorTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         conn.executescript(
             "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
-            " content TEXT, reasoning TEXT, timestamp REAL);")
-        for row in [("h1", "user", "ключевое_слово_hermes привет", None),
-                    ("h1", "assistant", "<think>hidden_think</think>hermes_answer", "reason_secret"),
-                    ("h1", "tool", "tool_secret", None)]:
-            conn.execute("INSERT INTO messages(session_id, role, content, reasoning, timestamp)"
-                         " VALUES (?, ?, ?, ?, 1791400000.5)", row)
+            " content TEXT, reasoning TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL);")
+        for row in [("h1", "user", "ключевое_слово_hermes привет", None, None, None),
+                    ("h1", "assistant", "<think>hidden_think</think>hermes_answer",
+                     "reason_secret", None, None),
+                    ("h1", "tool", "tool_secret", None, None, "shell")]:
+            conn.execute("INSERT INTO messages(session_id, role, content, reasoning,"
+                         " tool_calls, tool_name, timestamp)"
+                         " VALUES (?, ?, ?, ?, ?, ?, 1791400000.5)", row)
         conn.commit()
         conn.close()
         return path
+
+    def make_hermes_profile(self, name, rows, session="h1"):
+        """A per-profile database; the same raw session id as the top level on purpose."""
+        path = os.path.join(self.home, ".hermes", "profiles", name, "state.db")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
+            " content TEXT, reasoning TEXT, timestamp REAL);")
+        for role, text in rows:
+            conn.execute("INSERT INTO messages(session_id, role, content, reasoning, timestamp)"
+                         " VALUES (?, ?, ?, NULL, 1791400000.5)", (session, role, text))
+        conn.commit()
+        conn.close()
+        return path
+
+    def set_backfill(self, files_per_run, state="running"):
+        path = os.path.join(self.archive_dir, "backfill.json")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"v": 1, "files_per_run": files_per_run, "state": state}, handle)
+        os.chmod(path, 0o600)
 
     def set_config(self, **values):
         fd = os.open(self.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -149,8 +173,10 @@ class CollectorTest(unittest.TestCase):
     def entries(self):
         conn = sqlite3.connect(self.db)
         try:
+            # Conversation rows only: the journal (tool calls, results, reasoning) has its
+            # own tests, and these check how conversation is collected, deduplicated, resumed.
             return conn.execute("SELECT count(*), count(DISTINCT evidence_sha256)"
-                                " FROM entries").fetchone()
+                                " FROM entries WHERE role IN ('user', 'assistant')").fetchone()
         finally:
             conn.close()
 
@@ -184,19 +210,77 @@ class CollectorTest(unittest.TestCase):
         data = self.collect()
         self.assertEqual(data["status"], "ok")
         self.assertFalse(data["complete_capture_claimed"])
-        self.assertEqual(data["stored_entries"], {"claude": 2, "codex": 2, "hermes": 2})
+        # Claude's fixture also holds a thinking block, now archived as a journal row;
+        # Hermes's tool row likewise becomes a tool_result journal row.
+        self.assertEqual(data["stored_entries"], {"claude": 3, "codex": 2, "hermes": 3})
         for client in ("claude", "codex", "hermes"):
             hits = self.search(f"ключевое_слово_{client}")
             self.assertEqual([h["client"] for h in hits], [client])
             self.assertEqual(data["clients"][client]["sources_by_state"], {"caught_up": 1})
-        for secret in ("system_secret", "hidden_reasoning", "subagent_secret", "dev_secret",
-                       "hidden_think", "reason_secret", "tool_secret"):
+        for secret in ("system_secret", "subagent_secret", "dev_secret",
+                       "hidden_think", "reason_secret"):
             self.assertEqual(self.search(secret), [], secret)
+        # Claude shows its thinking in the session, so it is journal, not hidden context.
+        self.assertEqual([h["role"] for h in self.search("hidden_reasoning")], ["reasoning"])
+        # Hermes tool traffic was hidden before journal:2; now it is a masked,
+        # bounded tool_result row naming the tool.
+        tool = self.search("tool_secret")
+        self.assertEqual([h["role"] for h in tool], ["tool_result"])
+        self.assertEqual([h["session_id"] for h in tool], ["h1"])
         code, rec, _ = self.run_cli("read", str(self.search("ключевое_слово_codex")[0]["id"]))
         self.assertEqual((rec["cwd"], rec["session_id"]), ("/work/codexproj", "sess-codex"))
         code, rec, _ = self.run_cli("read", str(self.search("ключевое_слово_claude")[0]["id"]))
         self.assertEqual(rec["cwd"], "/work/proj")
         self.assertEqual(before, {p: self.sha(p) for p in before})
+
+    def test_invalid_role_selection_fails_before_discovery(self):
+        for roles in ([], ["user", "user"], ["root"], ["user", 1], "user", None):
+            self.set_config(enabled=True, roles=roles)
+            code, data, error = self.run_cli("collect", "--home", self.home, "--config", self.config)
+            self.assertNotEqual(code, 0, roles)
+            self.assertIn("roles", error)
+            self.assertFalse(os.path.exists(self.db), "invalid consent must not open an archive")
+
+    def test_role_selection_stops_collection_without_deleting_stored_rows(self):
+        # roles=["user"] admits only user rows at the admission stage; other
+        # roles never reach the insert. Widening the selection later stores
+        # them — and narrowing it again never deletes what is already stored.
+        self.set_config(enabled=True, clients=["claude"], roles=["user"])
+        data = self.collect()
+        self.assertEqual(data["status"], "ok")
+        conn = sqlite3.connect(self.db)
+        try:
+            roles = sorted(r for (r,) in conn.execute("SELECT DISTINCT role FROM entries"))
+        finally:
+            conn.close()
+        self.assertEqual(roles, ["user"])
+        self.assertGreater(self.entries()[0], 0)
+
+        # Widen: a newly appended assistant record is stored now; the file is
+        # already caught up, so widening alone re-reads nothing.
+        self.set_config(enabled=True, clients=["claude"])
+        self.put(".claude/projects/-work-proj/s1.jsonl", jl(
+            claude("assistant", "новый_ответ_after_widening", "a9"),
+        ), mode="a")
+        self.collect()
+        conn = sqlite3.connect(self.db)
+        try:
+            widened = sorted(r for (r,) in conn.execute("SELECT DISTINCT role FROM entries"))
+        finally:
+            conn.close()
+        self.assertIn("assistant", widened)
+
+        # Narrow again: nothing already stored is removed.
+        self.set_config(enabled=True, clients=["claude"], roles=["user"])
+        self.collect()
+        conn = sqlite3.connect(self.db)
+        try:
+            narrowed = sorted(r for (r,) in conn.execute("SELECT DISTINCT role FROM entries"))
+            users = conn.execute("SELECT count(*) FROM entries WHERE role = 'user'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(narrowed, widened)
+        self.assertGreater(users, 0)
 
     def test_second_run_inserts_nothing_and_skips_unchanged_files(self):
         self.collect()
@@ -321,7 +405,7 @@ class CollectorTest(unittest.TestCase):
             "sa._store = dying\n"
             f"sa.main(['--database', {self.db!r}, 'collect', '--home', {self.home!r},"
             f" '--config', {self.config!r}])\n")
-        proc = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True)
+        proc = subprocess.run([sys.executable, "-I", "-B", "-c", script], capture_output=True)
         self.assertEqual(proc.returncode, 9)
         self.collect()
         self.collect()
@@ -450,7 +534,8 @@ class CollectorTest(unittest.TestCase):
         data = self.collect()
         self.assertEqual((data["clients_selected"], data["client_selection"]),
                          (["claude", "codex", "hermes"], "legacy_all"))
-        self.assertEqual(data["stored_entries"], {"claude": 2, "codex": 2, "hermes": 2})
+        # Claude's thinking block and Hermes's tool row are journal rows now.
+        self.assertEqual(data["stored_entries"], {"claude": 3, "codex": 2, "hermes": 3})
 
     def test_explicit_client_selection_reads_only_selected_sources(self):
         self.set_config(enabled=True, clients=["hermes", "codex"])
@@ -464,7 +549,7 @@ class CollectorTest(unittest.TestCase):
             data = self.collect()
         self.assertEqual((data["clients_selected"], data["client_selection"]),
                          (["codex", "hermes"], "explicit"))
-        self.assertEqual(data["stored_entries"], {"codex": 2, "hermes": 2})
+        self.assertEqual(data["stored_entries"], {"codex": 2, "hermes": 3})
         self.assertEqual(data["clients"]["claude"]["root"], "not_selected")
         self.assertEqual(data["clients"]["claude"]["discovered"], 0)
         self.assertNotIn(self.claude_file, opened)
@@ -589,7 +674,11 @@ class CollectorTest(unittest.TestCase):
                           "stored_text_marker": "external_agent_tool_traffic"})
         status = self.run_cli("status")[1]
         self.assertEqual(status["quarantined"], {"external_agent_tool_traffic": 2})
-        self.assertEqual(status["entries"], stored - 2)
+        conn = sqlite3.connect(self.db)
+        journal = conn.execute("SELECT count(*) FROM entries"
+                               " WHERE role NOT IN ('user', 'assistant')").fetchone()[0]
+        conn.close()
+        self.assertEqual(status["entries"], stored - 2 + journal)
         hidden = rows["source_line"][0]
         self.assertEqual(self.run_cli("read", str(hidden))[0], 2)
         # Appends, a rewrite reset and repeated runs never bring the row back.
@@ -606,6 +695,91 @@ class CollectorTest(unittest.TestCase):
         self.collect()
         self.assertEqual([r["id"] for r in self.search("old_wrapped_one")], [hidden])
         self.assertEqual(self.run_cli("quarantine", "--release", str(hidden))[0], 2)
+
+    def test_hermes_profiles_are_separate_sources_with_namespaced_sessions(self):
+        sol = self.make_hermes_profile("sol", [
+            ("user", "sol_привет ключевое_слово_hermes"),
+            ("assistant", "sol_ответ"),
+        ])
+        night = self.make_hermes_profile("night", [
+            ("user", "night_вопрос"),
+        ])
+        # A snapshot holds the same history as the top-level database and must
+        # never be a source, whatever its state.db-shaped name.
+        snapshot = os.path.join(self.home, ".hermes", "state-snapshots", "2026-09-01", "state.db")
+        os.makedirs(os.path.dirname(snapshot), exist_ok=True)
+        shutil.copyfile(self.hermes_file, snapshot)
+        data = self.collect()
+        hermes = data["clients"]["hermes"]
+        self.assertEqual(hermes["profiles_root"], "present")
+        self.assertEqual(hermes["discovered"], 3)
+        self.assertEqual(hermes["sources_by_state"], {"caught_up": 3})
+        # Top level holds a tool row now archived as tool_result: 3 + 2 + 1.
+        self.assertEqual(data["stored_entries"]["hermes"], 3 + 2 + 1)
+        # The snapshot copy is not collected: the marker text exists once.
+        self.assertEqual(len(self.search("ключевое_слово_hermes")), 2)  # top level + sol
+        conn = sqlite3.connect(self.db)
+        sessions = {row[0] for row in conn.execute(
+            "SELECT DISTINCT e.session_id FROM entries e"
+            " JOIN sources s ON s.id = e.source_id WHERE s.client = 'hermes'")}
+        paths = {row[0] for row in conn.execute("SELECT path FROM sources WHERE client = 'hermes'")}
+        conn.close()
+        self.assertEqual(sessions, {"h1", "profiles/sol/h1", "profiles/night/h1"})
+        self.assertNotIn(os.path.realpath(snapshot), paths)
+        # Cursors are per source: appending to one profile moves only its cursor.
+        conn = sqlite3.connect(sol)
+        conn.execute("INSERT INTO messages(session_id, role, content, timestamp)"
+                     " VALUES ('h1', 'user', 'sol_позже', 1791400002)")
+        conn.commit()
+        conn.close()
+        data = self.collect()
+        self.assertEqual(data["clients"]["hermes"]["inserted"], 1)
+        self.assertEqual(self.collect()["clients"]["hermes"]["inserted"], 0)
+        self.assertEqual(len(self.search("sol_позже")), 1)
+        self.assertEqual((self.cursor(sol)["state"], self.cursor(sol)["position"]),
+                         ("caught_up", 3))
+        self.assertEqual(self.cursor(night)["position"], 1)
+        self.assertEqual(self.cursor(self.hermes_file)["position"], 3)
+
+    def test_symlinked_profile_directory_and_unreadable_profiles_are_reported_not_followed(self):
+        outside = os.path.join(self.tmp, "outside-profile")
+        os.makedirs(outside)
+        conn = sqlite3.connect(os.path.join(outside, "state.db"))
+        conn.executescript(
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,"
+            " content TEXT, reasoning TEXT, timestamp REAL);")
+        conn.execute("INSERT INTO messages(session_id, role, content, reasoning, timestamp)"
+                     " VALUES ('s', 'user', 'ссылка_снаружи', NULL, 1791400000.5)")
+        conn.commit()
+        conn.close()
+        os.makedirs(os.path.join(self.home, ".hermes", "profiles"), exist_ok=True)
+        os.symlink(outside, os.path.join(self.home, ".hermes", "profiles", "evil"))
+        data = self.collect()
+        self.assertEqual(data["clients"]["hermes"]["sources_by_state"], {"caught_up": 1})
+        self.assertEqual(self.search("ссылка_снаружи"), [])
+        profiles_dir = os.path.join(self.home, ".hermes", "profiles")
+        os.chmod(profiles_dir, 0)
+        try:
+            data = self.collect()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["clients"]["hermes"]["profiles_root"], "unreadable")
+            self.assertEqual(data["clients"]["hermes"]["root"], "present")
+        finally:
+            os.chmod(profiles_dir, 0o700)
+
+    def test_old_hermes_profile_is_collected_only_through_backfill(self):
+        old = self.make_hermes_profile("old", [("user", "старый_профиль")])
+        past = time.time() - 40 * 86400
+        os.utime(old, (past, past))
+        data = self.collect()
+        self.assertEqual(data["clients"]["hermes"]["out_of_window"], 1)
+        self.assertEqual(self.search("старый_профиль"), [])
+        self.set_backfill(files_per_run=5)
+        data = self.collect()
+        self.assertEqual(data["clients"]["hermes"]["admitted"], 1)
+        self.assertEqual(data["backfill"]["remaining_out_of_window"], 0)
+        self.assertEqual(len(self.search("старый_профиль")), 1)
+        self.assertEqual(self.cursor(old)["state"], "caught_up")
 
     def test_run_log_bounded_and_counts_only(self):
         with mock.patch.object(sa, "RUNS_KEPT", 3):

@@ -1880,11 +1880,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn create_temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
+        let _nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brain_indexer_test_{}", nanos));
+        let dir = crate::test_support::temp_path("brain_indexer_test");
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2057,13 +2057,7 @@ mod tests {
 
     #[test]
     fn bounded_read_rejects_actual_overlimit_bytes_and_keeps_unicode() {
-        let dir = std::env::temp_dir().join(format!(
-            "brain-indexer-bounded-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
+        let dir = crate::test_support::temp_path("brain-indexer-bounded");
         fs::create_dir_all(&dir).expect("dir");
         let source = dir.join("unicode.py");
         let text = "def привет():\n    return \"日本語 ✓\"\n";

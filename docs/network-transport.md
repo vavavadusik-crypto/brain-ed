@@ -1,17 +1,17 @@
 # brain-coord/1 network transport
 
-Status: loopback core stage (phase 6), LAN opt-in gate (TLS only). Date: 2026-10-09.
+Status: direct TLS with explicit LAN/CGNAT opt-in, plus optional company-hosted relay (E7.7). See [relay setup, nested TLS, token scopes and limits (RU)](relay.md). Historical loopback/plaintext rules below remain scoped to those transports.
 
 ## What this is — and is not
 
 `brain-coord/1` is a **custom application protocol over HTTP/1.1** (HTTPS in
-a later stage). It is intentionally **not MCP Streamable HTTP** and **not MCP
+the TLS transport). It is intentionally **not MCP Streamable HTTP** and **not MCP
 Authorization (OAuth 2.1)**. The stdio MCP adapter remains the only MCP
 surface and forwards only the `work_*` tools. There is no authorization
 server, no RFC 9728 metadata, no RFC 8707 audience binding and no token
 passthrough; credentials are local `0600` files issued by the coordinator
 host's admin. Anything that speaks this wire must implement the rules below,
-not MCP's.
+not MCP's. The optional `brain-relay/1` transports the same coordinator TLS bytes without terminating that TLS session.
 
 ## Endpoint and envelope
 
@@ -81,8 +81,9 @@ Identity comes from the credential, never from the request body:
   body parse → one state lock → authenticate → authorize (agent binding,
   space allowlist, role) → schema → coordinator dispatch.
 * The client is fail-closed: connection errors are `Unreachable`, never
-  retried against a different endpoint, and there is **no local fallback
-  coordinator**.
+  replayed after a TLS refusal or possible dispatch, and there is **no local
+  fallback coordinator**. An explicitly configured relay may be selected only
+  when the direct TCP connect fails, before any coordinator TLS/request bytes.
 
 ## Storage
 
@@ -93,6 +94,39 @@ Identity comes from the credential, never from the request body:
   revokes unbound credentials rather than guessing an identity for them —
   schema 1 was never released.
 * Directory `0700`, database and `-wal`/`-shm` `0600`.
+
+## Local team setup with init and join
+
+This example uses two terminals on one machine and synthetic identities. It
+does not establish evidence of a physical fleet or LAN deployment.
+
+```sh
+# Host terminal: init writes local CA/server keys; serve keeps this terminal open.
+coord="$HOME/.brain/net/host"
+brain net init --state-dir "$coord" --name localhost
+brain net serve --state-dir "$coord" --port 7443
+```
+
+```sh
+# Second terminal, trusted host administration. These output files must be new.
+coord="$HOME/.brain/net/host"
+brain net enroll --state-dir "$coord" --machine demo-worker --agent-id codex \
+  --role worker --grant-space default \
+  --credential-out "$HOME/demo-worker.credential" \
+  --bundle-out "$HOME/demo-join.json" --dial 127.0.0.1:7443
+brain net join "$HOME/demo-join.json"
+brain net status
+brain net call board
+```
+
+Keep the bundle private (`0600`): it contains a client credential. Transfer it
+only through a trusted private channel, and authenticate the CA fingerprint
+shown by `net init` through a separate trusted channel. A fingerprint in an
+untrusted bundle alone does not authenticate its sender. Join stores a private
+CA, credential and endpoint; it does not start a service. `--consume` removes
+the bundle only after success. Existing endpoints require explicit `--replace`
+and the old directory is retained as `.previous`; CA replacement at the host
+requires `net init --rotate` and clients need a newly verified bundle.
 
 ## TLS and the `brain net` CLI (loopback stage)
 
@@ -145,15 +179,19 @@ brain [--space S] net call <same connection flags> whoami|board|show|claims|add|
 
 Loopback stays the default. `brain net serve --listen <IP> --allow-lan`
 binds the TLS listener on one numeric address; `status`/`call` dial it with
-`--allow-lan-dial`. Both sides use the same validator (`checked_listen_ip`):
+`--allow-lan-dial`. CGNAT/overlay addresses have separate `--allow-cgnat`
+and `--allow-cgnat-dial` flags. Both sides use `checked_listen_ip_with`:
 
 * Loopback (`127.0.0.0/8`, `::1`) is always allowed and needs no flag.
-* Any other address needs the affirmative opt-in AND must be private
+* Other LAN addresses need the affirmative LAN opt-in AND must be private
   unicast: IPv4 RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) or IPv6
   unique-local (`fc00::/7`).
+* Shared CGNAT/overlay IPv4 (`RFC 6598 range`) needs its own affirmative
+  CGNAT flag. The LAN flag alone does not admit it. Join bundles with these
+  endpoints also require `net join --allow-cgnat-dial`.
 * Always refused, even with the opt-in: unspecified/wildcard (`0.0.0.0`,
   `::`), multicast, broadcast, link-local (`169.254/16`, `fe80::/10`),
-  IPv4-mapped IPv6, CGNAT `100.64/10`, documentation ranges and every public
+  IPv4-mapped IPv6, documentation ranges and every public
   address. Hostnames are never resolved. The check runs before any key is
   loaded, store opened or socket bound.
 * "Broadcast" here means the limited broadcast `255.255.255.255` only. A

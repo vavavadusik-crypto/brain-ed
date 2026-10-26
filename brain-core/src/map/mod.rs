@@ -120,8 +120,8 @@ mod tests {
         clock: Arc<AtomicI64>,
     }
 
-    fn fx(tag: &str) -> Fx {
-        let dir = std::env::temp_dir().join(format!("brain-map-{tag}-{}", std::process::id()));
+    fn fx(_tag: &str) -> Fx {
+        let dir = crate::test_support::temp_path("brain-map");
         let _ = std::fs::remove_dir_all(&dir);
         Fx {
             dir: Dir(dir),

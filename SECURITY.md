@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-Brain ED is an early preview. Only the latest `0.1.x` and the default branch
+Brain ED is an early preview. Only the latest released preview and the default branch
 receive fixes. Only Linux is supported.
 
 ## Reporting a vulnerability
 
 Do not disclose a vulnerability in a public issue. Once the repository is
-public, use GitHub's private vulnerability-reporting form in its **Security**
+public, use [GitHub's private vulnerability-reporting form](https://github.com/vavavadusik-crypto/brain-ed/security/advisories/new) in its **Security**
 tab. If that form is unavailable, contact the maintainer through their GitHub
 profile without including exploit details, secrets or a memory database in the
 first message.
@@ -30,3 +30,17 @@ run code as the same OS user (outside the isolation boundary); exposing the
 loopback UI or coordinator through a proxy or LAN against the documentation.
 
 The threat model and data boundaries are in [docs/SECURITY.md](docs/SECURITY.md).
+
+## Threat model in brief
+
+- Local state belongs to one OS account. Another process running as that user
+  can read it; Brain does not provide isolation from that process or encryption
+  at rest. The archive is global to its owner and has no project ACL.
+- Archive and imported memory text are untrusted evidence. Pattern masking
+  can miss secrets; do not treat retrieved text as instructions or assume an
+  archive is safe to publish.
+- MCP uses stdio; the UI and coordinator use loopback by default. LAN transport,
+  archive collection, model downloads and LLM calls need explicit setup/actions.
+  Distillation sends selected text to the chosen provider; subscription clients
+  have their own data policies and tool/isolation limits. `--offline` prevents
+  embedding downloads, but does not disable an explicitly requested LLM call.

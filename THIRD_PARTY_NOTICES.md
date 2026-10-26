@@ -41,10 +41,10 @@ THE SOFTWARE.
 
 ## Rust crates (from `Cargo.lock`, all features)
 
-Generated with `cargo metadata --locked --format-version 1 --all-features`
-(247 packages including the three workspace/path packages, which are not
-listed). Checked against `Cargo.lock` on 2026-10-09: every crate and version
-below matches. `python3 tools/check-licenses.py` enforces an allowlist over
+Generated with `cargo metadata --offline --locked --format-version 1 --all-features`
+(255 packages including the three workspace/path packages, which are not
+listed). Checked against `Cargo.lock` on 2026-10-26: every crate and version
+below matches. `python3 tools/check-licenses.py --check-notices` enforces an allowlist over
 parsed SPDX expressions in CI.
 
 Notes:
@@ -55,6 +55,10 @@ Notes:
   its notice and make its source available as MPL-2.0 requires.
 - `ring` is `Apache-2.0 AND ISC`; both apply. `unicode-ident` is
   `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 part always applies.
+- `ryu` offers `Apache-2.0 OR BSL-1.0`; use its Apache-2.0 option.
+  BSL-1.0 here means the permissive Boost Software License, not the
+  restricted Business Source License (`BUSL-1.1`). No AGPL, SSPL or BUSL
+  dependency is present in the locked metadata.
 - `r-efi` is used under its MIT/Apache-2.0 option (not LGPL); it is a
   UEFI-target dependency and is not compiled into Linux builds.
 - `webpki-roots` is CDLA-Permissive-2.0 (Mozilla root data).
@@ -65,8 +69,9 @@ Notes:
   (`libsqlite3-sys`, public domain SQLite amalgamation).
 
 Binary redistributors must ship the licence texts and notices of these
-crates. This repository does not produce binary releases yet; no generated
-licence bundle is included.
+crates. Release build workflows produce artifacts; publishing and supplying
+a complete licence-text bundle remain the maintainer's responsibility.
+The table covers locked dependencies on all targets, including optional crates.
 
 No model weights are included. `brain model install` downloads
 `minishlab/potion-*` Model2Vec weights only on explicit request; their licence
@@ -118,6 +123,7 @@ is shown on the model page and is the user's responsibility to accept.
 | darling_core | 0.20.11 | MIT |
 | darling_macro | 0.20.11 | MIT |
 | dary_heap | 0.3.9 | MIT OR Apache-2.0 |
+| deranged | 0.5.9 | MIT OR Apache-2.0 |
 | derive_builder | 0.20.2 | MIT OR Apache-2.0 |
 | derive_builder_core | 0.20.2 | MIT OR Apache-2.0 |
 | derive_builder_macro | 0.20.2 | MIT OR Apache-2.0 |
@@ -183,6 +189,7 @@ is shown on the model page and is the user's responsibility to accept.
 | ndarray | 0.15.6 | MIT OR Apache-2.0 |
 | nom | 7.1.3 | MIT |
 | num-complex | 0.4.6 | MIT OR Apache-2.0 |
+| num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-integer | 0.1.47 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | number_prefix | 0.4.0 | MIT |
@@ -191,11 +198,13 @@ is shown on the model page and is the user's responsibility to accept.
 | option-ext | 0.2.0 | MPL-2.0 |
 | paste | 1.0.15 | MIT OR Apache-2.0 |
 | pastey | 0.2.3 | MIT OR Apache-2.0 |
+| pem | 3.0.6 | MIT |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 |
 | portable-atomic | 1.15.0 | Apache-2.0 OR MIT |
 | potential_utf | 0.1.6 | Unicode-3.0 |
+| powerfmt | 0.2.1 | MIT OR Apache-2.0 |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
@@ -207,6 +216,7 @@ is shown on the model page and is the user's responsibility to accept.
 | rayon | 1.12.0 | MIT OR Apache-2.0 |
 | rayon-cond | 0.4.0 | Apache-2.0/MIT |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 |
+| rcgen | 0.13.2 | MIT OR Apache-2.0 |
 | redox_users | 0.5.2 | MIT |
 | regex | 1.13.1 | MIT OR Apache-2.0 |
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 |
@@ -242,6 +252,8 @@ is shown on the model page and is the user's responsibility to accept.
 | synstructure | 0.13.2 | MIT |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
+| time | 0.3.55 | MIT OR Apache-2.0 |
+| time-core | 0.1.9 | MIT OR Apache-2.0 |
 | tinystr | 0.8.4 | Unicode-3.0 |
 | tokenizers | 0.21.4 | Apache-2.0 |
 | tree-sitter | 0.25.10 | MIT |
@@ -307,6 +319,7 @@ is shown on the model page and is the user's responsibility to accept.
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
 | wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | writeable | 0.6.4 | Unicode-3.0 |
+| yasna | 0.5.2 | MIT OR Apache-2.0 |
 | yoke | 0.8.3 | Unicode-3.0 |
 | yoke-derive | 0.8.2 | Unicode-3.0 |
 | zerocopy | 0.8.56 | BSD-2-Clause OR Apache-2.0 OR MIT |

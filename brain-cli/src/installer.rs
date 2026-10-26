@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::client_home::{ClientHome, ClientHomes};
 
@@ -27,14 +28,44 @@ enum AgentClient {
     Claude,
     Codex,
     Cursor,
+    Opencode,
+    Openclaw,
+    Kimi,
 }
 
 impl AgentClient {
+    /// Stable lowercase id the settings window and routes use.
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Opencode => "opencode",
+            Self::Openclaw => "openclaw",
+            Self::Kimi => "kimi",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "cursor" => Some(Self::Cursor),
+            "opencode" => Some(Self::Opencode),
+            "openclaw" => Some(Self::Openclaw),
+            "kimi" => Some(Self::Kimi),
+            _ => None,
+        }
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor",
+            Self::Opencode => "OpenCode",
+            Self::Openclaw => "OpenClaw",
+            Self::Kimi => "Kimi Code",
         }
     }
 }
@@ -56,7 +87,7 @@ struct InstallManifest {
     entries: Vec<ManifestEntry>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestEntry {
     path: PathBuf,
@@ -78,17 +109,43 @@ pub(crate) fn install(
     // unusable HOME.
     crate::private_fs::require_safe_homes(home, brain_home)?;
     let homes = crate::client_home::from_process_env(home);
-    install_with(home, brain_home, binary, dry_run, yes, &homes)
+    install_with_only(
+        home,
+        brain_home,
+        binary,
+        dry_run,
+        yes,
+        &homes,
+        &executable_on_path,
+        None,
+    )
 }
 
-fn install_with(
+/// `only` narrows the same install path to one named agent (settings window).
+#[allow(clippy::too_many_arguments)] // the CLI and window share one install path
+fn install_with_only(
     home: &Path,
     brain_home: &Path,
     binary: &Path,
     dry_run: bool,
     yes: bool,
     homes: &ClientHomes,
+    path_probe: &dyn Fn(&str) -> bool,
+    only: Option<&str>,
 ) -> Result<usize, Box<dyn Error>> {
+    let filter = |clients: Vec<AgentClient>| -> Result<Vec<AgentClient>, Box<dyn Error>> {
+        match only {
+            None => Ok(clients),
+            Some(id) => {
+                let wanted =
+                    AgentClient::from_id(id).ok_or_else(|| format!("unknown agent: {id}"))?;
+                Ok(clients
+                    .into_iter()
+                    .filter(|client| client.id() == wanted.id())
+                    .collect())
+            }
+        }
+    };
     // First, dry runs included: an unset (`.`), empty, relative or
     // control-character HOME would plan client files, hooks and the stable
     // copy relative to the current directory or with unwritable bytes.
@@ -98,7 +155,7 @@ fn install_with(
     for (client, location) in &skipped {
         println!("{}", relocation_conflict(*client, *location, "install"));
     }
-    let clients = detect_clients(home, homes);
+    let clients = filter(detect_clients(home, homes, path_probe))?;
     if clients.is_empty() {
         if skipped.is_empty() {
             println!("No supported agents detected; nothing to change.");
@@ -121,12 +178,27 @@ fn install_with(
     }
     let plans = build_plans(home, &hook_binary, &clients);
     let manifest_path = brain_home.join("install-manifest.json");
-    let existing_manifest = manifest_path.exists();
+    let existing = if manifest_path.exists() {
+        let bytes = read_no_follow(&manifest_path, MAX_MANIFEST_BYTES, true)?
+            .ok_or("installation manifest disappeared")?;
+        let manifest: InstallManifest = serde_json::from_slice(&bytes)?;
+        validate_manifest(home, &manifest)?;
+        Some(manifest)
+    } else {
+        None
+    };
     let actionable = plans
         .iter()
         .filter(|plan| plan.conflict.is_none() && plan.before != plan.after)
         .count();
-    if existing_manifest && actionable > 0 && !dry_run {
+    if existing.as_ref().is_some_and(|manifest| {
+        plans.iter().any(|plan| {
+            plan.before != plan.after
+                && manifest.entries.iter().any(|entry| entry.path == plan.path)
+        })
+    }) && actionable > 0
+        && !dry_run
+    {
         return Err("an installation manifest already exists and files drifted; run brain uninstall or use --dry-run to inspect".into());
     }
 
@@ -179,13 +251,25 @@ fn install_with(
     }
 
     let mut prepared = Vec::new();
+    let mut retained = existing
+        .map(|manifest| manifest.entries)
+        .unwrap_or_default();
     for (index, plan) in &selected {
         let after = plan
             .after
             .as_deref()
             .ok_or("install plan unexpectedly removes a file")?;
         let backup = if let Some(before) = &plan.before {
-            let relative = PathBuf::from(format!("{index:03}.bak"));
+            let relative = std::iter::once(*index)
+                .chain(0..managed_paths(home).len())
+                .map(|index| PathBuf::from(format!("{index:03}.bak")))
+                .find(|name| {
+                    !backup_dir.join(name).exists()
+                        && !retained
+                            .iter()
+                            .any(|entry| entry.backup.as_ref() == Some(name))
+                })
+                .ok_or("no unused installation backup slot")?;
             crate::private_fs::write_private(&backup_dir.join(&relative), before)?;
             Some(relative)
         } else {
@@ -218,19 +302,10 @@ fn install_with(
     let applied = prepared.len();
     if !prepared.is_empty() {
         crate::private_fs::ensure_private_home(brain_home)?;
+        retained.extend(prepared.iter().map(|(_, entry)| entry.clone()));
         let manifest = serde_json::to_vec_pretty(&InstallManifest {
             version: 1,
-            entries: prepared
-                .iter()
-                .map(|(_, entry)| ManifestEntry {
-                    path: entry.path.clone(),
-                    existed: entry.existed,
-                    before_sha256: entry.before_sha256.clone(),
-                    after_sha256: entry.after_sha256.clone(),
-                    backup: entry.backup.clone(),
-                    mode: entry.mode,
-                })
-                .collect(),
+            entries: retained,
         })?;
         if let Err(error) = atomic_write(&manifest_path, &manifest, Some(0o600)) {
             rollback_plans(&prepared);
@@ -239,6 +314,24 @@ fn install_with(
     }
     println!("Installed Brain integration in {applied} file(s).");
     Ok(applied)
+}
+
+/// Tests inject the client probe; the public entry is [`install`], which
+/// selects every detected agent, and the settings window uses
+/// [`install_agent`] with one id.
+#[cfg(test)]
+fn install_with(
+    home: &Path,
+    brain_home: &Path,
+    binary: &Path,
+    dry_run: bool,
+    yes: bool,
+    homes: &ClientHomes,
+    path_probe: &dyn Fn(&str) -> bool,
+) -> Result<usize, Box<dyn Error>> {
+    install_with_only(
+        home, brain_home, binary, dry_run, yes, homes, path_probe, None,
+    )
 }
 
 fn rollback_plans(prepared: &[(&PlannedChange, ManifestEntry)]) {
@@ -259,15 +352,36 @@ pub(crate) fn uninstall(
 ) -> Result<usize, Box<dyn Error>> {
     crate::private_fs::require_safe_homes(home, brain_home)?;
     let homes = crate::client_home::from_process_env(home);
-    uninstall_with(home, brain_home, dry_run, yes, &homes)
+    uninstall_with_only(home, brain_home, dry_run, yes, &homes, None)
 }
 
+/// Tests inject the client probe instead of reading the process PATH, so
+/// parallel tests cannot race on it and detection is deterministic.
+#[cfg(test)]
+pub(crate) fn no_probe() -> impl Fn(&str) -> bool {
+    |_| false
+}
+
+/// Tests drive the full uninstall; the window narrows it to one agent via
+/// [`uninstall_agent`].
+#[cfg(test)]
 fn uninstall_with(
     home: &Path,
     brain_home: &Path,
     dry_run: bool,
     yes: bool,
     homes: &ClientHomes,
+) -> Result<usize, Box<dyn Error>> {
+    uninstall_with_only(home, brain_home, dry_run, yes, homes, None)
+}
+
+fn uninstall_with_only(
+    home: &Path,
+    brain_home: &Path,
+    dry_run: bool,
+    yes: bool,
+    homes: &ClientHomes,
+    only: Option<&str>,
 ) -> Result<usize, Box<dyn Error>> {
     // Before the manifest, backups or any client file is looked at.
     crate::private_fs::require_safe_homes(home, brain_home)?;
@@ -295,6 +409,25 @@ fn uninstall_with(
     let backup_dir = brain_home.join("install-backups");
     let backups_present =
         private_dir(&backup_dir).map_err(|error| refuse(format!("install-backups: {error}")))?;
+    // The settings window disconnects ONE agent: its entries are selected by
+    // the exact default paths the planner would install to; every other
+    // entry stays in the manifest untouched.
+    let selected: Vec<ManifestEntry> = match only {
+        None => manifest.entries.clone(),
+        Some(id) => {
+            let client =
+                AgentClient::from_id(id).ok_or_else(|| refuse(format!("unknown agent: {id}")))?;
+            manifest
+                .entries
+                .iter()
+                .filter(|entry| default_client_paths(home, client).contains(&entry.path))
+                .cloned()
+                .collect()
+        }
+    };
+    // Entries whose file is back to its pre-Brain state or restored here; they
+    // leave the manifest when only one agent is uninstalled.
+    let mut done_paths: Vec<PathBuf> = Vec::new();
     // Entries for a relocated client are matched on the exact default paths
     // only and skipped before their current file or backup is read; the
     // manifest, backups and stable binary are then kept.
@@ -317,7 +450,7 @@ fn uninstall_with(
     let mut skipped = false;
     let mut completed = 0_usize;
     let mut planned = Vec::new();
-    for entry in &manifest.entries {
+    for entry in &selected {
         if guarded.contains(&entry.path) {
             skipped = true;
             continue;
@@ -351,6 +484,7 @@ fn uninstall_with(
         };
         if already_restored {
             completed += 1;
+            done_paths.push(entry.path.clone());
             continue;
         }
         if current_sha.as_deref() != Some(entry.after_sha256.as_str()) {
@@ -401,6 +535,7 @@ fn uninstall_with(
             None => fs::remove_file(&entry.path)?,
         }
         restored += 1;
+        done_paths.push(entry.path.clone());
     }
     if dry_run {
         println!(
@@ -409,36 +544,317 @@ fn uninstall_with(
         );
         return Ok(planned.len());
     }
-    if !skipped && restored + completed == manifest.entries.len() {
-        for entry in &manifest.entries {
-            if let Some(relative) = &entry.backup {
-                let path = backup_dir.join(relative);
-                if path.exists() {
-                    fs::remove_file(path)?;
+    if only.is_some() {
+        // One agent left: the manifest keeps every entry that is not back to
+        // its pre-Brain state, so a later uninstall of the other agents still
+        // finds its own backups and checksums.
+        let remaining: Vec<ManifestEntry> = manifest
+            .entries
+            .iter()
+            .filter(|entry| !done_paths.contains(&entry.path))
+            .cloned()
+            .collect();
+        if !skipped && remaining.is_empty() {
+            finish_full_uninstall(brain_home, &backup_dir, &manifest_path, &manifest)?;
+        } else {
+            for entry in &manifest.entries {
+                if done_paths.contains(&entry.path)
+                    && let Some(relative) = &entry.backup
+                {
+                    let backup = backup_dir.join(relative);
+                    if backup.exists() {
+                        fs::remove_file(backup)?;
+                    }
                 }
             }
+            let bytes = serde_json::to_vec_pretty(&InstallManifest {
+                version: 1,
+                entries: remaining,
+            })?;
+            atomic_write(&manifest_path, &bytes, Some(0o600))?;
         }
-        if backup_dir.exists() {
-            let _ = fs::remove_dir(&backup_dir);
-        }
-        fs::remove_file(manifest_path)?;
-        // The settings shortcut and agent hooks intentionally share one stable
-        // binary. Removing one integration must not break the other.
-        let copy = stable_copy_path(brain_home);
-        if desktop_copy_owner_path(brain_home).exists() {
-            println!(
-                "Retained the Brain binary at {} because the desktop shortcut still uses it.",
-                copy.display()
-            );
-        } else if copy.exists() && fs::remove_file(&copy).is_ok() {
-            if let Some(parent) = copy.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-            println!("Removed the Brain binary at {}.", copy.display());
-        }
+    } else if !skipped && restored + completed == manifest.entries.len() {
+        finish_full_uninstall(brain_home, &backup_dir, &manifest_path, &manifest)?;
     }
     println!("Uninstalled Brain integration from {restored} file(s).");
     Ok(restored)
+}
+
+/// Every entry is restored: drop the backups, the manifest and the shared
+/// stable binary (unless the desktop shortcut still needs it).
+fn finish_full_uninstall(
+    brain_home: &Path,
+    backup_dir: &Path,
+    manifest_path: &Path,
+    manifest: &InstallManifest,
+) -> Result<(), Box<dyn Error>> {
+    for entry in &manifest.entries {
+        if let Some(relative) = &entry.backup {
+            let path = backup_dir.join(relative);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    if backup_dir.exists() {
+        let _ = fs::remove_dir(backup_dir);
+    }
+    fs::remove_file(manifest_path)?;
+    // The settings shortcut and agent hooks intentionally share one stable
+    // binary. Removing one integration must not break the other.
+    let copy = stable_copy_path(brain_home);
+    if desktop_copy_owner_path(brain_home).exists() {
+        println!(
+            "Retained the Brain binary at {} because the desktop shortcut still uses it.",
+            copy.display()
+        );
+    } else if copy.exists() && fs::remove_file(&copy).is_ok() {
+        if let Some(parent) = copy.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        println!("Removed the Brain binary at {}.", copy.display());
+    }
+    Ok(())
+}
+
+// ---- settings-window documents (E6.4) --------------------------------------
+
+/// The install manifest as written by a finished install; absent or unreadable
+/// means "no owned installation is known".
+fn read_manifest(brain_home: &Path) -> Option<InstallManifest> {
+    let path = brain_home.join("install-manifest.json");
+    let bytes = read_no_follow(&path, MAX_MANIFEST_BYTES, true).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether the id is one of the supported agents (route-side validation so
+/// unknown ids are refused before any filesystem work).
+pub(crate) fn agent_id_known(id: &str) -> bool {
+    AgentClient::from_id(id).is_some()
+}
+
+fn configured_agent(home: &Path, client: AgentClient, homes: &ClientHomes) -> Option<bool> {
+    match client {
+        AgentClient::Claude if !homes.claude.state.relocated() => {
+            mcp_entry_present(&[home.join(".claude.json")], "/mcpServers/brain")
+        }
+        AgentClient::Codex if !homes.codex.state.relocated() => {
+            let bytes = read_no_follow(
+                &home.join(".codex/config.toml"),
+                MAX_CLIENT_FILE_BYTES,
+                false,
+            )
+            .ok()??;
+            Some(
+                std::str::from_utf8(&bytes)
+                    .ok()?
+                    .contains("[mcp_servers.brain]"),
+            )
+        }
+        AgentClient::Cursor => {
+            mcp_entry_present(&[home.join(".cursor/mcp_config.json")], "/mcpServers/brain")
+        }
+        AgentClient::Opencode => mcp_entry_present(
+            &[
+                home.join(".config/opencode/opencode.jsonc"),
+                home.join(".config/opencode/opencode.json"),
+            ],
+            "/mcp/brain",
+        ),
+        AgentClient::Openclaw => mcp_entry_present(
+            &[home.join(".openclaw/openclaw.json")],
+            "/mcp/servers/brain",
+        ),
+        AgentClient::Kimi => {
+            mcp_entry_present(&[home.join(".kimi-code/mcp.json")], "/mcpServers/brain")
+        }
+        _ => None,
+    }
+}
+
+/// Configured MCP presence and manifest ownership are separate observations;
+/// neither proves a live handshake. Names and states only, no config contents.
+pub(crate) fn agents_document(home: &Path, brain_home: &Path) -> Value {
+    let manifest = read_manifest(brain_home);
+    let homes = crate::client_home::from_process_env(home);
+    let detected = detect_clients(home, &homes, &executable_on_path);
+    let agents = [
+        AgentClient::Claude,
+        AgentClient::Codex,
+        AgentClient::Cursor,
+        AgentClient::Opencode,
+        AgentClient::Openclaw,
+        AgentClient::Kimi,
+    ]
+    .iter()
+    .map(|client| {
+        let owned = default_client_paths(home, *client);
+        let managed = manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .entries
+                .iter()
+                .any(|entry| owned.contains(&entry.path))
+        });
+        json!({
+            "id": client.id(),
+            "label": client.name(),
+            "detected": detected.iter().any(|found| found.id() == client.id()),
+            "connected": configured_agent(home, *client, &homes),
+            "managed": managed,
+            "runtime_handshake": "not_checked",
+        })
+    })
+    .collect::<Vec<_>>();
+    json!({"agents": agents})
+}
+
+/// The exact plan `brain init --agents --dry-run` would show for ONE agent,
+/// built by the same planner. File headers use basenames; configuration
+/// content in the diff can itself contain executable paths.
+pub(crate) fn install_preview_document(
+    home: &Path,
+    brain_home: &Path,
+    binary: &Path,
+    agent: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let client = AgentClient::from_id(agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
+    crate::private_fs::require_safe_homes(home, brain_home)?;
+    validate_versionless_binary(binary)?;
+    let homes = crate::client_home::from_process_env(home);
+    let detected = detect_clients(home, &homes, &executable_on_path)
+        .into_iter()
+        .any(|found| found.id() == client.id());
+    if !detected {
+        return Ok(json!({"agent": agent, "detected": false, "plans": []}));
+    }
+    let plans = build_plans(home, &stable_copy_path(brain_home), &[client]);
+    let revision = sha256(&serde_json::to_vec(
+        &plans
+            .iter()
+            .map(|plan| {
+                json!({
+                    "path": plan.path, "before": plan.before.as_deref().map(sha256),
+                    "after": plan.after.as_deref().map(sha256), "conflict":plan.conflict,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?);
+    let documents = plans
+        .iter()
+        .map(|plan| {
+            let changed = plan.conflict.is_none() && plan.before != plan.after;
+            let diff = if changed {
+                // The two header lines carry the full path; file name only.
+                render_diff(&plan.path, plan.before.as_deref(), plan.after.as_deref())
+                    .lines()
+                    .skip(2)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            json!({
+                "file": plan.path.file_name().and_then(OsStr::to_str).unwrap_or("file"),
+                "description": plan.description,
+                "conflict": plan.conflict,
+                "changed": changed,
+                "diff": diff,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({"agent": agent, "detected": true, "plans": documents, "revision": revision}))
+}
+
+/// Restore preview with the same checksum and backup checks as uninstall.
+/// File headers use basenames; config content is shown as a bounded diff.
+pub(crate) fn disconnect_preview_document(
+    home: &Path,
+    brain_home: &Path,
+    agent: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let client = AgentClient::from_id(agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
+    crate::private_fs::require_safe_homes(home, brain_home)?;
+    let Some(manifest) = read_manifest(brain_home) else {
+        return Err("нет манифеста установки: нечего отключать".into());
+    };
+    validate_manifest(home, &manifest)?;
+    let homes = crate::client_home::from_process_env(home);
+    if relocated_clients(&homes)
+        .iter()
+        .any(|(found, _)| *found == client)
+    {
+        return Err("relocated client home: restore refused".into());
+    }
+    let owned = default_client_paths(home, client);
+    let backup_dir = brain_home.join("install-backups");
+    private_dir(&backup_dir)?;
+    let mut plans = Vec::new();
+    let mut versions = Vec::new();
+    for entry in manifest
+        .entries
+        .iter()
+        .filter(|entry| owned.contains(&entry.path))
+    {
+        symlink_free(home, &entry.path)?;
+        let current = read_no_follow(&entry.path, MAX_CLIENT_FILE_BYTES, false)?;
+        let original = if entry.existed {
+            let backup = entry.backup.as_ref().ok_or("missing backup")?;
+            let bytes = read_no_follow(&backup_dir.join(backup), MAX_CLIENT_FILE_BYTES, true)?
+                .ok_or("missing backup")?;
+            if entry.before_sha256.as_deref() != Some(sha256(&bytes).as_str()) {
+                return Err("backup checksum mismatch".into());
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        versions.push(json!({"path": entry.path, "before":current.as_deref().map(sha256), "after":original.as_deref().map(sha256)}));
+        let changed = current != original;
+        let conflict = changed
+            && current.as_deref().map(sha256).as_deref() != Some(entry.after_sha256.as_str());
+        plans.push(json!({
+            "file": entry.path.file_name().and_then(OsStr::to_str).unwrap_or("file"),
+            "changed": changed && !conflict,
+            "conflict": if conflict { Some("file changed after installation; restore refused") } else { None },
+            "diff": if changed && !conflict { render_diff(&entry.path, current.as_deref(), original.as_deref())
+                .lines().skip(2).collect::<Vec<_>>().join("\n") } else { String::new() },
+        }));
+    }
+    Ok(json!({"agent": agent, "plans": plans, "revision":sha256(&serde_json::to_vec(&versions)?)}))
+}
+
+/// Connect one agent through the exact install path (`yes`: the window's
+/// confirmation already happened before this call).
+pub(crate) fn install_agent(
+    home: &Path,
+    brain_home: &Path,
+    binary: &Path,
+    agent: &str,
+) -> Result<usize, Box<dyn Error>> {
+    crate::private_fs::require_safe_homes(home, brain_home)?;
+    let homes = crate::client_home::from_process_env(home);
+    install_with_only(
+        home,
+        brain_home,
+        binary,
+        false,
+        true,
+        &homes,
+        &executable_on_path,
+        Some(agent),
+    )
+}
+
+/// Disconnect one agent through the exact uninstall path; the manifest keeps
+/// every other agent's entries.
+pub(crate) fn uninstall_agent(
+    home: &Path,
+    brain_home: &Path,
+    agent: &str,
+) -> Result<usize, Box<dyn Error>> {
+    crate::private_fs::require_safe_homes(home, brain_home)?;
+    let homes = crate::client_home::from_process_env(home);
+    uninstall_with_only(home, brain_home, false, true, &homes, Some(agent))
 }
 
 /// Clients whose home variable points away from the default location. They
@@ -482,16 +898,30 @@ fn default_client_paths(home: &Path, client: AgentClient) -> Vec<PathBuf> {
             home.join(".cursor/mcp_config.json"),
             home.join(".cursor/rules/brain-for-ai.mdc"),
         ],
+        AgentClient::Opencode => vec![
+            home.join(".config/opencode/opencode.jsonc"),
+            home.join(".config/opencode/opencode.json"),
+            home.join(".config/opencode/AGENTS.md"),
+        ],
+        AgentClient::Openclaw => vec![home.join(".openclaw/openclaw.json")],
+        AgentClient::Kimi => vec![home.join(".kimi-code/mcp.json")],
     }
 }
 
 /// Every path a valid manifest may name: the exact default files of the
 /// clients Brain integrates, under the current `HOME`.
 fn managed_paths(home: &Path) -> Vec<PathBuf> {
-    [AgentClient::Claude, AgentClient::Codex, AgentClient::Cursor]
-        .into_iter()
-        .flat_map(|client| default_client_paths(home, client))
-        .collect()
+    [
+        AgentClient::Claude,
+        AgentClient::Codex,
+        AgentClient::Cursor,
+        AgentClient::Opencode,
+        AgentClient::Openclaw,
+        AgentClient::Kimi,
+    ]
+    .into_iter()
+    .flat_map(|client| default_client_paths(home, client))
+    .collect()
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -663,22 +1093,54 @@ fn symlink_free(home: &Path, path: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn detect_clients(home: &Path, homes: &ClientHomes) -> Vec<AgentClient> {
+fn detect_clients(
+    home: &Path,
+    homes: &ClientHomes,
+    path_probe: &dyn Fn(&str) -> bool,
+) -> Vec<AgentClient> {
     let mut clients = Vec::new();
-    if !homes.claude.state.relocated()
-        && (home.join(".claude").exists() || executable_on_path("claude"))
-    {
+    if !homes.claude.state.relocated() && (home.join(".claude").exists() || path_probe("claude")) {
         clients.push(AgentClient::Claude);
     }
-    if !homes.codex.state.relocated()
-        && (home.join(".codex").exists() || executable_on_path("codex"))
-    {
+    if !homes.codex.state.relocated() && (home.join(".codex").exists() || path_probe("codex")) {
         clients.push(AgentClient::Codex);
     }
-    if home.join(".cursor").exists() || executable_on_path("cursor") {
+    if home.join(".cursor").exists() || path_probe("cursor") {
         clients.push(AgentClient::Cursor);
     }
+    if home.join(".config/opencode").exists() || path_probe("opencode") {
+        clients.push(AgentClient::Opencode);
+    }
+    if home.join(".openclaw").exists() || path_probe("openclaw") {
+        clients.push(AgentClient::Openclaw);
+    }
+    if home.join(".kimi-code").exists() || path_probe("kimi") {
+        clients.push(AgentClient::Kimi);
+    }
     clients
+}
+
+/// Whether any of the given config files names the Brain MCP entry.
+///
+/// `Some(present)` when a file was readable and parsed; `None` when nothing
+/// could be read or the file did not parse — an unreadable config is not
+/// evidence of absence.
+pub(crate) fn mcp_entry_present(paths: &[PathBuf], pointer: &str) -> Option<bool> {
+    for path in paths {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = parse_jsonc(&text) else {
+            return None;
+        };
+        return Some(value.pointer(pointer).is_some());
+    }
+    None
+}
+
+/// PATH probe for doctor's integration report.
+pub(crate) fn executable_on_path_pub(name: &str) -> bool {
+    executable_on_path(name)
 }
 
 fn executable_on_path(name: &str) -> bool {
@@ -768,9 +1230,197 @@ fn build_plans(home: &Path, binary: &Path, clients: &[AgentClient]) -> Vec<Plann
                     None,
                 ));
             }
+            AgentClient::Opencode => {
+                // Both config names are supported by OpenCode; patch the one
+                // that exists, default to plain JSON for a fresh install.
+                let jsonc = home.join(".config/opencode/opencode.jsonc");
+                let plain = home.join(".config/opencode/opencode.json");
+                let config = if jsonc.exists() { jsonc } else { plain };
+                plans.push(json_plan(
+                    *client,
+                    config,
+                    "register user-scoped Brain MCP (OpenCode has no hook config; plugins only)",
+                    |text| patch_opencode_json(text, &command),
+                ));
+                plans.push(marker_plan(
+                    *client,
+                    home.join(".config/opencode/AGENTS.md"),
+                    "add user-scoped memory instructions",
+                    &instructions,
+                    MD_BEGIN,
+                    MD_END,
+                    None,
+                ));
+            }
+            AgentClient::Openclaw => {
+                plans.push(json_plan(
+                    *client,
+                    home.join(".openclaw/openclaw.json"),
+                    "register user-scoped Brain MCP (OpenClaw has no hook config)",
+                    |text| patch_openclaw_json(text, &command),
+                ));
+            }
+            AgentClient::Kimi => {
+                // Kimi Code reads stdio MCP servers from `mcpServers` in ~/.kimi-code/mcp.json
+                // (the same shape as Cursor's). Its SessionStart hook is observation-only, so
+                // there is no start-of-session notice to register.
+                plans.push(json_plan(
+                    *client,
+                    home.join(".kimi-code/mcp.json"),
+                    "register user-scoped Brain MCP (Kimi Code hooks cannot add context)",
+                    |text| patch_mcp_json(text, &command),
+                ));
+            }
         }
     }
     plans
+}
+
+/// OpenCode `mcp.brain`: a local stdio server.
+fn opencode_entry(binary: &str) -> String {
+    format!(
+        "\"brain\": {{\"type\": \"local\", \"command\": [{}, \"serve\"], \"enabled\": true}}",
+        serde_json::to_string(binary).unwrap_or_default()
+    )
+}
+
+fn opencode_entry_compatible(value: &serde_json::Value, binary: &str) -> bool {
+    let Some(entry) = value.as_object() else {
+        return false;
+    };
+    if entry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "command" | "enabled"))
+    {
+        return false;
+    }
+    let command = entry
+        .get("command")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    entry.get("type").and_then(serde_json::Value::as_str) == Some("local")
+        && command.as_deref() == Some([binary, "serve"].as_slice())
+        && entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn patch_opencode_json(original: &str, binary: &str) -> Result<String, String> {
+    // opencode.jsonc is JSONC: comments and trailing commas are legal, so the
+    // structural check goes through parse_jsonc while every edit is textual
+    // and keeps the surrounding bytes (including comments) untouched.
+    parse_jsonc_lenient(original).and_then(|value| {
+        value.as_object().map(|_| ()).ok_or_else(|| {
+            "existing configuration is not a JSON object; refusing to edit".to_owned()
+        })
+    })?;
+    let mut text = original.to_owned();
+    let root = object_bounds(&text, 0)?;
+    let entry = opencode_entry(binary);
+    if let Some((start, _)) = property_value(&text, root, "mcp")? {
+        if text.as_bytes().get(start) != Some(&b'{') {
+            return Err("mcp is not a JSON object; refusing to edit it".to_owned());
+        }
+        let servers = object_bounds(&text, start)?;
+        if let Some((brain_start, brain_end)) = property_value(&text, servers, "brain")? {
+            let current = parse_jsonc_lenient(&text[brain_start..brain_end])
+                .map_err(|_| "mcp.brain is not valid JSON; refusing to edit it".to_owned())?;
+            if !opencode_entry_compatible(&current, binary) {
+                return Err(format!(
+                    "mcp.brain already exists with different settings; expected {{type: local, \
+                     command: [{}, \"serve\"], enabled: true}} and no other keys. Edit or remove it \
+                     manually",
+                    serde_json::to_string(binary).unwrap_or_default()
+                ));
+            }
+        } else {
+            text = insert_object_member(&text, servers, &entry);
+        }
+    } else {
+        let value = format!("\"mcp\": {{{entry}}}");
+        text = insert_object_member(&text, root, &value);
+    }
+    Ok(text)
+}
+
+/// OpenClaw `mcp.servers.brain` per its own `openclaw config schema`.
+fn openclaw_entry(binary: &str) -> String {
+    format!(
+        "\"brain\": {{\"enabled\": true, \"command\": {}, \"args\": [\"serve\"]}}",
+        serde_json::to_string(binary).unwrap_or_default()
+    )
+}
+
+fn openclaw_entry_compatible(value: &serde_json::Value, binary: &str) -> bool {
+    let Some(entry) = value.as_object() else {
+        return false;
+    };
+    if entry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "enabled" | "command" | "args" | "env"))
+    {
+        return false;
+    }
+    let args = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+        && entry.get("command").and_then(serde_json::Value::as_str) == Some(binary)
+        && args.as_deref() == Some(["serve"].as_slice())
+}
+
+fn patch_openclaw_json(original: &str, binary: &str) -> Result<String, String> {
+    parse_jsonc_lenient(original).and_then(|value| {
+        value.as_object().map(|_| ()).ok_or_else(|| {
+            "existing configuration is not a JSON object; refusing to edit".to_owned()
+        })
+    })?;
+    let mut text = original.to_owned();
+    let root = object_bounds(&text, 0)?;
+    let entry = openclaw_entry(binary);
+    if let Some((start, _)) = property_value(&text, root, "mcp")? {
+        if text.as_bytes().get(start) != Some(&b'{') {
+            return Err("mcp is not a JSON object; refusing to edit it".to_owned());
+        }
+        let mcp_bounds = object_bounds(&text, start)?;
+        if let Some((servers_start, _)) = property_value(&text, mcp_bounds, "servers")? {
+            if text.as_bytes().get(servers_start) != Some(&b'{') {
+                return Err("mcp.servers is not a JSON object; refusing to edit it".to_owned());
+            }
+            let servers = object_bounds(&text, servers_start)?;
+            if let Some((brain_start, brain_end)) = property_value(&text, servers, "brain")? {
+                let current = parse_jsonc_lenient(&text[brain_start..brain_end]).map_err(|_| {
+                    "mcp.servers.brain is not valid JSON; refusing to edit it".to_owned()
+                })?;
+                if !openclaw_entry_compatible(&current, binary) {
+                    return Err(format!(
+                        "mcp.servers.brain already exists with different settings; expected \
+                         {{enabled: true, command: {}, args: [\"serve\"]}} and no other keys besides \
+                         env. Edit or remove it manually",
+                        serde_json::to_string(binary).unwrap_or_default()
+                    ));
+                }
+            } else {
+                text = insert_object_member(&text, servers, &entry);
+            }
+        } else {
+            let value = format!("\"servers\": {{{entry}}}");
+            text = insert_object_member(&text, mcp_bounds, &value);
+        }
+    } else {
+        let value = format!("\"mcp\": {{\"servers\": {{{entry}}}}}");
+        text = insert_object_member(&text, root, &value);
+    }
+    Ok(text)
 }
 
 fn json_plan<F>(client: AgentClient, path: PathBuf, description: &str, patch: F) -> PlannedChange
@@ -1390,6 +2040,81 @@ fn parse_jsonc(text: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&stripped).map_err(|error| error.to_string())
 }
 
+/// JSONC validation that also tolerates trailing commas — legal in JSONC
+/// configs (OpenCode's own file uses them), rejected by serde_json.
+fn parse_jsonc_lenient(text: &str) -> Result<serde_json::Value, String> {
+    // Reuse the comment stripper by round-tripping through parse_jsonc only
+    // for its error; instead strip here and drop trailing commas outside
+    // strings before the JSON parse.
+    let bytes = text.as_bytes();
+    let mut stripped = Vec::with_capacity(bytes.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            stripped.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => {
+                in_string = true;
+                stripped.push(byte);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    stripped.push(b' ');
+                    index += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let close = text[index + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                stripped.extend(
+                    bytes[index..close]
+                        .iter()
+                        .map(|&byte| if byte == b'\n' { b'\n' } else { b' ' }),
+                );
+                index = close;
+                continue;
+            }
+            b',' => {
+                // A comma is trailing when the next non-space/comment byte
+                // closes the enclosing object or array.
+                let mut lookahead = index + 1;
+                while lookahead < bytes.len()
+                    && (bytes[lookahead] == b' '
+                        || bytes[lookahead] == b'\n'
+                        || bytes[lookahead] == b'\r'
+                        || bytes[lookahead] == b'\t')
+                {
+                    lookahead += 1;
+                }
+                if lookahead < bytes.len() && (bytes[lookahead] == b'}' || bytes[lookahead] == b']')
+                {
+                    // drop the comma
+                } else {
+                    stripped.push(byte);
+                }
+            }
+            _ => stripped.push(byte),
+        }
+        index += 1;
+    }
+    serde_json::from_slice(&stripped).map_err(|error| error.to_string())
+}
+
 fn ensure_json_object(original: &str) -> Result<String, String> {
     if original.trim().is_empty() {
         return Ok("{}\n".to_owned());
@@ -1680,15 +2405,12 @@ mod home_guard_tests {
     use crate::private_fs::tests::{snapshot, unsafe_home_pairs};
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
+    fn scratch(_tag: &str) -> PathBuf {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-installer-guard-{tag}-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-installer-guard");
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         root
@@ -1711,7 +2433,15 @@ mod home_guard_tests {
         for (home, brain_home) in unsafe_home_pairs(&root) {
             for dry_run in [true, false] {
                 for result in [
-                    install_with(&home, &brain_home, &source, dry_run, true, &homes),
+                    install_with(
+                        &home,
+                        &brain_home,
+                        &source,
+                        dry_run,
+                        true,
+                        &homes,
+                        &no_probe(),
+                    ),
                     uninstall_with(&home, &brain_home, dry_run, true, &homes),
                     install(&home, &brain_home, &source, dry_run, true),
                     uninstall(&home, &brain_home, dry_run, true),
@@ -1739,7 +2469,16 @@ mod home_guard_tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
         let homes = crate::client_home::classify_all(&home, None, None, None);
         let before = snapshot(&root);
-        install_with(&home, &home.join(".brain"), &source, true, true, &homes).unwrap();
+        install_with(
+            &home,
+            &home.join(".brain"),
+            &source,
+            true,
+            true,
+            &homes,
+            &no_probe(),
+        )
+        .unwrap();
         uninstall_with(&home, &home.join(".brain"), true, true, &homes).unwrap();
         assert_eq!(snapshot(&root), before, "dry runs still write nothing");
         let _ = fs::remove_dir_all(root);
@@ -2095,8 +2834,6 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
-    /// Tests inject client-home variables instead of reading or mutating the
-    /// process environment, so parallel tests cannot race on it.
     fn unset_homes() -> ClientHomes {
         crate::client_home::classify_all(Path::new("/synthetic/home"), None, None, None)
     }
@@ -2145,8 +2882,16 @@ mod tests {
             crate::client_home::classify_all(&home, None, Some(forbidden.as_os_str()), None);
         let codex_before = snapshot(&home, &CODEX_FILES);
         let claude_before = snapshot(&home, &CLAUDE_FILES);
-        let applied =
-            install_with(&home, &brain_home, &binary, false, true, &homes).expect("install");
+        let applied = install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &homes,
+            &no_probe(),
+        )
+        .expect("install");
         assert!(applied > 0, "the unrelated client still installs");
         assert_eq!(
             snapshot(&home, &CODEX_FILES),
@@ -2189,8 +2934,18 @@ mod tests {
             None,
         );
         let claude_before = snapshot(&home, &CLAUDE_FILES);
-        install_with(&home, &brain_home, &binary, true, true, &homes).expect("dry run");
-        install_with(&home, &brain_home, &binary, false, true, &homes).expect("install");
+        install_with(&home, &brain_home, &binary, true, true, &homes, &no_probe())
+            .expect("dry run");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &homes,
+            &no_probe(),
+        )
+        .expect("install");
         assert_eq!(snapshot(&home, &CLAUDE_FILES), claude_before);
         let manifest = fs::read_to_string(brain_home.join("install-manifest.json")).unwrap();
         assert!(manifest.contains(".codex/hooks.json"), "Codex proceeds");
@@ -2234,6 +2989,138 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn install_with_only_writes_just_the_named_agent() {
+        let (root, home, brain_home, binary) = guard_fixture("per-agent-install");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), b"{}\n").unwrap();
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        let applied = install_with_only(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+            Some("claude"),
+        )
+        .expect("install claude only");
+        assert!(applied > 0);
+        let manifest: InstallManifest =
+            serde_json::from_slice(&fs::read(brain_home.join("install-manifest.json")).unwrap())
+                .unwrap();
+        assert!(!manifest.entries.is_empty());
+        for entry in &manifest.entries {
+            assert!(default_client_paths(&home, AgentClient::Claude).contains(&entry.path));
+        }
+        // The other detected agent is untouched.
+        assert!(!home.join(".cursor/mcp_config.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_preview_document_plans_only_the_named_agent() {
+        let (root, home, brain_home, binary) = guard_fixture("per-agent-preview");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), b"{}\n").unwrap();
+        let document =
+            install_preview_document(&home, &brain_home, &binary, "claude").expect("preview");
+        assert_eq!(document["detected"], serde_json::json!(true));
+        let plans = document["plans"].as_array().expect("plans array");
+        assert!(!plans.is_empty());
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan["file"] == serde_json::json!("settings.json"))
+        );
+        for plan in plans {
+            // File names only: no full path may reach the window.
+            assert!(
+                plan["file"]
+                    .as_str()
+                    .is_some_and(|name| !name.contains('/'))
+            );
+        }
+        let unknown = install_preview_document(&home, &brain_home, &binary, "stranger");
+        assert!(unknown.is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_with_only_keeps_the_other_agents_entries() {
+        let (root, home, brain_home, binary) = guard_fixture("per-agent-uninstall");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), b"{}\n").unwrap();
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(
+            home.join(".cursor/mcp_config.json"),
+            b"{\"mcpServers\":{}}\n",
+        )
+        .unwrap();
+        for agent in ["claude", "cursor"] {
+            install_with_only(
+                &home,
+                &brain_home,
+                &binary,
+                false,
+                true,
+                &unset_homes(),
+                &no_probe(),
+                Some(agent),
+            )
+            .expect("connect agents sequentially");
+        }
+        let preview = disconnect_preview_document(&home, &brain_home, "claude").unwrap();
+        assert!(
+            preview["plans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|plan| plan["changed"] == true
+                    && plan["diff"].as_str().is_some_and(|diff| diff.contains("-")))
+        );
+        let claude_settings = home.join(".claude/settings.json");
+
+        let restored = uninstall_with_only(
+            &home,
+            &brain_home,
+            false,
+            true,
+            &unset_homes(),
+            Some("claude"),
+        )
+        .expect("uninstall claude");
+        assert!(restored > 0);
+        // Claude's file is back to its pre-Brain bytes…
+        assert_eq!(fs::read(&claude_settings).unwrap(), b"{}\n");
+        // …while Cursor keeps its integration and its manifest entries.
+        let cursor_now = fs::read(home.join(".cursor/mcp_config.json")).unwrap();
+        assert!(String::from_utf8_lossy(&cursor_now).contains("brain"));
+        let manifest_bytes = fs::read(brain_home.join("install-manifest.json")).unwrap();
+        let manifest: InstallManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(manifest
+            .entries
+            .iter()
+            .any(|entry| default_client_paths(&home, AgentClient::Cursor).contains(&entry.path)));
+        assert!(
+            manifest.entries.iter().all(
+                |entry| !default_client_paths(&home, AgentClient::Claude).contains(&entry.path)
+            )
+        );
+
+        // The remaining agent still uninstalls cleanly afterwards.
+        let rest = uninstall_with_only(&home, &brain_home, false, true, &unset_homes(), None)
+            .expect("uninstall cursor");
+        assert!(rest > 0);
+        assert!(!brain_home.join("install-manifest.json").exists());
+        assert_eq!(
+            fs::read(home.join(".cursor/mcp_config.json")).unwrap(),
+            b"{\"mcpServers\":{}}\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn installed_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
         let (root, home, brain_home, binary) = guard_fixture(label);
         fs::create_dir_all(home.join(".cursor")).unwrap();
@@ -2242,7 +3129,16 @@ mod tests {
             b"{\"mcpServers\":{}}\n",
         )
         .unwrap();
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
         (root, home, brain_home)
     }
 
@@ -2321,6 +3217,285 @@ mod tests {
     }
 
     #[test]
+    fn opencode_jsonc_keeps_comments_and_foreign_keys_and_is_idempotent() {
+        let root = compat_root("opencode-jsonc");
+        let home = root.join("home");
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        let before = "{\n  // user's own comment, must survive\n  \"theme\": \"opencode\",\n  \"model\": \"synthetic/model\",\n}";
+        fs::write(home.join(".config/opencode/opencode.jsonc"), before).unwrap();
+        fs::write(home.join(".config/opencode/AGENTS.md"), "# Notes\n").unwrap();
+
+        let binary = root.join("build/brain");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
+        let after = fs::read_to_string(home.join(".config/opencode/opencode.jsonc")).unwrap();
+        assert!(
+            after.contains("// user's own comment, must survive"),
+            "{after}"
+        );
+        assert!(after.contains("\"theme\""), "{after}");
+        assert!(after.contains("\"brain\""), "{after}");
+        // The patched document must still parse as JSONC.
+        let parsed = parse_jsonc(&after).expect("jsonc");
+        // The registered command is the stable copy, exactly as for the other clients.
+        assert_eq!(
+            parsed
+                .pointer("/mcp/brain/command/0")
+                .and_then(serde_json::Value::as_str),
+            Some(stable_copy_path(&brain_home).to_string_lossy().as_ref())
+        );
+
+        // Repeat: nothing changes.
+        let before_bytes = fs::read(home.join(".config/opencode/opencode.jsonc")).unwrap();
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("repeat");
+        assert_eq!(
+            fs::read(home.join(".config/opencode/opencode.jsonc")).unwrap(),
+            before_bytes
+        );
+
+        // Uninstall restores the exact original bytes from the backup.
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).expect("uninstall");
+        assert_eq!(
+            fs::read(home.join(".config/opencode/opencode.jsonc")).unwrap(),
+            before.as_bytes()
+        );
+        assert_eq!(
+            fs::read(home.join(".config/opencode/AGENTS.md")).unwrap(),
+            b"# Notes\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_conflicting_brain_entry_is_reported_not_overwritten() {
+        let root = compat_root("opencode-conflict");
+        let home = root.join("home");
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        fs::write(
+            home.join(".config/opencode/opencode.json"),
+            "{\"mcp\": {\"brain\": {\"type\": \"local\", \"command\": [\"other\"], \"enabled\": true}}}",
+        )
+        .unwrap();
+        let plans = build_plans(&home, &root.join("build/brain"), &[AgentClient::Opencode]);
+        let conflict = plans
+            .iter()
+            .find(|plan| plan.conflict.is_some())
+            .expect("a conflict must be planned");
+        assert!(
+            conflict
+                .conflict
+                .as_deref()
+                .unwrap()
+                .contains("different settings")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openclaw_json_gets_the_schema_shape_and_stays_idempotent() {
+        let root = compat_root("openclaw-json");
+        let home = root.join("home");
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".openclaw")).unwrap();
+        let before = "{\n  \"meta\": {\"owner\": \"synthetic\"}\n}";
+        fs::write(home.join(".openclaw/openclaw.json"), before).unwrap();
+
+        let binary = root.join("build/brain");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
+        let after = fs::read_to_string(home.join(".openclaw/openclaw.json")).unwrap();
+        let parsed = parse_jsonc(&after).expect("json");
+        assert_eq!(
+            parsed
+                .pointer("/mcp/servers/brain/enabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .pointer("/meta/owner")
+                .and_then(serde_json::Value::as_str),
+            Some("synthetic")
+        );
+
+        let before_bytes = fs::read(home.join(".openclaw/openclaw.json")).unwrap();
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("repeat");
+        assert_eq!(
+            fs::read(home.join(".openclaw/openclaw.json")).unwrap(),
+            before_bytes
+        );
+
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).expect("uninstall");
+        assert_eq!(
+            fs::read(home.join(".openclaw/openclaw.json")).unwrap(),
+            before.as_bytes()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kimi_code_mcp_json_keeps_foreign_servers_and_uninstalls_byte_for_byte() {
+        let root = compat_root("kimi-mcp");
+        let home = root.join("home");
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".kimi-code")).unwrap();
+        let before = "{\n  \"mcpServers\": {\"filesystem\": {\"command\": \"npx\", \"args\": [\"-y\"]}}\n}\n";
+        let config = home.join(".kimi-code/mcp.json");
+        fs::write(&config, before).unwrap();
+        let binary = root.join("build/brain");
+        let install = || {
+            install_with(
+                &home,
+                &brain_home,
+                &binary,
+                false,
+                true,
+                &unset_homes(),
+                &no_probe(),
+            )
+            .expect("install")
+        };
+        install();
+        let parsed = parse_jsonc(&fs::read_to_string(&config).unwrap()).expect("json");
+        assert_eq!(
+            parsed
+                .pointer("/mcpServers/brain/args/0")
+                .and_then(serde_json::Value::as_str),
+            Some("serve")
+        );
+        assert_eq!(
+            parsed
+                .pointer("/mcpServers/filesystem/command")
+                .and_then(serde_json::Value::as_str),
+            Some("npx"),
+            "a server the user already had must survive"
+        );
+        let installed = fs::read(&config).unwrap();
+        install();
+        assert_eq!(
+            fs::read(&config).unwrap(),
+            installed,
+            "a second install changes nothing"
+        );
+        uninstall_with(&home, &brain_home, false, true, &unset_homes()).expect("uninstall");
+        assert_eq!(fs::read(&config).unwrap(), before.as_bytes());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kimi_code_is_detected_by_its_home_or_binary() {
+        let root = compat_root("detect-kimi");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        assert!(detect_clients(&home, &unset_homes(), &no_probe()).is_empty());
+        let found = detect_clients(&home, &unset_homes(), &|name: &str| name == "kimi");
+        assert_eq!(found, [AgentClient::Kimi]);
+        fs::create_dir_all(home.join(".kimi-code")).unwrap();
+        assert_eq!(
+            detect_clients(&home, &unset_homes(), &no_probe()),
+            [AgentClient::Kimi]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_and_openclaw_are_detected_by_config_dir_or_binary() {
+        let root = compat_root("detect-two");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        let detected = detect_clients(&home, &unset_homes(), &no_probe());
+        assert_eq!(detected, [AgentClient::Opencode]);
+        fs::create_dir_all(home.join(".openclaw")).unwrap();
+        let detected = detect_clients(&home, &unset_homes(), &no_probe());
+        assert_eq!(detected, [AgentClient::Opencode, AgentClient::Openclaw]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dry_run_writes_nothing_for_the_new_agents() {
+        let root = compat_root("opencode-dry");
+        let home = root.join("home");
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("brain"), b"#!/bin/sh\nexit 0\n").unwrap();
+        let brain_home = home.join(".brain");
+        fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        fs::create_dir_all(home.join(".openclaw")).unwrap();
+        fs::write(home.join(".config/opencode/opencode.json"), "{}\n").unwrap();
+        fs::write(home.join(".openclaw/openclaw.json"), "{}\n").unwrap();
+        let before = (
+            fs::read(home.join(".config/opencode/opencode.json")).unwrap(),
+            fs::read(home.join(".openclaw/openclaw.json")).unwrap(),
+        );
+        install_with(
+            &home,
+            &brain_home,
+            &root.join("build/brain"),
+            true,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("dry run");
+        assert_eq!(
+            (
+                fs::read(home.join(".config/opencode/opencode.json")).unwrap(),
+                fs::read(home.join(".openclaw/openclaw.json")).unwrap()
+            ),
+            before,
+            "a dry run must not write"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn uninstall_with_only_claude_relocated_restores_codex_and_cursor() {
         let (root, home, brain_home) = installed_fixture("unguard-claude");
         let installed_claude = snapshot(&home, &CLAUDE_FILES);
@@ -2380,7 +3555,16 @@ mod tests {
         fs::create_dir_all(home.join(".cursor")).unwrap();
         fs::write(home.join(".cursor/mcp_config.json"), CURSOR_BEFORE).unwrap();
         let original = snapshot(&home, &all_client_files());
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).unwrap();
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .unwrap();
         let manifest_path = brain_home.join("install-manifest.json");
         let entries = serde_json::from_slice::<InstallManifest>(&fs::read(&manifest_path).unwrap())
             .unwrap()
@@ -2787,6 +3971,7 @@ mod tests {
             false,
             true,
             &unset_homes(),
+            &no_probe(),
         )
         .unwrap();
         let _ = fs::remove_dir_all(brain_home.join("install-backups"));
@@ -2828,6 +4013,7 @@ mod tests {
             false,
             true,
             &unset_homes(),
+            &no_probe(),
         )
         .unwrap();
         let manifest: InstallManifest =
@@ -2872,21 +4058,18 @@ mod tests {
 
     /// Clients that would be planned, without Cursor, for compact assertions.
     fn build_plans_for(home: &Path, homes: &ClientHomes) -> Vec<AgentClient> {
-        detect_clients(home, homes)
+        detect_clients(home, homes, &no_probe())
             .into_iter()
             .filter(|client| *client != AgentClient::Cursor)
             .collect()
     }
 
-    fn compat_root(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
+    fn compat_root(_label: &str) -> PathBuf {
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "brain-compat-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+        crate::test_support::temp_path("brain-compat")
     }
 
     /// Nested `projects.*.mcpServers`, a decoy string and a comment come
@@ -3168,19 +4351,46 @@ mod tests {
         fs::create_dir_all(&build).unwrap();
         let binary = build.join("brain");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
-        install_with(&home, &brain_home, &binary, true, true, &unset_homes()).expect("dry run");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            true,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("dry run");
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
         assert!(
             !home.join(".codex/hooks.json").exists(),
             "dry run writes nothing"
         );
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
         let first = (
             fs::read(home.join(".codex/hooks.json")).ok(),
             fs::read(home.join(".codex/AGENTS.md")).ok(),
         );
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("repeat");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("repeat");
         assert_eq!(fs::read(home.join(".codex/config.toml")).unwrap(), toml);
         assert_eq!(
             (
@@ -3279,12 +4489,30 @@ mod tests {
         };
         let before = snapshot();
 
-        install_with(&home, &brain_home, &binary, true, true, &unset_homes()).expect("dry run");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            true,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("dry run");
         assert_eq!(snapshot(), before, "dry run writes nothing");
         assert!(!brain_home.join("install-manifest.json").exists());
         assert!(!stable.exists());
 
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("install");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
         let first = snapshot();
         assert_eq!(first[0], before[0], "compatible root entry byte-identical");
         assert_eq!(first[3], before[3], "conflicting TOML untouched");
@@ -3293,15 +4521,23 @@ mod tests {
             serde_json::from_slice(first[1].as_ref().unwrap()).unwrap();
         assert_eq!(settings["theme"], "dark");
 
-        install_with(&home, &brain_home, &binary, false, true, &unset_homes()).expect("repeat");
+        install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("repeat");
         assert_eq!(snapshot(), first, "repeated install changes nothing");
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn claude_user_config_is_planned_even_when_absent() {
-        let home =
-            std::env::temp_dir().join(format!("brain-missing-config-{}", std::process::id()));
+        let home = crate::test_support::temp_path("brain-missing-config");
         assert!(!home.exists());
         let plans = build_plans(&home, Path::new("/opt/brain"), &[AgentClient::Claude]);
         let plan = plans
@@ -3318,11 +4554,11 @@ mod tests {
 
     #[test]
     fn unreadable_or_non_utf8_json_is_never_treated_as_missing() {
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("brain-invalid-config-{nonce}"));
+        let root = crate::test_support::temp_path("brain-invalid-config");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("settings.json");
         let bytes = [0xff, 0xfe, 0x7b];
@@ -3344,12 +4580,11 @@ mod tests {
 
     #[test]
     fn install_is_idempotent_and_uninstall_restores_exact_bytes() {
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("brain-installer-{}-{nonce}", std::process::id()));
+        let root = crate::test_support::temp_path("brain-installer");
         let home = root.join("home");
         let brain_home = home.join(".brain");
         fs::create_dir_all(home.join(".claude")).expect("claude dir");
@@ -3382,8 +4617,16 @@ mod tests {
         let binary = source_dir.join("brain");
         fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
 
-        let first = install_with(&home, &brain_home, &binary, false, true, &unset_homes())
-            .expect("install");
+        let first = install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("install");
         assert!(first > 0);
         let user_config: serde_json::Value =
             serde_json::from_slice(&fs::read(home.join(".claude.json")).unwrap()).unwrap();
@@ -3409,8 +4652,16 @@ mod tests {
             .iter()
             .map(|(path, _)| fs::read(path).expect("installed bytes"))
             .collect::<Vec<_>>();
-        let second = install_with(&home, &brain_home, &binary, false, true, &unset_homes())
-            .expect("idempotent install");
+        let second = install_with(
+            &home,
+            &brain_home,
+            &binary,
+            false,
+            true,
+            &unset_homes(),
+            &no_probe(),
+        )
+        .expect("idempotent install");
         assert_eq!(second, 0);
         for ((path, _), expected) in fixtures.iter().zip(installed) {
             assert_eq!(fs::read(path).expect("second install bytes"), expected);
@@ -3429,14 +4680,11 @@ mod tests {
     fn removing_agent_hooks_keeps_a_desktop_owned_binary() {
         use std::os::unix::fs::PermissionsExt;
 
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-installer-shared-copy-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-installer-shared-copy");
         let home = root.join("home");
         let brain_home = home.join(".brain");
         fs::create_dir_all(home.join(".codex")).expect("codex dir");
@@ -3475,14 +4723,11 @@ mod tests {
 
     #[test]
     fn refuses_user_config_when_home_is_a_git_worktree() {
-        let nonce = SystemTime::now()
+        let _nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "brain-installer-git-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::temp_path("brain-installer-git");
         let home = root.join("home");
         fs::create_dir_all(home.join(".git")).expect("git metadata dir");
         fs::write(home.join(".git/HEAD"), b"ref: refs/heads/main\n").expect("git head");

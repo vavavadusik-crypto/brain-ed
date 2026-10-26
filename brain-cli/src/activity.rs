@@ -205,13 +205,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Unique scratch directory, matching how the rest of this crate tests.
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(_name: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "brain-activity-{}-{name}-{nonce}",
-            std::process::id()
-        ));
+        let _nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = crate::test_support::temp_path("brain-activity");
         std::fs::create_dir_all(&root).expect("scratch directory");
         root
     }

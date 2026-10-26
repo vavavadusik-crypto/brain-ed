@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dependency licence policy check for the Brain ED workspace.
 
-Reads `cargo metadata --locked` (no extra tool needed) and parses each
+Reads `cargo metadata --offline --locked` (no extra tool needed) and parses each
 package's SPDX licence expression properly: `OR` is a choice offered by the
 author (one acceptable branch is enough), `AND` binds every part, `WITH`
 attaches an exception, parentheses group, and the legacy `A/B` spelling means
@@ -16,6 +16,7 @@ still have to ship the notices listed in THIRD_PARTY_NOTICES.md.
 Usage:
     python3 tools/check-licenses.py              # check the workspace
     python3 tools/check-licenses.py --self-test  # parser tests, no cargo
+    python3 tools/check-licenses.py --check-notices  # also check locked notice rows
 """
 
 import hashlib
@@ -160,6 +161,9 @@ def self_test():
         "(MIT OR Apache-2.0) AND AGPL-3.0-only": False,
         "(GPL-2.0-only OR GPL-3.0-only) AND MIT": False,
         "SSPL-1.0 OR BUSL-1.1": False,
+        "BSL-1.0": True,  # Boost Software License, not Business Source (BUSL).
+        "BUSL-1.1": False,
+        "AGPL-3.0-only": False,
         "GPL-2.0-only WITH Classpath-exception-2.0": False,
         "Some-Unreviewed-Licence": False,
     }
@@ -188,13 +192,32 @@ def file_sha256(package):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def check_notices(packages, path):
+    rows = re.findall(r"^\| ([^|]+) \| ([^|]+) \| ([^|]+) \|$", path.read_text(), re.M)
+    listed = {(name, version): licence for name, version, licence in rows if name != "Crate"}
+    expected = {
+        (p["name"], p["version"]): p.get("license") or
+        (VERIFIED_LICENCE_FILES.get((p["name"], p["version"]), ("UNREVIEWED",))[0] + " (license_file)")
+        for p in packages if p.get("source") is not None
+    }
+    problems = [f"NOTICE      {name} {version}: missing or mismatched licence"
+                for (name, version), licence in expected.items()
+                if listed.get((name, version)) != licence]
+    problems += [f"STALE       {name} {version}: not in locked metadata"
+                 for name, version in listed.keys() - expected.keys()]
+    crate_rows = [(n, v) for n, v, _ in rows if n != "Crate"]
+    if len(crate_rows) != len(set(crate_rows)):
+        problems.append("NOTICE      duplicate crate rows")
+    return problems
+
+
 def main():
     if "--self-test" in sys.argv[1:]:
         return self_test()
 
     metadata = json.loads(
         subprocess.run(
-            ["cargo", "metadata", "--locked", "--format-version", "1", "--all-features"],
+            ["cargo", "metadata", "--offline", "--locked", "--format-version", "1", "--all-features"],
             capture_output=True,
             text=True,
             check=True,
@@ -227,6 +250,8 @@ def main():
             continue
         problems.append(f"UNDECLARED  {name} {version}")
 
+    if "--check-notices" in sys.argv[1:]:
+        problems.extend(check_notices(metadata["packages"], pathlib.Path(__file__).resolve().parents[1] / "THIRD_PARTY_NOTICES.md"))
     for line in problems:
         print(line, file=sys.stderr)
     if problems:

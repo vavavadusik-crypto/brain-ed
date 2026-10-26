@@ -80,15 +80,18 @@ class SessionArchiveTest(unittest.TestCase):
 
     def test_claude_import_and_search(self):
         data = self.imp("claude", self.claude_fixture())
-        self.assertEqual(data["inserted"], 2)
+        # 2 conversation rows + the thinking block, the tool call and its result (journal).
+        self.assertEqual(data["inserted"], 5)
         self.assertFalse(data["incremental"])
         self.assertFalse(data["complete_capture_claimed"])
         self.assertEqual(len(self.search("parse_config_v2")), 2)
         self.assertEqual(len(self.search("ёжик")), 1)
         self.assertEqual(len(self.search("brain_core")), 1)
-        for hidden in ("hidden_reasoning_token", "tool_payload_x", "tool_output_secret",
-                       "secret", "caveat"):
+        for hidden in ("secret", "caveat"):
             self.assertEqual(self.search(hidden), [], hidden)
+        for token, role in (("hidden_reasoning_token", "reasoning"), ("tool_payload_x", "tool_call"),
+                            ("tool_output_secret", "tool_result")):
+            self.assertEqual([h["role"] for h in self.search(token)], [role], token)
         hit = self.search("Привет")[0]
         self.assertEqual((hit["client"], hit["role"], hit["session_id"]),
                          ("claude", "user", "sess-c"))
@@ -116,14 +119,16 @@ class SessionArchiveTest(unittest.TestCase):
              "message": "Готово: cargo test passed"}},
         ))
         data = self.imp("codex", source)
-        self.assertEqual(data["inserted"], 2)
+        # 2 conversation rows + the visible reasoning summary and the tool output (journal).
+        self.assertEqual(data["inserted"], 4)
         self.assertEqual(len(self.search("уникальноеслово")), 1)
         self.assertEqual(self.search("cargo")[0]["session_id"], "sess-x")
-        for hidden in ("developer_rules_text", "envsecret", "reasoning_secret",
-                       "tool_output_secret"):
+        for hidden in ("developer_rules_text", "envsecret"):
             self.assertEqual(self.search(hidden), [], hidden)
+        for token, role in (("reasoning_secret", "reasoning"), ("tool_output_secret", "tool_result")):
+            self.assertEqual([h["role"] for h in self.search(token)], [role], token)
         _, status, _ = self.run_cli("status")
-        self.assertEqual(status["by_client"], {"codex": 2})
+        self.assertEqual(status["by_client"], {"codex": 4})
 
     def test_codex_hidden_channels_excluded(self):
         def msg(text, **tags):
@@ -182,10 +187,12 @@ class SessionArchiveTest(unittest.TestCase):
         source = self.make_hermes()
         before = self.file_sha(source)
         data = self.imp("hermes", source)
-        self.assertEqual(data["inserted"], 2)
+        # The assistant tool-call row and the tool result row are journal now.
+        self.assertEqual(data["inserted"], 4)
         self.assertEqual(self.file_sha(source), before)
         self.assertEqual(len(self.search("hermes_agent")), 2)
-        self.assertEqual(self.search("tool_output_secret"), [])
+        self.assertEqual([hit["role"] for hit in self.search("tool_output_secret")],
+                         ["tool_result"])
         self.assertEqual(self.search("system_prompt_secret"), [])
         hit = self.search("Запусти")[0]
         _, rec, _ = self.run_cli("read", str(hit["id"]))
@@ -261,7 +268,7 @@ class SessionArchiveTest(unittest.TestCase):
         source = self.make_hermes()
         os.chmod(source, 0o644)
         digest = self.file_sha(source)
-        self.assertEqual(self.imp("hermes", source)["inserted"], 2)
+        self.assertEqual(self.imp("hermes", source)["inserted"], 4)
         self.assertEqual(stat.S_IMODE(os.stat(source).st_mode), 0o644)
         self.assertEqual(self.file_sha(source), digest)
         self.assertEqual(stat.S_IMODE(os.stat(self.db).st_mode), 0o600, "archive stays private")
@@ -273,14 +280,14 @@ class SessionArchiveTest(unittest.TestCase):
             writer.execute("BEGIN IMMEDIATE")
             writer.execute("INSERT INTO messages(session_id, role, content) VALUES"
                            " ('h1', 'user', 'uncommitted_hermes_text')")
-            self.assertEqual(self.imp("hermes", source)["inserted"], 2)
+            self.assertEqual(self.imp("hermes", source)["inserted"], 4)
             self.assertEqual(self.search("uncommitted_hermes_text"), [])
         finally:
             writer.execute("ROLLBACK")
             writer.close()
 
     def test_hermes_without_optional_timestamp(self):
-        self.assertEqual(self.imp("hermes", self.make_hermes(with_ts=False))["inserted"], 2)
+        self.assertEqual(self.imp("hermes", self.make_hermes(with_ts=False))["inserted"], 4)
 
     # ------------------------------------------------------------ replay
 
@@ -288,9 +295,10 @@ class SessionArchiveTest(unittest.TestCase):
         source = self.claude_fixture()
         self.imp("claude", source)
         again = self.imp("claude", source)
-        self.assertEqual((again["inserted"], again["duplicates"]), (0, 2))
+        # Journal rows (thinking, tool call, tool result) are as idempotent as conversation.
+        self.assertEqual((again["inserted"], again["duplicates"]), (0, 5))
         _, status, _ = self.run_cli("status")
-        self.assertEqual(status["entries"], 2)
+        self.assertEqual(status["entries"], 5)
 
     def test_claude_edit_same_uuid_kept_as_version(self):
         source = self.write("c.jsonl", jl(claude_line("user", "версия_один", "u1")))
@@ -355,7 +363,9 @@ class SessionArchiveTest(unittest.TestCase):
         conn.commit()
         conn.close()
         data = self.imp("hermes", source)
-        self.assertEqual((data["inserted"], data["duplicates"]), (2, 0))
+        # The rewritten conversation rows are new identities; the journal rows
+        # of untouched rows are recognised as duplicates.
+        self.assertEqual((data["inserted"], data["duplicates"]), (2, 2))
         self.assertEqual(self.imp("hermes", source)["inserted"], 0)
 
     def test_claude_uuid_relocation_deduped(self):
@@ -482,7 +492,7 @@ class SessionArchiveTest(unittest.TestCase):
             self.assertEqual(os.path.getsize(self.db), 0)
             self.assertEqual(stat.S_IMODE(os.stat(self.db).st_mode), bad_mode)
         os.chmod(self.db, 0o600)  # empty owner-only file is initialized
-        self.assertEqual(self.imp("claude", self.claude_fixture())["inserted"], 2)
+        self.assertEqual(self.imp("claude", self.claude_fixture())["inserted"], 5)
         os.chmod(self.db, 0o644)
         before = self.file_sha(self.db)
         source = self.write("more.jsonl", jl(claude_line("user", "новое", "u9")))

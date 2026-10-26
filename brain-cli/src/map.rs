@@ -40,16 +40,19 @@ pub(crate) enum MapCommand {
     Init,
     /// Read the next batch of this installation's coordinator events of --space into the map.
     IngestCoordinator {
+        /// How many coordinator events to read at most (default 100).
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// Read-only timeline of --space, or of one task.
     Timeline {
+        /// Timeline of only this task id.
         #[arg(long)]
         task: Option<i64>,
         /// Continue after this local sequence number.
         #[arg(long, default_value_t = 0)]
         after: i64,
+        /// Page size (default 50).
         #[arg(long, default_value_t = 50)]
         limit: usize,
         /// Only what the map had received by this unix time.
@@ -58,6 +61,7 @@ pub(crate) enum MapCommand {
     },
     /// Read-only: one page of projected links of --space; pass `next_cursor` back as --cursor.
     Links {
+        /// Page size (default 50).
         #[arg(long, default_value_t = 50)]
         limit: usize,
         /// Opaque cursor from the previous page's `next_cursor`.
@@ -69,10 +73,13 @@ pub(crate) enum MapCommand {
     },
     /// Print the context packet itself: raw JSON, no trailing newline, its byte length within the budget.
     Packet {
+        /// Project the packet is for (e.g. default/brain).
         #[arg(long)]
         project: Option<String>,
+        /// Task the packet is centered on.
         #[arg(long)]
         task: Option<i64>,
+        /// Packet tier: weak (default, small budget) or strong (large).
         #[arg(long, value_enum, default_value_t = TierArg::Weak)]
         tier: TierArg,
         /// Bytes of the packet JSON (weak ≤ 4096, strong ≤ 32768).

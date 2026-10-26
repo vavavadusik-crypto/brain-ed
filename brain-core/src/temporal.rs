@@ -788,7 +788,7 @@ fn looks_like_instruction(text: &str) -> bool {
         return true;
     }
     // A text that opens by naming a directory is handing over a workspace —
-    // "Задача в /home/<user>/projects/<name> (работай ТОЛЬКО в этом…" — rather
+    // "Задача в /example-home/<user>/projects/<name> (работай ТОЛЬКО в этом…" — rather
     // than describing work. A record about work cites its paths further in,
     // once it has said something.
     if head
@@ -2791,12 +2791,9 @@ mod tests {
         }
     }
 
-    fn test_database_path(name: &str) -> PathBuf {
-        let sequence = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "brain-temporal-{name}-{}-{sequence}.sqlite",
-            std::process::id()
-        ))
+    fn test_database_path(_name: &str) -> PathBuf {
+        let _sequence = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
+        crate::test_support::temp_path("brain-temporal")
     }
 
     // Test fixture: one argument per stored node column.

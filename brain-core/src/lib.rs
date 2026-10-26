@@ -4,6 +4,7 @@ pub mod coordination;
 pub mod embeddings;
 mod error;
 pub mod goals;
+pub mod lexical;
 mod memory;
 mod model;
 pub mod network;
@@ -14,6 +15,8 @@ mod search;
 mod storage;
 pub mod templates;
 pub mod temporal;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use error::{StorageError, StorageResult};
 pub use memory::{
@@ -39,3 +42,6 @@ pub use sharing::{
     SHARE_APPLICATION_ID, SHARE_SCHEMA_VERSION, ShareError, ShareEvent, ShareResult, ShareStore,
     SharedFact, TrustedPeer,
 };
+
+pub mod redact;
+pub mod team;

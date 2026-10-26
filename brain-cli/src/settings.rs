@@ -28,6 +28,12 @@ pub(crate) const BUDGET_TOKENS_RANGE: (usize, usize) = (100, 20_000);
 pub(crate) const MIN_COSINE_RANGE: (f64, f64) = (0.0, 0.99);
 pub(crate) const MIN_BM25_RANGE: (f64, f64) = (0.0, 0.99);
 
+/// How young an archive entry must be before `brain ask` stops treating it as
+/// history. The conversation an agent is having right now quotes the very
+/// query being asked, so without this gate its own messages outrank the
+/// weeks-old fact the question is about. 0 disables the gate.
+pub(crate) const DEFAULT_ARCHIVE_MIN_AGE_MINUTES: u32 = 120;
+
 /// Hop count past which published graph-retrieval results report noise growing
 /// faster than recall. Shown as a warning, never enforced.
 pub(crate) const GRAPH_HOPS_DIMINISHING: u32 = 2;
@@ -111,6 +117,41 @@ pub(crate) struct StoredSettings {
     pub overrides: QualityOverrides,
     #[serde(default)]
     pub embedding_mode: EmbeddingMode,
+    #[serde(default = "default_include_archive")]
+    pub include_archive: bool,
+    #[serde(default = "default_archive_min_age_minutes")]
+    pub archive_min_age_minutes: u32,
+    #[serde(default)]
+    pub backup_dir: String,
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: u32,
+    #[serde(default)]
+    pub backup_timer_enabled: bool,
+    /// Tell a starting Claude Code or Codex session that Brain is available (fixed text only).
+    #[serde(default = "default_session_start_notice")]
+    pub session_start_notice: bool,
+    /// Plug-in LLM providers (compute nodes), tried by priority.
+    #[serde(default)]
+    pub llm_providers: Vec<crate::llm::LlmProvider>,
+    /// SessionStart briefing mode: "off" (default) or "brief" (cached project brief).
+    #[serde(default)]
+    pub session_start_brief: String,
+}
+
+fn default_session_start_notice() -> bool {
+    true
+}
+
+fn default_include_archive() -> bool {
+    true
+}
+
+fn default_archive_min_age_minutes() -> u32 {
+    DEFAULT_ARCHIVE_MIN_AGE_MINUTES
+}
+
+fn default_backup_keep() -> u32 {
+    14
 }
 
 impl Default for StoredSettings {
@@ -120,6 +161,14 @@ impl Default for StoredSettings {
             profile: Profile::default().to_string(),
             overrides: QualityOverrides::default(),
             embedding_mode: EmbeddingMode::default(),
+            include_archive: true,
+            archive_min_age_minutes: DEFAULT_ARCHIVE_MIN_AGE_MINUTES,
+            session_start_notice: true,
+            backup_dir: String::new(),
+            backup_keep: default_backup_keep(),
+            backup_timer_enabled: false,
+            llm_providers: Vec::new(),
+            session_start_brief: String::from("off"),
         }
     }
 }
@@ -231,6 +280,86 @@ where
     Ok(())
 }
 
+/// Parses and applies one memory-related setting from its raw text form.
+///
+/// `brain config set` and the settings window's POST both land here, so a
+/// value one path accepts the other never rejects, and the error texts are
+/// the same everywhere. Unknown keys are refused with the supported list.
+pub(crate) fn apply_memory_setting(
+    settings: &mut StoredSettings,
+    key: &str,
+    raw: &str,
+) -> Result<(), String> {
+    match key {
+        "include_archive" => {
+            settings.include_archive = raw
+                .parse::<bool>()
+                .map_err(|_| "include_archive must be true or false".to_owned())?;
+        }
+        "session_start_notice" => {
+            settings.session_start_notice = raw
+                .parse::<bool>()
+                .map_err(|_| "session_start_notice must be true or false".to_owned())?;
+        }
+        "archive_min_age_minutes" => {
+            settings.archive_min_age_minutes = parse_minutes(raw)?;
+        }
+        "backup_dir" => {
+            // Empty resets to the default location; a non-empty value must be
+            // an absolute path so the timer and the CLI agree.
+            if raw.is_empty() {
+                settings.backup_dir = String::new();
+            } else if raw.starts_with('/') {
+                settings.backup_dir = raw.to_owned();
+            } else {
+                return Err(
+                    "backup_dir must be an absolute path (or empty for the default)".to_owned(),
+                );
+            }
+        }
+        "backup_keep" => {
+            settings.backup_keep = raw
+                .parse::<u64>()
+                .ok()
+                .and_then(|keep| u32::try_from(keep).ok())
+                .filter(|keep| (1..=1000).contains(keep))
+                .ok_or_else(|| {
+                    "backup_keep must be a whole number of snapshots from 1 to 1000".to_owned()
+                })?;
+        }
+        "backup_timer_enabled" => {
+            settings.backup_timer_enabled = raw
+                .parse::<bool>()
+                .map_err(|_| "backup_timer_enabled must be true or false".to_owned())?;
+        }
+        "session_start_brief" => match raw {
+            "off" | "brief" => settings.session_start_brief = raw.to_owned(),
+            other => {
+                return Err(format!(
+                    "session_start_brief must be off or brief (got {other:?})"
+                ));
+            }
+        },
+        _ => {
+            return Err(format!(
+                "unknown setting {key:?}; supported: profile, include_archive, archive_min_age_minutes, session_start_notice"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whole minutes, 0 to u32::MAX; 0 disables the age filter.
+pub(crate) fn parse_minutes(raw: &str) -> Result<u32, String> {
+    raw.parse::<u64>()
+        .ok()
+        .and_then(|minutes| u32::try_from(minutes).ok())
+        .ok_or_else(|| {
+            "archive_min_age_minutes must be a whole number of minutes from 0 to 4294967295 (0 disables the age filter)"
+                .to_owned()
+        })
+}
+
 /// Where the settings document lives.
 pub(crate) fn settings_path(brain_home: &Path) -> PathBuf {
     brain_home.join("settings.json")
@@ -317,6 +446,94 @@ pub(crate) fn load_with_diagnostics(brain_home: &Path) -> LoadedSettings {
             )),
         }
     }
+    if let Some(value) = document.get("session_start_brief") {
+        match value.as_str() {
+            Some(mode @ ("off" | "brief")) => settings.session_start_brief = mode.to_owned(),
+            _ => warnings
+                .push("session_start_brief должен быть off или brief; применено off".to_owned()),
+        }
+    }
+    if let Some(value) = document.get("session_start_notice") {
+        match value.as_bool() {
+            Some(notice) => settings.session_start_notice = notice,
+            None => warnings.push(
+                "session_start_notice must be a boolean; the default (on) is used".to_owned(),
+            ),
+        }
+    }
+    if let Some(value) = document.get("include_archive") {
+        match value.as_bool() {
+            Some(include) => settings.include_archive = include,
+            None => {
+                // A malformed privacy switch must not silently enable archive reads.
+                settings.include_archive = false;
+                warnings
+                    .push("include_archive must be a boolean; archive search disabled".to_owned());
+            }
+        }
+    }
+    if let Some(value) = document.get("archive_min_age_minutes") {
+        match value
+            .as_u64()
+            .and_then(|minutes| u32::try_from(minutes).ok())
+        {
+            Some(minutes) => settings.archive_min_age_minutes = minutes,
+            None => warnings.push(format!(
+                "archive_min_age_minutes must be a whole number of minutes from 0 to {}; kept {}",
+                u32::MAX,
+                settings.archive_min_age_minutes
+            )),
+        }
+    }
+    if let Some(value) = document.get("backup_dir") {
+        match value.as_str() {
+            Some(dir) if dir.is_empty() || dir.starts_with('/') => {
+                settings.backup_dir = dir.to_owned();
+            }
+            _ => warnings.push(
+                "backup_dir должен быть абсолютным путём или пустым; применено значение по умолчанию"
+                    .to_owned(),
+            ),
+        }
+    }
+    if let Some(value) = document.get("backup_keep") {
+        match value.as_u64().and_then(|keep| u32::try_from(keep).ok()) {
+            Some(keep) if (1..=1000).contains(&keep) => settings.backup_keep = keep,
+            _ => warnings.push(
+                "backup_keep должен быть целым числом от 1 до 1000; применено значение по умолчанию"
+                    .to_owned(),
+            ),
+        }
+    }
+    if let Some(value) = document.get("backup_timer_enabled") {
+        match value.as_bool() {
+            Some(enabled) => settings.backup_timer_enabled = enabled,
+            None => warnings.push(
+                "backup_timer_enabled должен быть true или false; применено значение по умолчанию"
+                    .to_owned(),
+            ),
+        }
+    }
+    if let Some(value) = document.get("llm_providers") {
+        match value.as_array() {
+            Some(items) => {
+                let mut providers = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    match serde_json::from_value::<crate::llm::LlmProvider>(item.clone()) {
+                        Ok(provider) if crate::llm::validate_provider(&provider).is_ok() => {
+                            providers.push(provider);
+                        }
+                        _ => warnings.push(format!(
+                            "llm_providers[{index}] не прошёл проверку (имя, https/loopback, модель); элемент отброшен"
+                        )),
+                    }
+                }
+                settings.llm_providers = providers;
+            }
+            None => warnings
+                .push("llm_providers должен быть массивом; список провайдеров отброшен".to_owned()),
+        }
+    }
     if let Some(value) = document.get("overrides") {
         if let Some(overrides) = value.as_object() {
             settings.overrides.candidates_per_signal = recover_unsigned(
@@ -343,6 +560,32 @@ pub(crate) fn load_with_diagnostics(brain_home: &Path) -> LoadedSettings {
         }
     }
     settings.version = SETTINGS_VERSION;
+    // A typo in a key would silently do nothing: name it instead.
+    const KNOWN: [&str; 12] = [
+        "version",
+        "profile",
+        "embedding_mode",
+        "session_start_brief",
+        "session_start_notice",
+        "include_archive",
+        "archive_min_age_minutes",
+        "backup_dir",
+        "backup_keep",
+        "backup_timer_enabled",
+        "llm_providers",
+        "overrides",
+    ];
+    let mut unknown = document
+        .keys()
+        .filter(|key| !KNOWN.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if !unknown.is_empty() {
+        warnings.push(format!(
+            "settings.json содержит неизвестные поля {unknown:?}; они проигнорированы"
+        ));
+    }
     LoadedSettings { settings, warnings }
 }
 
@@ -426,22 +669,31 @@ fn recover_fraction(
 /// that would silently reset every knob. The bare profile file is kept in sync
 /// for any code path that has not moved to the settings document yet.
 pub(crate) fn save(brain_home: &Path, settings: &StoredSettings) -> io::Result<()> {
-    settings
-        .validate()
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-    crate::private_fs::ensure_private_home(brain_home)?;
-    let path = settings_path(brain_home);
-    let staging = path.with_extension("json.tmp");
-    let mut encoded = serde_json::to_vec_pretty(settings)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    crate::settings_history::save(brain_home, settings, "cli")
+}
+
+pub(crate) fn write_document(brain_home: &Path, settings: &StoredSettings) -> io::Result<()> {
+    let mut encoded = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
     encoded.push(b'\n');
-    fs::write(&staging, &encoded)?;
-    fs::rename(&staging, &path)?;
-    fs::write(
-        legacy_profile_path(brain_home),
-        settings.profile().to_string(),
-    )?;
+    crate::private_fs::write_private(&settings_path(brain_home), &encoded)?;
+    // settings.json is authoritative. A failed compatibility mirror must not
+    // erase the audit record for an already committed settings document.
+    if let Err(error) = crate::private_fs::write_private(
+        &legacy_profile_path(brain_home),
+        settings.profile().to_string().as_bytes(),
+    ) {
+        eprintln!("warning: settings saved, but legacy profile mirror failed: {error}");
+    }
     Ok(())
+}
+
+/// Any increase of either cutoff above the chosen profile reduces recall.
+pub(crate) fn stricter_thresholds(settings: &StoredSettings) -> Vec<serde_json::Value> {
+    let base = settings.profile().settings();
+    let live = settings.effective();
+    [("min_cosine", base.min_cosine, live.min_cosine), ("min_bm25", base.min_bm25, live.min_bm25)]
+        .into_iter().filter(|(_, before, after)| after > before)
+        .map(|(key, before, after)| serde_json::json!({"key": key, "profile_default": before, "effective": after})).collect()
 }
 
 /// Rough relative cost of arbitrary settings against the default profile.
@@ -462,16 +714,142 @@ pub(crate) fn relative_cost(settings: &QualitySettings) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// G12: the settings.json FILE table — unknown fields, wrong types and
+    /// huge values never abort the load; they warn and fall back.
+    #[test]
+    fn settings_files_follow_the_table() {
+        let cases: &[(&str, &str, usize)] = &[
+            // (file content, warning fragment expected, number of warnings)
+            ("not json at all", "повреждён", 1),
+            ("[1,2,3]", "должен содержать JSON-объект", 1),
+            (
+                "{\"version\":99,\"profile\":\"balanced\"}",
+                "неподдерживаемую версию",
+                1,
+            ),
+            ("{}", "неподдерживаемую версию отсутствует", 1),
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"mystery_key\":true}",
+                "неизвестные поля",
+                1,
+            ),
+            // Duplicate keys collapse to the last value at the serde_json
+            // layer (standard JSON behavior); nothing to warn about here.
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"include_archive\":\"yes\"}",
+                "include_archive",
+                1,
+            ),
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"archive_min_age_minutes\":99999999999}",
+                "archive_min_age_minutes",
+                1,
+            ),
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"session_start_notice\":1}",
+                "session_start_notice",
+                1,
+            ),
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"embedding_mode\":\"turbo\"}",
+                "embedding_mode",
+                1,
+            ),
+            (
+                "{\"version\":1,\"profile\":\"balanced\",\"session_start_brief\":true}",
+                "session_start_brief",
+                1,
+            ),
+            ("{\"version\":1,\"profile\":\"balanced\"}", "", 0),
+        ];
+        for (content, expected, warning_count) in cases {
+            let home = crate::test_support::temp_path("settings-table");
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).expect("home");
+            std::fs::write(home.join("settings.json"), content).expect("settings");
+            let loaded = load_with_diagnostics(&home);
+            assert_eq!(
+                loaded.warnings.len(),
+                *warning_count,
+                "{content}: warnings were {:?}",
+                loaded.warnings
+            );
+            if !expected.is_empty() {
+                assert!(
+                    loaded.warnings.iter().any(|w| w.contains(expected)),
+                    "{content}: expected {expected:?} in {:?}",
+                    loaded.warnings
+                );
+            }
+            std::fs::remove_dir_all(&home).ok();
+        }
+        // A valid file keeps its values; a huge-but-valid minutes value loads.
+        let home = crate::test_support::temp_path("settings-table-ok");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            home.join("settings.json"),
+            br#"{"version":1,"profile":"balanced","embedding_mode":"off",
+                 "include_archive":true,"archive_min_age_minutes":4294967295}"#,
+        )
+        .expect("settings");
+        let loaded = load_with_diagnostics(&home);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(loaded.settings.include_archive);
+        assert_eq!(loaded.settings.archive_min_age_minutes, 4_294_967_295);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// G12: every memory-setting key accepts and refuses the same values on
+    /// both paths (CLI and window share this function).
+    #[test]
+    fn memory_settings_follow_the_value_table() {
+        let mut settings = StoredSettings::default();
+        let cases: &[(&str, &str, bool)] = &[
+            ("include_archive", "true", true),
+            ("include_archive", "false", true),
+            ("include_archive", "1", false),
+            ("include_archive", "yes", false),
+            ("include_archive", "", false),
+            ("session_start_notice", "true", true),
+            ("session_start_notice", "false", true),
+            ("session_start_notice", "TRUE", false),
+            ("session_start_notice", "on", false),
+            ("archive_min_age_minutes", "0", true),
+            ("archive_min_age_minutes", "90", true),
+            ("archive_min_age_minutes", "4294967295", true),
+            ("archive_min_age_minutes", "4294967296", false),
+            ("archive_min_age_minutes", "-5", false),
+            ("archive_min_age_minutes", "1.5", false),
+            ("archive_min_age_minutes", "", false),
+            ("backup_keep", "1", true),
+            ("backup_keep", "1000", true),
+            ("backup_keep", "0", false),
+            ("backup_keep", "1001", false),
+            ("backup_keep", "abc", false),
+            ("backup_timer_enabled", "true", true),
+            ("backup_timer_enabled", "false", true),
+            ("backup_timer_enabled", "1", false),
+            ("session_start_brief", "off", true),
+            ("session_start_brief", "brief", true),
+            ("session_start_brief", "on", false),
+            ("session_start_brief", "", false),
+            ("backup_dir", "", true),
+            ("backup_dir", "/tmp/brain-backups", true),
+            ("backup_dir", "relative/path", false),
+            ("no-such-key", "true", false),
+        ];
+        for (key, raw, expected) in cases {
+            let outcome = apply_memory_setting(&mut settings, key, raw);
+            assert_eq!(outcome.is_ok(), *expected, "{key}={raw:?}: {outcome:?}");
+        }
+        let unsupported = apply_memory_setting(&mut settings, "no-such-key", "true").unwrap_err();
+        assert!(unsupported.contains("supported:"), "{unsupported}");
+    }
     use super::*;
 
-    fn temp_home(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "brain-settings-test-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
+    fn temp_home(_tag: &str) -> PathBuf {
+        let root = crate::test_support::temp_path("brain-settings-test");
         fs::create_dir_all(&root).expect("create temp brain home");
         root
     }
@@ -526,6 +904,68 @@ mod tests {
             "precise",
             "older code paths must keep reading the same choice"
         );
+        fs::remove_dir_all(home).expect("remove temp brain home");
+    }
+
+    #[test]
+    fn the_shared_memory_setting_parser_is_strict_and_names_its_errors() {
+        let mut settings = StoredSettings::default();
+        assert!(apply_memory_setting(&mut settings, "include_archive", "false").is_ok());
+        assert!(!settings.include_archive);
+        assert!(apply_memory_setting(&mut settings, "session_start_notice", "true").is_ok());
+        assert!(settings.session_start_notice);
+        // Minutes: zero and the ceiling are fine, everything else is one text.
+        assert_eq!(
+            apply_memory_setting(&mut settings, "archive_min_age_minutes", "0"),
+            Ok(())
+        );
+        assert_eq!(settings.archive_min_age_minutes, 0);
+        assert!(
+            apply_memory_setting(&mut settings, "archive_min_age_minutes", "4294967295").is_ok()
+        );
+        for bad in ["-5", "1.5", "soon", "4294967296"] {
+            let error =
+                apply_memory_setting(&mut settings, "archive_min_age_minutes", bad).expect_err(bad);
+            assert!(
+                error.starts_with("archive_min_age_minutes must be a whole number of minutes"),
+                "{bad}: {error}"
+            );
+        }
+        // Booleans refuse anything but true/false, with the same text everywhere.
+        assert_eq!(
+            apply_memory_setting(&mut settings, "include_archive", "sometimes").unwrap_err(),
+            "include_archive must be true or false"
+        );
+        // Unknown keys name the supported list.
+        assert!(
+            apply_memory_setting(&mut settings, "profile", "fast")
+                .unwrap_err()
+                .starts_with("unknown setting")
+        );
+    }
+
+    #[test]
+    fn archive_min_age_round_trips_and_a_malformed_value_keeps_the_default() {
+        let home = temp_home("min-age");
+        let tuned = StoredSettings {
+            archive_min_age_minutes: 15,
+            ..StoredSettings::default()
+        };
+        save(&home, &tuned).expect("settings save");
+        assert_eq!(load(&home).archive_min_age_minutes, 15);
+
+        fs::write(
+            settings_path(&home),
+            r#"{"version":1,"profile":"balanced","archive_min_age_minutes":"soon"}"#,
+        )
+        .expect("write malformed min age");
+        let loaded = load_with_diagnostics(&home);
+        assert_eq!(
+            loaded.settings.archive_min_age_minutes,
+            DEFAULT_ARCHIVE_MIN_AGE_MINUTES
+        );
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("archive_min_age_minutes"));
         fs::remove_dir_all(home).expect("remove temp brain home");
     }
 

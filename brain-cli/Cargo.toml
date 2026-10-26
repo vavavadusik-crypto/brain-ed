@@ -16,10 +16,17 @@ model2vec = ["brain-core/model2vec"]
 [dependencies]
 brain-core = { path = "../brain-core", default-features = false }
 clap = { version = "4.5", features = ["derive", "env"] }
+# Already in the dependency tree (tokenizers, tree-sitter); used for secret masking.
+regex = "1.13"
+# Already in the tree via hf-hub; the OpenAI-compatible LLM client.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2.5"
 libc = "0.2"
 rusqlite = "0.40.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The only new dependency allowed by the E7.0b brief: org rustls CA generation.
+rcgen = "0.13"
 
 [lints]
 workspace = true

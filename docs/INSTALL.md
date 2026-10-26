@@ -1,4 +1,8 @@
-# Installing Brain ED 0.1.3 (early preview source)
+> For the checksum-verified download installer (`./install.sh`) and Linux musl /
+> Termux setup, see the [five-minute quick start](../README.md#quick-start-in-5-minutes).
+> This page documents the retained source/desktop installer.
+
+# Installing Brain ED 0.2.0 (early preview source)
 
 Supported: **Linux (x86_64 glibc)** from source. macOS and Windows are not
 supported in this preview: the source uses Unix-only APIs and `/proc/self`
@@ -13,7 +17,7 @@ installs the version it was built from. See
 | Need | Why |
 |---|---|
 | Rust via rustup | `rust-toolchain.toml` pins the exact toolchain; rustup installs it on first `cargo` call. Workspace edition is 2024. |
-| C compiler (`cc`) | `rusqlite` builds the bundled SQLite; `sqlite-vec` is C. |
+| C and C++ compilers (`cc`, `c++`) | Bundled SQLite and sqlite-vec use C; esaxx-rs uses C++. |
 | Network access to crates.io | `cargo build --locked` fetches exactly the versions in `Cargo.lock`. |
 | `python3` (optional) | Only for `tools/session_archive.py` / `tools/agent_bridge.py`. The built-in `brain archive` collector does not need it. |
 | `gio` (optional) | GNOME: lets the binary mark desktop launchers as trusted. |
@@ -23,15 +27,15 @@ No root access is needed or used.
 ## Installer
 
 ```console
-./install.sh --help
-./install.sh --dry-run     # prints the commands; no build, download or file write
-./install.sh               # build + launchers
-./install.sh --uninstall   # launchers out; ~/.brain kept
+./packaging/install-source.sh --help
+./packaging/install-source.sh --dry-run     # prints the commands; no build, download or file write
+./packaging/install-source.sh               # build + launchers
+./packaging/install-source.sh --uninstall   # launchers out; ~/.brain kept
 ```
 
 `--uninstall --dry-run` lists what would be removed and changes nothing.
 
-`./install.sh` does exactly:
+`./packaging/install-source.sh` does exactly:
 
 1. Refuses to run as root, on non-Linux, or without an absolute `$HOME`.
 2. From the checkout root (so `rust-toolchain.toml` applies even when the
@@ -158,18 +162,18 @@ a refusal.
 ### Manual integration
 
 When a file is refused, add the entry yourself, pointing at the stable copy
-(not `target/`), with your real home directory instead of `/home/<you>`.
+(not `target/`), with your real home directory instead of `/path/to/user-dir`.
 TOML does not expand `~`:
 
 ```toml
 # Codex
 [mcp_servers.brain]
-command = "/home/<you>/.brain/bin/brain"
+command = "/path/to/user-dir/.brain/bin/brain"
 args = ["serve"]
 ```
 
 ```json
-{ "mcpServers": { "brain": { "command": "/home/<you>/.brain/bin/brain", "args": ["serve"] } } }
+{ "mcpServers": { "brain": { "command": "/path/to/user-dir/.brain/bin/brain", "args": ["serve"] } } }
 ```
 
 Merge the JSON fragment into the existing root object (Claude Code, Cursor);
@@ -199,7 +203,7 @@ them; remove them by hand.
 ## Uninstall
 
 ```console
-./install.sh --uninstall          # or: brain ui --remove-shortcut [--dry-run]
+./packaging/install-source.sh --uninstall          # or: brain ui --remove-shortcut [--dry-run]
 brain uninstall --dry-run         # agent integrations, if you added them
 ```
 

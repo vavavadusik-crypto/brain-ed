@@ -321,6 +321,34 @@ fn truncate_utf8(mut text: String, max_bytes: usize) -> String {
     text
 }
 
+/// The hard token ceiling a SessionStart hook may inject.
+pub(crate) const SESSION_BRIEF_TOKEN_LIMIT: usize = 2000;
+
+/// The cached project brief for a SessionStart hook: cache-only (no rebuild,
+/// the hook must answer within a second), truncated to
+/// [`SESSION_BRIEF_TOKEN_LIMIT`] by the project's own conservative estimator.
+/// `None` when there is no fresh cache — the hook then sends just the notice.
+pub(crate) fn cached_session_brief(
+    brain_home: &Path,
+    config: &RuntimeConfig,
+    cwd: &Path,
+) -> Option<String> {
+    let text = cached_brief(brain_home, config, cwd)?;
+    if conservative_tokens(&text) <= SESSION_BRIEF_TOKEN_LIMIT {
+        return Some(text);
+    }
+    // Truncate at a character boundary; the estimate is a byte count, so the
+    // cap is conservative and the cut never exceeds the limit.
+    let mut cut = text.len();
+    while conservative_tokens(&text[..cut]) > SESSION_BRIEF_TOKEN_LIMIT {
+        cut -= 1;
+    }
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(text[..cut].to_owned())
+}
+
 fn conservative_tokens(text: &str) -> usize {
     // Every cl100k token contains at least one byte. Capping and reporting the
     // UTF-8 byte count is therefore a safe upper bound without a network model.
@@ -335,15 +363,12 @@ mod tests {
         Agent, Attribution, NewNode, NodeKind, Session, Space, SpaceKind, SqliteStorage,
     };
 
-    fn temp_root(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
+    fn temp_root(_label: &str) -> PathBuf {
+        let _nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "brain-brief-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+        crate::test_support::temp_path("brain-brief")
     }
 
     fn test_config(root: &Path, agent: &str) -> RuntimeConfig {

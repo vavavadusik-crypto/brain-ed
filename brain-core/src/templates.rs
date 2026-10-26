@@ -1224,7 +1224,7 @@ fn episode_from(
 /// module accepts.
 /// Whether a label is a filesystem path and nothing else.
 ///
-/// A record titled `/home/someone/projects/thing` says where work happened, not
+/// A record titled `/example-home/someone/projects/thing` says where work happened, not
 /// what was done. Quoting it as a step tells the reader nothing and publishes
 /// somebody's directory layout. A label that merely mentions a path further in
 /// — "Fixed the parser in src/lexer.rs" — is a real statement and stays.
@@ -1805,12 +1805,9 @@ mod tests {
         }
     }
 
-    fn test_database_path(name: &str) -> PathBuf {
-        let sequence = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "brain-templates-{name}-{}-{sequence}.sqlite",
-            std::process::id()
-        ))
+    fn test_database_path(_name: &str) -> PathBuf {
+        let _sequence = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
+        crate::test_support::temp_path("brain-templates")
     }
 
     fn attribution(recorded_at: Timestamp) -> Attribution {

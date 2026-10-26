@@ -1292,13 +1292,7 @@ pub(crate) mod tests {
 
     /// A database with `count` nodes in a chain, built through the real schema.
     pub(crate) fn chain_database(count: usize) -> (Scratch, std::path::PathBuf) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "brain-explore-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let directory = crate::test_support::temp_path("brain-explore");
         std::fs::create_dir_all(&directory).expect("temporary directory");
         let path = directory.join("brain.sqlite");
         drop(brain_core::SqliteStorage::open(&path).expect("migrate"));

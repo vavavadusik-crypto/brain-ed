@@ -31,6 +31,7 @@ use crate::network::protocol::{
 use crate::sharing::{
     MAX_WIRE_PAGE, Principal as SharePrincipal, ShareError, ShareEvent, ShareStore,
 };
+use rustls::pki_types::{CertificateDer, ServerName};
 
 /// Validates a listen (or dial) address against the binding policy.
 ///
@@ -44,8 +45,35 @@ use crate::sharing::{
 /// # Errors
 /// `NetError::InvalidRequest` (400) naming the refused address.
 pub fn checked_listen_ip(ip: IpAddr, allow_lan: bool) -> Result<IpAddr, NetError> {
+    checked_listen_ip_with(ip, allow_lan, false)
+}
+
+/// Shared address space `RFC 6598 range` (RFC 6598): carrier-grade NAT and overlay
+/// networks such as Tailscale. Neither private LAN nor public, so it has its own opt-in.
+pub fn is_cgnat(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && v4.octets()[1] & 0xC0 == 64)
+}
+
+/// As [`checked_listen_ip`], with a separate explicit opt-in for CGNAT addresses.
+///
+/// # Errors
+/// `NetError::InvalidRequest` (400) naming the refused address.
+pub fn checked_listen_ip_with(
+    ip: IpAddr,
+    allow_lan: bool,
+    allow_cgnat: bool,
+) -> Result<IpAddr, NetError> {
     if ip.is_loopback() {
         return Ok(ip);
+    }
+    if is_cgnat(ip) {
+        return if allow_cgnat {
+            Ok(ip)
+        } else {
+            Err(NetError::invalid(format!(
+                "{ip} is a shared CGNAT/overlay address (RFC 6598 range); it needs the explicit CGNAT opt-in"
+            )))
+        };
     }
     if !allow_lan {
         return Err(NetError::invalid(format!(
@@ -76,6 +104,30 @@ fn host_names_ip(host: &str, ip: IpAddr) -> bool {
         .and_then(|inner| inner.strip_suffix(']'))
         .unwrap_or(host);
     bare.parse::<IpAddr>().is_ok_and(|parsed| parsed == ip)
+}
+
+/// Whether a `Host` header (optionally `name:port`) is a DNS name the server's
+/// own certificate is valid for. IP literals are left to [`host_names_ip`]: an
+/// IP in the certificate is not enough, it must be the address actually bound.
+pub(crate) fn host_is_certificate_name(host: &str, certificate: &CertificateDer<'static>) -> bool {
+    if host.starts_with('[') {
+        return false;
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        Some(_) => return false,
+        None => host,
+    };
+    let Ok(server_name) = ServerName::try_from(name.to_owned()) else {
+        return false;
+    };
+    if matches!(server_name, ServerName::IpAddress(_)) {
+        return false;
+    }
+    let Ok(parsed) = rustls::server::ParsedCertificate::try_from(certificate) else {
+        return false;
+    };
+    rustls::client::verify_server_name(&parsed, &server_name).is_ok()
 }
 
 /// How the listener is bound.
@@ -121,6 +173,10 @@ pub(crate) struct Inner {
     /// whose `--server-name` is that IP (its certificate's IP SAN) is not
     /// refused. `None` (plaintext server) keeps the loopback names only.
     bound_host: Option<IpAddr>,
+    /// The TLS server's own end-entity certificate: a `Host` naming one of its
+    /// DNS names (the client's `--server-name`) is accepted, any other name is
+    /// still refused. `None` (plaintext server) accepts no names beyond loopback.
+    certificate: Option<CertificateDer<'static>>,
 }
 
 impl Inner {
@@ -141,10 +197,16 @@ impl Inner {
             live: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
             bound_host: None,
+            certificate: None,
         })
     }
 
     /// Also accepts `Host: <ip>` (exactly) for a TLS listener bound to `ip`.
+    pub(crate) fn with_certificate(mut self, certificate: CertificateDer<'static>) -> Self {
+        self.certificate = Some(certificate);
+        self
+    }
+
     pub(crate) fn with_bound_host(mut self, ip: IpAddr) -> Self {
         self.bound_host = Some(ip);
         self
@@ -441,8 +503,160 @@ fn respond<W: Write>(stream: &mut W, status: u16, body: &Value) {
     let _ = stream.flush();
 }
 
-/// Fixed check order: route → Host → Origin → method → auth → authz → schema → coordinator.
+// Log processing outcomes before writing response bytes. Broken connections before
+// a bounded HTTP request can be parsed have no identifiable team operation.
 fn route(inner: &Inner, request: &HttpRequest) -> CallOutcome {
+    let parsed = serde_json::from_slice::<Value>(&request.body).unwrap_or(Value::Null);
+    let operation = parsed["tool"].as_str().unwrap_or("");
+    if !["share_pull", "share_query"].contains(&operation) {
+        return route_unlogged(inner, request);
+    }
+    let received = unix_now();
+    let started = std::time::Instant::now();
+    // Preserve the coordinator's generated correlation ID, while arbitrary
+    // caller strings become opaque refs instead of entering the audit verbatim.
+    let given_id = parsed["request_id"].as_str();
+    let request_id = if let Some(id) = given_id.filter(|id| {
+        id.strip_prefix("cli-").is_some_and(|s| {
+            s.len() == 24
+                && s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    }) {
+        id.to_owned()
+    } else {
+        crate::team::opaque(
+            "request",
+            given_id.unwrap_or(&format!("{}-{}", received, started.elapsed().as_nanos())),
+        )
+    };
+    // A received request is journaled before dispatch. If the process or client
+    // disappears, the pending entry remains visible as an unfinished request.
+    {
+        let Ok(state) = inner.state.lock() else {
+            return CallOutcome {
+                status: 503,
+                body: NetError::unavailable("audit unavailable").body(),
+            };
+        };
+        let pending = crate::team::Audit {
+            request_id: request_id.clone(),
+            received_at: received,
+            completed_at: received,
+            machine: None,
+            agent: None,
+            token_id: None,
+            project_id: None,
+            space: None,
+            operation: operation.into(),
+            valid_at: None,
+            recorded_at: None,
+            policy_revision: None,
+            snapshot_id: None,
+            record_refs: vec![],
+            count: 0,
+            outcome: "cancelled".into(),
+            latency_ms: 0,
+            reason: "pending".into(),
+        };
+        if state.share.team_audit(&pending).is_err() {
+            return CallOutcome {
+                status: 503,
+                body: NetError::unavailable("audit unavailable").body(),
+            };
+        }
+    }
+    let mut outcome = route_unlogged(inner, request);
+    let Ok(state) = inner.state.lock() else {
+        return CallOutcome {
+            status: 503,
+            body: NetError::unavailable("audit unavailable").body(),
+        };
+    };
+    let authenticated = request
+        .header("authorization")
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|s| BearerToken::parse(s).ok())
+        .and_then(|token| {
+            state
+                .auth
+                .authenticate(&token, unix_now(), "127.0.0.1")
+                .ok()
+        });
+    let space = parsed
+        .pointer("/arguments/space")
+        .and_then(Value::as_str)
+        .filter(|s| crate::team::id(s));
+    if space.is_some_and(crate::team::is_team) && outcome.status != 200 {
+        outcome.body = json!({"error":if outcome.status>=500 {"unavailable"}else{"refused"},"code":"team_denied"});
+    }
+    let manifest = space.and_then(|s| state.share.team_manifest(s).ok().flatten());
+    let slice = space.and_then(|s| state.share.team_active_slice(s).ok().flatten());
+    let mut record_refs = vec![];
+    if let Some(events) = outcome
+        .body
+        .pointer("/result/share/events")
+        .and_then(Value::as_array)
+    {
+        for event in events {
+            if let Some(id) = event
+                .pointer("/fact/fact_id")
+                .and_then(Value::as_str)
+                .filter(|s| crate::team::id(s))
+            {
+                record_refs.push(id.to_owned());
+            }
+        }
+    }
+    let audit = crate::team::Audit {
+        request_id,
+        received_at: received,
+        completed_at: unix_now(),
+        machine: authenticated
+            .as_ref()
+            .map(|a| a.principal.machine_id.clone()),
+        agent: authenticated.as_ref().map(|a| a.agent_id().to_string()),
+        token_id: authenticated
+            .as_ref()
+            .map(|a| a.token_id.as_str().to_owned()),
+        project_id: manifest.as_ref().map(|m| m.project_id.clone()),
+        space: space.map(str::to_owned),
+        operation: operation.into(),
+        valid_at: None,
+        recorded_at: None,
+        policy_revision: manifest.as_ref().map(|m| m.revision),
+        snapshot_id: slice.as_ref().map(|s| s.snapshot_id.clone()),
+        count: record_refs.len(),
+        record_refs,
+        outcome: if outcome.status == 200 {
+            "ok"
+        } else if outcome.status >= 500 {
+            "error"
+        } else {
+            "denied"
+        }
+        .into(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        reason: if outcome.status == 200 {
+            "ok"
+        } else if outcome.status >= 500 {
+            "unavailable"
+        } else {
+            "refused"
+        }
+        .into(),
+    };
+    if state.share.team_audit(&audit).is_err() {
+        return CallOutcome {
+            status: 503,
+            body: NetError::unavailable("audit unavailable").body(),
+        };
+    }
+    outcome
+}
+
+/// Fixed check order: route → Host → Origin → method → auth → authz → schema → coordinator.
+fn route_unlogged(inner: &Inner, request: &HttpRequest) -> CallOutcome {
     if request.path != ENDPOINT {
         return CallOutcome {
             status: 404,
@@ -455,7 +669,11 @@ fn route(inner: &Inner, request: &HttpRequest) -> CallOutcome {
         || host == "localhost"
         || host == expected_loopback
         || host == format!("localhost:{}", host.rsplit(':').next().unwrap_or(""))
-        || inner.bound_host.is_some_and(|ip| host_names_ip(host, ip));
+        || inner.bound_host.is_some_and(|ip| host_names_ip(host, ip))
+        || inner
+            .certificate
+            .as_ref()
+            .is_some_and(|certificate| host_is_certificate_name(host, certificate));
     if !host_ok {
         return CallOutcome {
             status: 403,
@@ -822,6 +1040,35 @@ mod tests {
     use crate::network::protocol;
 
     #[test]
+    fn cgnat_has_its_own_opt_in_and_opens_nothing_else() {
+        use std::net::Ipv4Addr;
+        let ip = |text: &str| -> IpAddr { text.parse().expect("ip") };
+        for inside in ["100.64.0.0", "100.64.0.43", "100.127.255.255"] {
+            assert!(is_cgnat(ip(inside)), "{inside}");
+            assert!(
+                checked_listen_ip_with(ip(inside), false, true).is_ok(),
+                "{inside}"
+            );
+            assert!(
+                checked_listen_ip_with(ip(inside), true, false).is_err(),
+                "LAN opt-in must not open {inside}"
+            );
+            assert!(checked_listen_ip(ip(inside), true).is_err(), "{inside}");
+        }
+        for outside in ["100.63.255.255", "100.128.0.0", "8.8.8.8"] {
+            assert!(!is_cgnat(ip(outside)), "{outside}");
+            assert!(
+                checked_listen_ip_with(ip(outside), true, true).is_err(),
+                "{outside}"
+            );
+        }
+        // The CGNAT opt-in is not a LAN opt-in.
+        assert!(checked_listen_ip_with(ip("192.168.1.5"), false, true).is_err());
+        assert!(checked_listen_ip_with(ip("192.168.1.5"), true, false).is_ok());
+        assert!(checked_listen_ip_with(IpAddr::V4(Ipv4Addr::LOCALHOST), false, false).is_ok());
+    }
+
+    #[test]
     fn listen_policy_defaults_to_loopback_and_gates_lan() {
         let ip = |text: &str| text.parse::<IpAddr>().expect("ip");
         for loopback in ["127.0.0.1", "127.8.9.10", "::1"] {
@@ -858,13 +1105,7 @@ mod tests {
 
     #[test]
     fn lan_host_is_accepted_only_when_opted_in_and_auth_still_applies() {
-        let dir = std::env::temp_dir().join(format!(
-            "brain-lan-host-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
+        let dir = crate::test_support::temp_path("brain-lan-host");
         std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
             .create(&dir)
             .expect("state dir");
@@ -935,10 +1176,10 @@ mod tests {
         }
     }
 
-    fn temp_state(tag: &str) -> TempDir {
+    fn temp_state(_tag: &str) -> TempDir {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("brain-net-{tag}-{}-{n}", std::process::id()));
+        let _n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = crate::test_support::temp_path("brain-net");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp dir");
         TempDir(dir)

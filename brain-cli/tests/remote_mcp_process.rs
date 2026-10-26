@@ -3,6 +3,8 @@
 //! `brain serve --remote-config` and is driven over MCP stdio. Only
 //! 127.0.0.1 is bound.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -17,15 +19,12 @@ use serde_json::{Value, json};
 const BRAIN: &str = env!("CARGO_BIN_EXE_brain");
 const MAX_REPLY_BYTES: usize = 16 * 1024;
 
-fn temp_root(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn temp_root(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-remote-mcp-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-remote-mcp");
     fs::create_dir_all(&root).expect("root");
     root
 }

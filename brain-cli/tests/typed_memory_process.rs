@@ -2,6 +2,8 @@
 //! isolated HOME: every supported kind reaches map packets under its own kind,
 //! projects stay isolated, and an explicit packet query only reads.
 
+#[path = "common/test_support.rs"]
+mod test_support;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,15 +14,12 @@ use serde_json::{Value, json};
 
 const MACHINE: &str = "m-0123456789abcdef0123456789abcdef";
 
-fn isolated_home(tag: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+fn isolated_home(_tag: &str) -> PathBuf {
+    let _nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "brain-project-memory-process-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
+    let root = test_support::temp_path("brain-project-memory-process");
     fs::create_dir_all(&root).expect("create isolated home");
     root
 }
