@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -108,6 +108,53 @@ impl Fixture {
             .unwrap()
     }
 }
+// BSD may inherit O_NONBLOCK from the listener; Linux accepted sockets do not.
+// Set the mode on the accepted stream before relying on a blocking read timeout.
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut buf = [0; 4096];
+    let start = loop {
+        let n = stream.read(&mut buf).unwrap();
+        assert!(n > 0);
+        bytes.extend_from_slice(&buf[..n]);
+        if let Some(pos) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&bytes[..pos]);
+            let length: usize = header
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            if bytes.len() >= pos + 4 + length {
+                break pos + 4;
+            }
+        }
+    };
+    bytes[start..].to_vec()
+}
+
+#[test]
+fn fake_http_server_reads_fragmented_requests_on_nonblocking_streams() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    // Force the Darwin inheritance condition on Linux as well.
+    stream.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || read_http_request(&mut stream));
+    client
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    client.write_all(b"}").unwrap();
+    assert_eq!(worker.join().unwrap(), b"{}");
+}
+
 struct Server {
     url: String,
     replies: Arc<Mutex<BTreeMap<i64, Value>>>,
@@ -133,31 +180,8 @@ impl Server {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut buf = [0; 4096];
-                let start = loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(pos) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let header = String::from_utf8_lossy(&bytes[..pos]);
-                        let length: usize = header
-                            .lines()
-                            .find_map(|l| {
-                                l.to_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|s| s.trim().parse().unwrap())
-                            })
-                            .unwrap();
-                        if bytes.len() >= pos + 4 + length {
-                            break pos + 4;
-                        }
-                    }
-                };
-                let request: Value = serde_json::from_slice(&bytes[start..]).unwrap();
+                let bytes = read_http_request(&mut stream);
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
                 let prompt = request["messages"][0]["content"].as_str().unwrap();
                 let data: Value =
                     serde_json::from_str(prompt.split_once("\nSession data: ").unwrap().1).unwrap();
@@ -210,9 +234,29 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.take().unwrap().join().unwrap();
+        if let Err(panic) = self.handle.take().unwrap().join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
+#[test]
+fn fake_server_cleanup_preserves_the_original_failure() {
+    let panic = std::panic::catch_unwind(|| {
+        let _server = Server {
+            url: String::new(),
+            replies: Default::default(),
+            requests: Default::default(),
+            stop: Default::default(),
+            handle: Some(std::thread::spawn(|| panic!("synthetic server failure"))),
+        };
+        panic!("original test failure");
+    })
+    .unwrap_err();
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"original test failure"));
+}
+
 fn fact(session: &str, id: i64, status: &str) -> Value {
     json!({"type":"error","what":"Synthetic failure","why":"Observed synthetic evidence",
         "status":status,"session":session,"project":"MODEL PROJECT IS IGNORED","evidence":[id],"when":999999999999_i64,
@@ -878,6 +922,26 @@ fn rejection_counters_cover_transitions() {
 }
 
 #[test]
+fn temporary_fixture_resolves_parent_alias_but_preserves_child_symlinks() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let alias = f.0.join("temp-alias");
+    symlink(&f.0, &alias).unwrap();
+    let path = test_support::temp_path_under(&alias, "canonical-fixture");
+    assert_eq!(path.parent().unwrap(), fs::canonicalize(&f.0).unwrap());
+    assert!(!path.exists());
+    fs::create_dir(&path).unwrap();
+    let child = path.join("child-link");
+    symlink(&f.0, &child).unwrap();
+    assert!(
+        fs::symlink_metadata(child)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn keep_raw_is_opt_in_private_and_refuses_symlinks() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
@@ -988,16 +1052,26 @@ fn schema_enums_prompt_and_russian_synonyms_agree() {
 }
 
 // Only these temporary scripts are invoked; never the owner's real CLIs.
-const COMMAND_FAKE: &str = r#"#!/usr/bin/python3
-import os,sys,json,pathlib,time,subprocess
+const COMMAND_FAKE: &str = r#"import os,sys,json,pathlib,time,subprocess
 home=pathlib.Path(os.environ['HOME'])
+allowed_env={'HOME','PATH','LANG','LC_CTYPE','CLAUDE_CONFIG_DIR','CODEX_HOME'}
+phase='startup'
+def failure(kind, value, tb):
+    # Test-only diagnostics: names/stages only, never env values, prompts or argv.
+    while tb and tb.tb_next: tb=tb.tb_next
+    (home/'fake-failure.json').write_text(json.dumps({'phase':phase,'exception':kind.__name__,'line':tb.tb_lineno if tb else None,'unexpected_env_keys':sorted(set(os.environ)-allowed_env)}))
+sys.excepthook=failure
 a=sys.argv[1:]
 mode=(home/'mode').read_text()
 name=pathlib.Path(sys.argv[0]).name
+phase='environment'
 assert not any(k in os.environ for k in ['BRAIN_SECRET','ANTHROPIC_API_KEY','OPENAI_API_KEY','BRAIN_DATABASE','BRAIN_SPACE','SSH_AUTH_SOCK'])
-assert set(os.environ) <= {'HOME','PATH','LANG','LC_CTYPE','CLAUDE_CONFIG_DIR','CODEX_HOME'}
+assert set(os.environ) <= allowed_env
+phase='cwd'
 assert not list(pathlib.Path.cwd().iterdir())
 assert pathlib.Path.cwd().stat().st_mode & 0o777 == 0o700
+if a==['--fixture-preflight']: sys.exit(0)
+phase='argv'
 if name=='claude':
     assert a[a.index('--tools')+1]==''
     assert '--strict-mcp-config' in a
@@ -1020,6 +1094,7 @@ if mode=='hang':
     child=subprocess.Popen(['/bin/sleep','4'])
     (home/'child.pid').write_text(str(child.pid))
     time.sleep(4)
+phase='stdin'
 prompt=sys.stdin.read()
 assert prompt and prompt not in a
 (home/'prompt').write_text(prompt)
@@ -1047,11 +1122,69 @@ if name=='claude' and mode=='events': print(json.dumps([{'type':'system','subtyp
 elif name=='claude': print(json.dumps({'type':'result','subtype':'success','is_error':False,'structured_output':doc}))
 else: pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps(doc))
 "#;
+// Resolve the test runner's Python before PATH is restricted to fake CLIs.
+// /usr/bin/python3 on Darwin may be an Xcode launcher rather than the interpreter.
+fn command_fake() -> String {
+    static PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let python = PYTHON.get_or_init(|| {
+        let output = Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("resolve Python for synthetic CLI");
+        assert!(
+            output.status.success(),
+            "cannot resolve synthetic CLI Python"
+        );
+        let path = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert!(
+            std::path::Path::new(&path).is_absolute() && !path.contains(char::is_whitespace),
+            "synthetic CLI Python requires an absolute shebang-compatible path"
+        );
+        path
+    });
+    format!("#!{python}\n{COMMAND_FAKE}")
+}
+
+#[test]
+fn synthetic_cli_python_runs_with_restricted_path_and_reports_only_failure_metadata() {
+    let f = Fixture::new();
+    f.command_provider("claude", "success");
+    let cwd = f.0.join("preflight");
+    fs::create_dir(&cwd).unwrap();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |unexpected: bool| {
+        let mut c = Command::new(f.0.join("bin/claude"));
+        c.env_clear()
+            .env("HOME", &f.0)
+            .env("PATH", f.0.join("bin"))
+            .current_dir(&cwd)
+            .arg("--fixture-preflight");
+        if unexpected {
+            c.env("BRAIN_SECRET", "must-never-appear-in-diagnostics");
+        }
+        c.output().unwrap()
+    };
+    let output = run(false);
+    let failure = || fs::read_to_string(f.0.join("fake-failure.json")).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "synthetic Python preflight failed: {}",
+        failure()
+    );
+    assert!(failure().is_empty());
+    assert!(!run(true).status.success());
+    let diagnostic = failure();
+    let value: Value = serde_json::from_str(&diagnostic).unwrap();
+    assert_eq!(value["phase"], "environment");
+    assert_eq!(value["unexpected_env_keys"], json!(["BRAIN_SECRET"]));
+    assert!(!diagnostic.contains("must-never-appear-in-diagnostics"));
+}
+
 impl Fixture {
     fn command_provider(&self, name: &str, mode: &str) {
         let bin = self.0.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join(name), COMMAND_FAKE).unwrap();
+        fs::write(bin.join(name), command_fake()).unwrap();
         fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(self.0.join("mode"), mode).unwrap();
         let report = self.cli(&[
@@ -1068,7 +1201,7 @@ impl Fixture {
         assert_eq!(report["status"], "saved");
     }
     fn command_output(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_brain"))
+        let output = Command::new(env!("CARGO_BIN_EXE_brain"))
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", self.0.join("bin"))
@@ -1079,7 +1212,14 @@ impl Fixture {
             .args(["--offline", "--space", "distill-test", "--agent", "test"])
             .args(args)
             .output()
-            .unwrap()
+            .unwrap();
+        self.report_fake_failure();
+        output
+    }
+    fn report_fake_failure(&self) {
+        if let Ok(diagnostic) = fs::read_to_string(self.0.join("fake-failure.json")) {
+            eprintln!("synthetic CLI failure metadata: {diagnostic}");
+        }
     }
     fn command_run(&self) -> Output {
         self.command_output(&["distill", "run", "--session", "command-session"])
@@ -1505,7 +1645,7 @@ impl Fixture {
         fs::set_permissions(bin.join("systemctl"), fs::Permissions::from_mode(0o700)).unwrap();
     }
     fn timer_output(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_brain"))
+        let output = Command::new(env!("CARGO_BIN_EXE_brain"))
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", self.0.join("bin"))
@@ -1513,7 +1653,9 @@ impl Fixture {
             .args(["--offline", "--space", "distill-test", "--agent", "test"])
             .args(args)
             .output()
-            .unwrap()
+            .unwrap();
+        self.report_fake_failure();
+        output
     }
     fn timer_cli(&self, args: &[&str]) -> Value {
         let o = self.timer_output(args);

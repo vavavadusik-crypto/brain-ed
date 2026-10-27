@@ -19,13 +19,19 @@ Brain ED: `admin` (администратор координатора), `manage
 использует отдельный space `team.PROJECT`. Это граница опубликованных срезов,
 не ACL личного архива. Архивы не открываются этими командами.
 
-Новая схема auth.sqlite (v4) добавляет таблицы участников, приглашений и правил
+Новая схема auth.sqlite (v5) добавляет таблицы участников, приглашений и правил
 адресации. Существующие `worker`/`reader`, токены, identity bindings, пространства
 и grants сохраняются. `net enroll --role manager` — совместимый alias `reader`.
 `team who` отображает старый `reader` как `manager` с `legacy: true`: это описание
 прежних прав, не автоматическая выдача доступа к проекту или подключение к шлюзу.
 Для нового онбординга используйте отдельное имя и приглашение. Одно имя принадлежит
 одной машине/роли/проекту; занятое или отозванное имя автоматически не переиспользуется.
+
+M3 / 0.3: срезы подписаны Ed25519; `--projects a,b --expires 30d` ограничивает
+чтение руководителя. Источник и координатор независимо проверяют подписанные
+права. Для ротации используйте `team rekey`, затем `team publish`. Формат,
+отказ старым unsigned-срезам и действия при компрометации описаны в
+[безопасности команды / team security](team-security.md).
 
 ## Подготовка (администратор, один раз)
 
@@ -148,7 +154,8 @@ brain team remove worker-1
 JSON не продлевает его. При принятии в транзакции приглашение помечается
 использованным, старый токен отзывается, а отдельный токен участника передаётся
 только по TLS и сохраняется 0600. Копия приглашения повторно не работает.
-Токен участника и токен чтения источника действуют до 90 дней; автоматического
+Транспортный токен участника и токен чтения источника действуют до 90 дней;
+подписанные права руководителя ограничены исходным `--expires` приглашения; автоматического
 продления нет. После истечения нужна явная повторная регистрация с новым именем.
 При потере ответа во время принятия результат может быть неизвестен: не пытайтесь
 возвращать приглашению силу редактированием файла; администратор отзывает учётку
@@ -231,7 +238,7 @@ automatic renewal. Invitation expiration is server-enforced (default 7 days,
 60 seconds to 90 days), even if its JSON is edited. If redemption loses its
 response, ask the local admin to revoke the account and invite a new name.
 
-Auth schema v4 preserves legacy credentials, identity bindings, spaces and grants;
+Auth schema v5 preserves legacy credentials, identity bindings, spaces and grants;
 `reader` remains accepted and is displayed as legacy manager by `team who`.
 This does not automatically join old accounts to a project or grant new rights.
 `net enroll --role manager` is a compatible reader alias. One new team account
@@ -245,7 +252,7 @@ state out of source control. The coordinator's private auth database holds sourc
 read credentials. Use `--state-dir DIR` for isolated installations (`DIR/client`
 holds joined credentials). Use explicit `--dial` / `--source-dial` if the corresponding
 server belongs to another Brain home. There is no formal security or fleet readiness
-claim; signatures and scoped signed tokens belong to M3.
+claim. M3 adds [signed snapshots and scoped capabilities](team-security.md).
 
 Synthetic reproducible demonstration:
 

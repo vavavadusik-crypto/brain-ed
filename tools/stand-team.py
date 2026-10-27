@@ -181,6 +181,7 @@ class Stand:
             ca = self.transfer(host, home + '/.brain/net/tls/ca.pem', boss, name + '.ca.pem')
             credential = self.transfer(host, home + '/reader.credential', boss, name + '.reader')
             self.run(boss, 'team', 'peer', '--machine', name, '--origin', origin, '--project', 'checkout',
+                     '--public-key', self.run(host, 'team', 'manifest')['signing_public_key'],
                      '--team-space', 'team.checkout', '--dial', worker_endpoint, '--server-name', worker_ip,
                      '--ca', ca, '--credential', credential, worker_dial)
             self.rows.append([name, arch, joined, published, 0, host])

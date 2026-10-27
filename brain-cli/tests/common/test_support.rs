@@ -30,11 +30,18 @@ pub(crate) fn register(path: PathBuf) {
 
 /// A unique path under `/tmp` (not created).
 pub(crate) fn temp_path(tag: &str) -> PathBuf {
+    temp_path_under(&std::env::temp_dir(), tag)
+}
+
+// Canonicalize only the existing test temp root, before appending the fixture.
+// Symlinks created inside a fixture remain visible to product security checks.
+pub(crate) fn temp_path_under(root: &std::path::Path, tag: &str) -> PathBuf {
+    let root = std::fs::canonicalize(root).expect("canonical test temp root");
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{tag}-{}-{nanos}", std::process::id()));
+    let path = root.join(format!("{tag}-{}-{nanos}", std::process::id()));
     register(path.clone());
     path
 }

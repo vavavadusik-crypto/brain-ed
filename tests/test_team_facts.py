@@ -141,7 +141,7 @@ class TeamFactsProcess(unittest.TestCase):
         self.dial = ready["bind"]
         origin = self.team("manifest")["manifests"][0]["manifest"]["origin"]
         self.run_brain(self.coordinator, "team", "peer", "--machine", self.machine, "--origin", origin,
-                       "--project", "proj", "--team-space", "team.proj", "--dial", self.dial,
+                       "--project", "proj", "--public-key", self.team("manifest")["signing_public_key"], "--team-space", "team.proj", "--dial", self.dial,
                        "--server-name", "localhost", "--ca", self.state / "tls/ca.pem",
                        "--credential", self.cred)
 

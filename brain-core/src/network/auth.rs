@@ -34,7 +34,7 @@ const APPLICATION_ID: i64 = 0x4252_4E41; // "BRNA"
 /// Auth schema version this code writes. Newer files are refused.
 /// v2: principals gained the credential-bound `agent_id`.
 /// v3: explicit per-principal `memory_grants`; older principals get none.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 /// How long a new credential stays valid unless issued otherwise.
 pub const DEFAULT_CREDENTIAL_TTL_SECS: i64 = 90 * 86_400;
 /// Shortest credential lifetime.
@@ -78,6 +78,19 @@ CREATE TABLE memory_grants (
 ) STRICT;
 ";
 
+pub(super) const TEAM_SECURITY: &str = r"
+CREATE TABLE IF NOT EXISTS team_security (
+ principal_id INTEGER PRIMARY KEY REFERENCES principals(id),
+ projects TEXT NOT NULL, expires_at INTEGER NOT NULL,
+ public_key TEXT, key_epoch INTEGER NOT NULL DEFAULT 1,
+ rights TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS team_key_audit (
+ id INTEGER PRIMARY KEY, principal_id INTEGER NOT NULL REFERENCES principals(id),
+ at INTEGER NOT NULL, old_key TEXT, new_key TEXT NOT NULL, epoch INTEGER NOT NULL
+) STRICT;
+";
+
 pub(super) const TEAM_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS team_members (
  principal_id INTEGER PRIMARY KEY REFERENCES principals(id),
@@ -92,7 +105,7 @@ CREATE TABLE IF NOT EXISTS team_invitations (
 ) STRICT;
 ";
 
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 9] = [
     "meta",
     "principals",
     "credentials",
@@ -100,6 +113,8 @@ const TABLES: [&str; 7] = [
     "team_members",
     "team_invitations",
     "team_route_policy",
+    "team_security",
+    "team_key_audit",
 ];
 
 pub(super) fn now_unix() -> i64 {
@@ -326,6 +341,7 @@ impl AuthStore {
                 tx.execute_batch(SCHEMA)?;
                 tx.execute_batch(MEMORY_GRANTS)?;
                 tx.execute_batch(TEAM_SCHEMA)?;
+                tx.execute_batch(TEAM_SECURITY)?;
                 tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
@@ -362,6 +378,7 @@ impl AuthStore {
             )?;
             tx.execute_batch(MEMORY_GRANTS)?;
             tx.execute_batch(TEAM_SCHEMA)?;
+            tx.execute_batch(TEAM_SECURITY)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             return Ok(());
@@ -371,6 +388,7 @@ impl AuthStore {
         if version == 2 {
             tx.execute_batch(MEMORY_GRANTS)?;
             tx.execute_batch(TEAM_SCHEMA)?;
+            tx.execute_batch(TEAM_SECURITY)?;
             tx.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('migrated_from_v2', 1)",
                 [],
@@ -381,6 +399,13 @@ impl AuthStore {
         }
         if version == 3 {
             tx.execute_batch(TEAM_SCHEMA)?;
+            tx.execute_batch(TEAM_SECURITY)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if version == 4 {
+            tx.execute_batch(TEAM_SECURITY)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             return Ok(());

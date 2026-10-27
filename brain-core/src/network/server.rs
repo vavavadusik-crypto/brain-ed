@@ -588,7 +588,17 @@ fn route(inner: &Inner, request: &HttpRequest) -> CallOutcome {
         .and_then(Value::as_str)
         .filter(|s| crate::team::id(s));
     if space.is_some_and(crate::team::is_team) && outcome.status != 200 {
-        outcome.body = json!({"error":if outcome.status>=500 {"unavailable"}else{"refused"},"code":"team_denied"});
+        outcome.body = match outcome.body["message"].as_str() {
+            Some("подпись не прошла / snapshot signature failed") => {
+                NetError::forbidden("snapshot signature failed").body()
+            }
+            Some(message) if message.starts_with("rights token") => {
+                NetError::forbidden("rights token").body()
+            }
+            _ => {
+                json!({"error":if outcome.status>=500 {"unavailable"}else{"refused"},"code":"team_denied"})
+            }
+        };
     }
     let manifest = space.and_then(|s| state.share.team_manifest(s).ok().flatten());
     let slice = space.and_then(|s| state.share.team_active_slice(s).ok().flatten());
@@ -831,6 +841,12 @@ fn dispatch(
         };
     }
     if request.tool.starts_with("share_") {
+        if let Err(error) = state.auth.team_source_rights(request, now) {
+            return CallOutcome {
+                status: error.status(),
+                body: error.body(),
+            };
+        }
         return dispatch_share(&state.share, authenticated, request, now);
     }
     let actor = Actor::new(
@@ -935,6 +951,12 @@ fn dispatch_share(
                 "result": {"status": "ok", "share": value},
             }),
         },
+        Err(ShareError::InvalidData(message)) if message == "team_signature_failed" => {
+            CallOutcome {
+                status: 403,
+                body: NetError::forbidden("snapshot signature failed").body(),
+            }
+        }
         Err(ShareError::CapabilityDenied { .. } | ShareError::SpaceNotEnabled(_)) => CallOutcome {
             status: 403,
             body: json!({"error": "forbidden", "code": "share_denied"}),

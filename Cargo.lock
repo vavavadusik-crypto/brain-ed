@@ -180,6 +180,7 @@ dependencies = [
  "libc",
  "model2vec-rs",
  "regex",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

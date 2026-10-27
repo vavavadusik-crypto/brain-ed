@@ -83,14 +83,21 @@ remote и diff не сериализуются. Тексты проходят о
 в зарегистрированном корне. Детектор шаблонов не доказывает отсутствие
 произвольного неизвестного секрета или вредоносного утверждения.
 
+Для ручного peer задайте `SOURCE_PUBLIC_KEY` по `signing_public_key` из
+`brain team manifest` на доверенном источнике и передайте его доверенным каналом.
+Приглашения выполняют закрепление автоматически.
+
 ## Публикация и отзыв
 
 Сущности публикуются отдельными share facts, последним идёт манифест поколения.
 Используются `ShareStore` и существующие события/`share_pull` TLS-транспорта
-`brain net share`; новые сетевые tools не добавлены. Генерация и retract старого
+`brain net share`; онбординг и права 0.3 используют также `team_*` tools. Генерация и retract старого
 поколения атомарны. Повтор одинакового среза не создаёт новых событий и сохраняет исходную дату;
 отсутствие изменений не выдаётся за свежие сведения.
-`integrity=tls+blake3-unsigned`, `signature=null`: цифровой подписи нет.
+`integrity=tls+blake3+ed25519`: срез подписан ключом машины. В 0.3 / M3
+координатор и `team ask` проверяют подпись по закреплённому ключу, источник
+дополнительно проверяет подписанные права руководителя. Старые unsigned-срезы
+не принимаются; см. [формат, ротацию и границы доверия](team-security.md).
 
 Изолированные `team.*` spaces зарезервированы: обычные свободные JSON
 `net share publish/supersede` там запрещены, `share_query` закрыт.
@@ -114,7 +121,7 @@ wont_fix/not_a_bug/became_feature. Переходы distill сохраняют �
 Регистрация endpoint — доверенная локальная операция, без токена в argv:
 
 ```sh
-brain team peer --state-dir /tmp/coordinator/net --machine 7 \
+brain team peer --public-key "$SOURCE_PUBLIC_KEY" --state-dir /tmp/coordinator/net --machine 7 \
   --origin install-EXACT --project app --team-space team.app.leads \
   --dial 127.0.0.1:7443 --server-name localhost \
   --ca /tmp/coordinator/ca.pem --credential /tmp/coordinator/reader.credential
@@ -177,7 +184,7 @@ Retention: срезы/история — 90 дней, аудит — 365 дне�
 
 Проверки: `tests/test_team_facts.py` (два временных HOME, реальный TLS 127.0.0.1),
 `tests/test_team_settings.js`, Rust schema/policy/lifecycle/ranking/UI tests.
-Не реализованы: raw-режим, Ed25519/Biscuit, hook-журнал моделей, Iroh/relay,
+Не реализованы: raw-режим, Biscuit, hook-журнал моделей, Iroh,
 поиск на исходной машине новым tool, автоматический distill.
 
 
@@ -338,7 +345,7 @@ python3 -m unittest discover -s tests -p test_stand_team.py -v
 ## Через ИИ-помощника
 
 На машине руководителя запустите локальный `brain mcp` через stdio. Реестр
-источников заранее задаёт администратор командами `brain team peer …`.
+источников заранее задаёт администратор командами `brain team peer --public-key "$SOURCE_PUBLIC_KEY" …`.
 `brain mcp` — псевдоним `brain serve`. MCP использует конфигурацию в `~/.brain/net`
 того пользователя, от которого запущен процесс. Произвольные адреса, пути
 credentials, state-dir и team-space через аргументы этих инструментов не принимаются.

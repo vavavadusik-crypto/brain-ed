@@ -213,6 +213,7 @@ class Demo:
                 origin = self.run(home, "team", "manifest")["manifests"][0]["manifest"]["origin"]
                 peer_route = self.routes[home]["connect"] if self.via_relay else ["--dial", dial]
                 self.run(boss, "team", "peer", "--machine", name, "--origin", origin, "--project", "checkout",
+                         "--public-key", self.run(home, "team", "manifest")["signing_public_key"],
                          "--team-space", "team.checkout", *peer_route, "--server-name", "localhost",
                          "--ca", home / ".brain/net/tls/ca.pem", "--credential", reader)
                 print(f"Готова {name}: enroll → join → enable → publish; error lifecycle confirmed → fixed → reopened", flush=True)

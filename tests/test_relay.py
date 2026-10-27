@@ -150,6 +150,7 @@ class RelayProcess(unittest.TestCase):
         # accidental inheritance observable without contacting that relay.
         (self.base / "client/.brain/net/client/relay-ca.pem").write_text("invalid CA")
         self.run_cli("client", "team", "peer", "--machine", "source-worker", "--origin", "synthetic-origin",
+                     "--public-key", "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
                      "--project", "demo", "--team-space", "team.demo", "--dial", self.coord[1]["bind"],
                      "--server-name", "localhost", "--ca", self.base / "coord/net/tls/ca.pem",
                      "--credential", self.base / "credential")

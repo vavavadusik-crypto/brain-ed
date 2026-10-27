@@ -2172,6 +2172,7 @@ Commands:
   accept     Register from an invitation; publication stays OFF without explicit consent
   who        Safe team roster: names, roles and observed freshness, no endpoints or secrets
   remove     Local coordinator admin: revoke a member and access to team slices
+  rekey      Rotate the machine signing key through the coordinator; old slices close immediately
   peer       Coordinator admin: pin a source machine, origin, project, space and TLS endpoint
   ask        Search only complete verified replicas of explicitly selected machines
   manifest   Read-only local manifest: what, to whom and when. Missing policy means off
@@ -2213,8 +2214,9 @@ Options:
       --name <NAME>                Unique machine name, 3..64 lowercase letters, digits and hyphens
       --project <PROJECT>          Project id, used as an explicit team.PROJECT shared-space boundary [default: default]
       --share-state-dir <DIR>      Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
-      --expires <EXPIRES>          Invitation lifetime: seconds or suffix s, m, h, d (60s..90d) [default: 7d]
       --offline                    Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+      --projects <PROJECTS>        Manager read scope, comma-separated project ids (up to 16)
+      --expires <EXPIRES>          Invitation lifetime: seconds or suffix s, m, h, d (60s..90d) [default: 7d]
       --out <OUT>                  New invitation file, 0600. Default: NAME.invite.json in current directory
       --dial <DIAL>                Coordinator address; default: this Brain home's running net serve
       --server-name <SERVER_NAME>  Coordinator certificate SAN; default: first name from net init
@@ -2300,12 +2302,33 @@ Options:
   -h, --help                     Print help
 ```
 
+### `brain team rekey`
+
+Rotate the machine signing key through the coordinator; old slices close immediately
+
+```console
+Usage: brain team rekey [OPTIONS]
+```
+
+```text
+Options:
+      --database <PATH>          SQLite database path (default: ~/.brain/brain.sqlite)
+      --state-dir <STATE_DIR>    Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
+      --space <SPACE>            Memory namespace [default: default]
+      --team-space <TEAM_SPACE>  Isolated team space, e.g. team.project.readers
+      --agent <AGENT>            Agent identity used for attribution and memory ownership [default: brain-cli]
+      --models-dir <DIR>         Model cache directory (default: ~/.brain/models)
+      --share-state-dir <DIR>    Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
+      --offline                  Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+  -h, --help                     Print help
+```
+
 ### `brain team peer`
 
 Coordinator admin: pin a source machine, origin, project, space and TLS endpoint
 
 ```console
-Usage: brain team peer [OPTIONS] --machine <MACHINE> --origin <ORIGIN> --project <PROJECT>
+Usage: brain team peer [OPTIONS] --machine <MACHINE> --origin <ORIGIN> --public-key <PUBLIC_KEY> --project <PROJECT>
 ```
 
 ```text
@@ -2318,9 +2341,10 @@ Options:
       --machine <MACHINE>          Enrolled name of the source machine
       --models-dir <DIR>           Model cache directory (default: ~/.brain/models)
       --origin <ORIGIN>            Origin the source machine publishes under (pinned for verification)
-      --project <PROJECT>          Project id expected in the machine's slice
+      --public-key <PUBLIC_KEY>    Explicitly pinned Ed25519 public key, lowercase hex
       --share-state-dir <DIR>      Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
       --offline                    Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+      --project <PROJECT>          Project id expected in the machine's slice
       --via-relay <HOST:PORT>      Explicit company relay (DNS:PORT or IP:PORT). Direct TCP is tried first when present
       --relay-token-file <FILE>    Separate relay credential (0600); register for serve, connect for clients/bundles
       --relay-name <NAME>          Exact name authorized by the relay token, [a-z0-9-]{3,64}

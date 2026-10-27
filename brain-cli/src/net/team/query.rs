@@ -22,6 +22,9 @@ pub(crate) struct PeerArgs {
     /// Origin the source machine publishes under (pinned for verification).
     #[arg(long)]
     origin: String,
+    /// Explicitly pinned Ed25519 public key, lowercase hex.
+    #[arg(long)]
+    public_key: String,
     /// Project id expected in the machine's slice.
     #[arg(long)]
     project: String,
@@ -39,10 +42,12 @@ struct Peer {
     connect: ConnectArgs,
     #[serde(default)]
     via_coordinator: bool,
+    public_key: String,
 }
 impl Peer {
     fn validate(&self) -> ShareResult<()> {
-        if self.schema != "brain-team-peer/1"
+        if team::keys::validate_public(&self.public_key).is_err()
+            || self.schema != "brain-team-peer/1"
             || ![&self.machine, &self.origin, &self.project, &self.space]
                 .iter()
                 .all(|s| team::id(s))
@@ -93,6 +98,7 @@ pub(super) fn configure(args: PeerArgs) -> ShareResult<Value> {
         space,
         connect: args.connect,
         via_coordinator: false,
+        public_key: args.public_key,
     };
     peer.validate()?;
     // Validate before persisting endpoint references. No coordinator request;
@@ -165,6 +171,11 @@ fn refresh(
             {
                 return Err("offline");
             }
+            TlsCallResult::Refused(brain_core::network::NetError::Forbidden(message))
+                if message.contains("snapshot signature failed") =>
+            {
+                return Err("signature_failed");
+            }
             TlsCallResult::Refused(_) => return Err("denied"),
             TlsCallResult::Unreachable(_) => return Err("offline"),
             TlsCallResult::Tls(TlsError::Unreachable(_)) => return Err("offline"),
@@ -228,7 +239,11 @@ fn refresh(
                 received_from_peer: peer.machine.clone(),
                 received_at: super::super::unix_now(),
             };
-            replica.validate().map_err(|_| "incomplete")?;
+            replica
+                .slice
+                .verify_pinned(&peer.public_key)
+                .map_err(|_| "signature_failed")?;
+            replica.validate().map_err(|_| "signature_failed")?;
             if replica.received_at - replica.slice.generated_at > 90 * DAY {
                 return Err("no_slice");
             }
@@ -442,7 +457,23 @@ pub(super) fn ask(config: &crate::RuntimeConfig, args: AskArgs) -> ShareResult<V
     let machines = args.machines.iter().collect::<BTreeSet<_>>();
     let mut origins = BTreeSet::new();
     for machine in machines {
-        let cached = store.team_replica(machine)?;
+        let cached = match store.team_replica(machine) {
+            Ok(replica) => replica,
+            Err(_) => {
+                statuses.push(
+                    json!({"machine":machine,"status":"signature_failed","coverage":"unknown"}),
+                );
+                store.team_audit(&audit(
+                    (&request_id, now, started, &args),
+                    None,
+                    None,
+                    vec![],
+                    "error",
+                    "signature_failed",
+                ))?;
+                continue;
+            }
+        };
         let peer = store
             .team_peer(machine)?
             .and_then(|v| serde_json::from_value::<Peer>(v).ok());
@@ -467,11 +498,40 @@ pub(super) fn ask(config: &crate::RuntimeConfig, args: AskArgs) -> ShareResult<V
         };
         match outcome {
             Ok(replica) => {
-                store.team_save_replica(machine, &replica)?;
+                if store.team_save_replica(machine, &replica).is_err() {
+                    store.team_audit(&audit(
+                        (&request_id, now, started, &args),
+                        peer.as_ref(),
+                        None,
+                        vec![],
+                        "denied",
+                        "refused",
+                    ))?;
+                    statuses
+                        .push(json!({"machine":machine,"status":"denied","coverage":"unknown"}));
+                    continue;
+                }
                 let replica = if let Some(recorded) = args.recorded_at {
-                    if let Some(historical) =
-                        store.team_replica_as_of(machine, &replica.slice, recorded)?
-                    {
+                    let historical = match store.team_replica_as_of(
+                        machine,
+                        &replica.slice,
+                        recorded,
+                    ) {
+                        Ok(historical) => historical,
+                        Err(_) => {
+                            store.team_audit(&audit(
+                                (&request_id, now, started, &args),
+                                peer.as_ref(),
+                                None,
+                                vec![],
+                                "error",
+                                "signature_failed",
+                            ))?;
+                            statuses.push(json!({"machine":machine,"status":"signature_failed","coverage":"unknown"}));
+                            continue;
+                        }
+                    };
+                    if let Some(historical) = historical {
                         historical
                     } else {
                         store.team_audit(&audit(
@@ -587,6 +647,7 @@ pub(super) fn ask(config: &crate::RuntimeConfig, args: AskArgs) -> ShareResult<V
             "no_slice" => "нет среза",
             "history_unknown" => "история до первого наблюдения неизвестна",
             "denied" => "доступ запрещён",
+            "signature_failed" => "подпись не прошла",
             "stale" => "устарел",
             "incomplete" => "неполный срез",
             "empty" => "совпадений нет",

@@ -382,8 +382,10 @@ and separate evidence on real machines; this ADR does not replace them.
    list. The machine owner switches publication off locally at any time.
 3. Phase 1: one isolated team space per project and recipient set; administered
    by the coordinator administrator.
-4. Phase 1 without a digital signature: TLS + BLAKE3 slice integrity. Ed25519
-   signatures are phase 2, together with Biscuit.
+4. Phase 1 used unsigned TLS + BLAKE3 integrity. Decision for 0.3 / M3:
+   Ed25519 snapshots with pinned machine keys and a versioned coordinator-signed
+   read/project/expiry capability, without Biscuit. Coordinator, source and
+   `team ask` enforce it; see [team-security](../team-security.md).
 5. Retention: slices 90 days, the local audit of lead requests 365 days. A
    slice older than 24 h is marked "stale"; an offline machine means "no
    answer" plus the last slice time and its age.

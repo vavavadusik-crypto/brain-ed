@@ -33,7 +33,7 @@ impl Source {
 impl AuthStore {
     /// Team gateway credentials are secrets (legacy auth stored only hashes).
     /// Refuse unsafe existing state rather than silently chmod an owner's files.
-    fn private_team_state(&self) -> Result<(), NetError> {
+    pub(super) fn private_team_state(&self) -> Result<(), NetError> {
         use std::os::unix::fs::MetadataExt;
         let uid =
             super::tls::current_uid().ok_or_else(|| NetError::forbidden("unknown state owner"))?;
@@ -73,7 +73,27 @@ impl AuthStore {
         project: &str,
         ttl: i64,
     ) -> Result<BearerToken, NetError> {
+        self.team_invite_projects(name, role, &[project.to_owned()], ttl)
+    }
+    pub fn team_invite_projects(
+        &self,
+        name: &str,
+        role: &str,
+        projects: &[String],
+        ttl: i64,
+    ) -> Result<BearerToken, NetError> {
         self.private_team_state()?;
+        if projects.is_empty()
+            || projects.len() > 16
+            || (role == "worker" && projects.len() != 1)
+            || projects.iter().any(|p| !crate::team::id(p) || p.len() > 48)
+        {
+            return Err(NetError::invalid(
+                "manager requires 1..16 projects; worker requires one project",
+            ));
+        }
+        let project = projects[0].as_str();
+        self.team_authority()?;
         if !["worker", "manager"].contains(&role) || !crate::team::id(project) || project.len() > 48
         {
             return Err(NetError::invalid("invalid team role or project"));
@@ -90,7 +110,14 @@ impl AuthStore {
         }
         let tx = self.connection.unchecked_transaction()?;
         let space = format!("team.{project}");
-        self.upsert_principal(name, "team", name, role, &[&space])?;
+        let spaces: Vec<String> = projects.iter().map(|p| format!("team.{p}")).collect();
+        self.upsert_principal(
+            name,
+            "team",
+            name,
+            role,
+            &spaces.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
         let id: i64 = tx.query_row(
             "SELECT id FROM principals WHERE machine_id=?1 AND agent_id='team'",
             [name],
@@ -105,8 +132,18 @@ impl AuthStore {
             "INSERT INTO team_invitations(token_id,principal_id) VALUES(?1,?2)",
             params![token.token_id().as_str(), id],
         )?;
+        tx.execute(
+            "INSERT INTO team_security(principal_id,projects,expires_at) VALUES(?1,?2,?3)",
+            params![
+                id,
+                serde_json::to_string(projects).map_err(|_| NetError::invalid("projects"))?,
+                super::auth::now_unix() + ttl
+            ],
+        )?;
         if role == "manager" {
-            self.grant_memory_read(name, "team", &space)?;
+            for space in &spaces {
+                self.grant_memory_read(name, "team", space)?;
+            }
         }
         tx.commit()?;
         Ok(token)
@@ -166,6 +203,13 @@ impl AuthStore {
         {
             return Err(NetError::forbidden("invitation identity or role mismatch"));
         }
+        let public_key = req
+            .arguments
+            .get("public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| NetError::invalid("machine public key required"))?;
+        crate::team::keys::validate_public(public_key)
+            .map_err(|_| NetError::invalid("invalid machine public key"))?;
         let source = match req.arguments.get("source") {
             Some(v) if auth.principal.role == "worker" => {
                 let source: Source = serde_json::from_value(v.clone())
@@ -210,11 +254,49 @@ impl AuthStore {
             "UPDATE team_members SET accepted_at=?2,source=?3 WHERE principal_id=?1",
             params![auth.principal.id, now, source],
         )?;
+        let expires: i64 = tx.query_row(
+            "SELECT expires_at FROM team_security WHERE principal_id=?1",
+            [auth.principal.id],
+            |r| r.get(0),
+        )?;
+        if expires <= now {
+            return Err(NetError::forbidden("invitation expired"));
+        }
+        let rights = if role == "manager" {
+            let key = crate::team::keys::MachineKey::load(
+                self.path
+                    .parent()
+                    .ok_or_else(|| NetError::invalid("state"))?,
+            )
+            .map_err(|_| NetError::unavailable("authority key"))?;
+            Some(
+                crate::team::security::Rights {
+                    version: 1,
+                    issuer: key.public_key(),
+                    subject: auth.principal.machine_id.clone(),
+                    credential_id: token.token_id().as_str().into(),
+                    projects: self.team_projects(auth)?,
+                    permission: "read".into(),
+                    issued_at: now,
+                    expires_at: expires,
+                }
+                .sign(&key)
+                .map_err(|_| NetError::unavailable("rights signing"))?,
+            )
+        } else {
+            None
+        };
+        tx.execute(
+            "UPDATE team_security SET public_key=?2,rights=?3 WHERE principal_id=?1",
+            params![auth.principal.id, public_key, rights],
+        )?;
+        tx.execute(
+            "INSERT INTO team_key_audit(principal_id,at,new_key,epoch) VALUES(?1,?2,?3,1)",
+            params![auth.principal.id, now, public_key],
+        )?;
         tx.commit()?;
         // Returned only in the encrypted accept response, written 0600 by the CLI.
-        Ok(
-            json!({"credential":token.as_str(),"expires_at":now+super::auth::DEFAULT_CREDENTIAL_TTL_SECS}),
-        )
+        Ok(json!({"credential":token.as_str(),"expires_at":expires,"rights":rights}))
     }
 
     pub fn team_route_policy(
@@ -239,8 +321,25 @@ impl AuthStore {
             return self.team_accept(auth, req, now);
         }
         let (project, space) = self.team_project(auth)?;
+        if req.tool == "team_rekey" {
+            return self.team_rekey(auth, req, now);
+        }
+        if auth.principal.role == "reader" {
+            self.team_capability(auth, &project, now)?;
+        }
         if req.tool == "team_directory" {
             return self.team_directory(auth, &project, &space);
+        }
+        let space = req
+            .space()
+            .ok_or_else(|| NetError::invalid("space"))?
+            .to_owned();
+        let project = space
+            .strip_prefix("team.")
+            .ok_or_else(|| NetError::forbidden("project"))?
+            .to_owned();
+        if !self.team_projects(auth)?.contains(&project) {
+            return Err(NetError::forbidden("project not granted"));
         }
         if req.tool == "team_register" {
             if auth.principal.role != "worker" || req.space() != Some(space.as_str()) {
@@ -289,25 +388,10 @@ impl AuthStore {
         let source: Source =
             serde_json::from_str(&source.ok_or_else(|| NetError::forbidden("source unavailable"))?)
                 .map_err(|_| NetError::unavailable("source config"))?;
-        let client = TlsCoordClient::team_source(&source)?;
-        let mut args = req.arguments.clone();
-        args.remove("source_name");
-        let body = match client.call("share_pull", "", args, req.request_id.clone()) {
-            TlsCallResult::Ok(v) => v,
-            TlsCallResult::Refused(_) => return Err(NetError::forbidden("source denied")),
-            _ => return Err(NetError::unavailable("source offline")),
-        };
-        if body["result"]["share"]["origin"] != source.origin {
-            return Err(NetError::forbidden("source origin mismatch"));
-        }
-        let share = body["result"]["share"].clone();
-        if let Some(events) = share["events"].as_array() {
-            for event in events {
-                if let Some(t) = event["fact"]["payload"]["generated_at"].as_i64() {
-                    self.connection.execute("UPDATE team_members SET last_slice_at=?2 WHERE principal_id IN (SELECT id FROM principals WHERE machine_id=?1)",params![name,t])?;
-                }
-            }
-        }
+        let rights = self.team_capability(auth, &project, now)?;
+        let public_key = self.team_pin(name)?;
+        let share = verified_page(&source, &public_key, name, &project, &space, &rights, req)?;
+        self.connection.execute("UPDATE team_members SET last_slice_at=?2 WHERE principal_id IN (SELECT id FROM principals WHERE machine_id=?1)",params![name,share["generated_at"].as_i64()])?;
         Ok(json!({"status":"ok","share":share}))
     }
 
@@ -317,18 +401,23 @@ impl AuthStore {
         project: &str,
         space: &str,
     ) -> Result<Value, NetError> {
-        let mut st=self.connection.prepare("SELECT p.machine_id,m.source FROM team_members m JOIN principals p ON p.id=m.principal_id WHERE m.project=?1 AND p.disabled_at IS NULL AND p.role='worker' AND m.accepted_at IS NOT NULL AND m.source IS NOT NULL ORDER BY p.machine_id LIMIT 200")?;
+        let mut st=self.connection.prepare("SELECT p.machine_id,m.source FROM team_members m JOIN principals p ON p.id=m.principal_id WHERE m.project IN (SELECT value FROM json_each(?1)) AND p.disabled_at IS NULL AND p.role='worker' AND m.accepted_at IS NOT NULL AND m.source IS NOT NULL ORDER BY p.machine_id LIMIT 200")?;
         let mut peers = vec![];
         if auth.principal.role == "reader" && auth.memory_read_spaces().contains(&space.to_string())
         {
-            for row in st.query_map([project], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })? {
+            for row in st.query_map(
+                [serde_json::to_string(&self.team_projects(auth)?)
+                    .map_err(|_| NetError::invalid("projects"))?],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )? {
                 let (name, text) = row?;
                 let source: Source = serde_json::from_str(&text)
                     .map_err(|_| NetError::unavailable("source config"))?;
                 peers.push(
-                    json!({"machine":name,"origin":source.origin,"project":project,"space":space}),
+                    {
+                        let (project,space):(String,String)=self.connection.query_row("SELECT m.project,m.space FROM team_members m JOIN principals p ON p.id=m.principal_id WHERE p.machine_id=?1",[&name],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                        json!({"machine":name,"origin":source.origin,"project":project,"space":space,"public_key":self.team_pin(&name)?})
+                    },
                 );
             }
         }
@@ -336,6 +425,137 @@ impl AuthStore {
             json!({"status":"ok","peers":peers,"team":self.team_who(Some(project),super::auth::now_unix())?}),
         )
     }
+}
+
+/// Read and verify a complete bounded generation before releasing its first page.
+fn verified_page(
+    source: &Source,
+    public_key: &str,
+    machine: &str,
+    project: &str,
+    space: &str,
+    rights: &str,
+    req: &CoordRequest,
+) -> Result<Value, NetError> {
+    use crate::{
+        sharing::{EventKind, FactKind, ShareEvent},
+        team::{Fact, MAX_ENTITIES, SLICE_SCHEMA, Slice},
+    };
+    let signature_error = || NetError::forbidden("подпись не прошла / snapshot signature failed");
+    let client = TlsCoordClient::team_source(source)?;
+    let mut cursor = 0;
+    let mut all = Vec::new();
+    let mut complete = false;
+    for _ in 0..4 {
+        let args = serde_json::from_value(
+            json!({"space":space,"after_seq":cursor,"limit":10,"rights":rights}),
+        )
+        .map_err(|_| signature_error())?;
+        let body = match client.call("share_pull", "", args, req.request_id.clone()) {
+            TlsCallResult::Ok(body) => body,
+            TlsCallResult::Refused(error) => return Err(error),
+            _ => return Err(NetError::unavailable("source offline")),
+        };
+        let page = &body["result"]["share"];
+        if page["origin"] != source.origin || page["space"] != space {
+            return Err(signature_error());
+        }
+        let events = page["events"].as_array().ok_or_else(signature_error)?;
+        if events.is_empty() {
+            return Err(signature_error());
+        }
+        for value in events {
+            let event = ShareEvent::from_wire(value).map_err(|_| signature_error())?;
+            if event.origin != source.origin
+                || event.space != space
+                || event.kind != EventKind::Put
+                || event.claimed_agent.is_some()
+                || (cursor != 0 && event.seq != cursor + 1)
+                || event.seq == 0
+                || all.len() > MAX_ENTITIES
+            {
+                return Err(signature_error());
+            }
+            cursor = event.seq;
+            all.push(event);
+        }
+        if page["next_seq"].as_u64() != Some(cursor) {
+            return Err(signature_error());
+        }
+        match page["has_more"].as_bool() {
+            Some(false) => {
+                complete = true;
+                break;
+            }
+            Some(true) => {}
+            _ => return Err(signature_error()),
+        }
+    }
+    if !complete {
+        return Err(signature_error());
+    }
+    let last = all.last().ok_or_else(signature_error)?;
+    let shared = last.fact.as_ref().ok_or_else(signature_error)?;
+    if shared.kind != FactKind::Fact
+        || shared.claim.is_some()
+        || shared.payload["schema"] != SLICE_SCHEMA
+    {
+        return Err(signature_error());
+    }
+    let slice: Slice =
+        serde_json::from_value(shared.payload.clone()).map_err(|_| signature_error())?;
+    let mut facts = Vec::new();
+    for event in all.iter().take(all.len() - 1) {
+        let shared = event.fact.as_ref().ok_or_else(signature_error)?;
+        let fact: Fact =
+            serde_json::from_value(shared.payload.clone()).map_err(|_| signature_error())?;
+        if shared.claim.is_some()
+            || (matches!(fact.content, crate::team::Content::Link { .. }))
+                != (shared.kind == FactKind::Link)
+        {
+            return Err(signature_error());
+        }
+        facts.push(fact);
+    }
+    slice
+        .verify_pinned(public_key)
+        .map_err(|_| signature_error())?;
+    slice.validate(&facts).map_err(|_| signature_error())?;
+    if slice.machine_id != machine
+        || slice.project_id != project
+        || slice.space != space
+        || slice.origin != source.origin
+        || Some(slice.seq_first) != all.first().map(|e| e.seq)
+        || slice.seq_last != cursor
+    {
+        return Err(signature_error());
+    }
+    let after = req
+        .arguments
+        .get("after_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if after != 0 && after < slice.seq_first.saturating_sub(1) {
+        return Err(signature_error());
+    }
+    let limit = req
+        .arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10) as usize;
+    let events: Vec<Value> = all
+        .iter()
+        .filter(|e| e.seq > after)
+        .take(limit)
+        .map(ShareEvent::to_wire)
+        .collect();
+    let next = events
+        .last()
+        .and_then(|e| e["seq"].as_u64())
+        .unwrap_or(after);
+    Ok(
+        json!({"origin":source.origin,"space":space,"after_seq":after,"next_seq":next,"has_more":next<cursor,"events":events,"generated_at":slice.generated_at}),
+    )
 }
 
 #[cfg(test)]
@@ -389,7 +609,7 @@ mod tests {
             tool: "team_accept".into(),
             agent: String::new(),
             arguments: serde_json::from_value(
-                json!({"space":"team.demo","expected_role":"worker","expected_name":"manager-one"}),
+                json!({"space":"team.demo","expected_role":"worker","expected_name":"manager-one","public_key":crate::team::keys::MachineKey::generate().unwrap().public_key()}),
             )
             .unwrap(),
             request_id: None,

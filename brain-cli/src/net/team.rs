@@ -25,6 +25,8 @@ pub(crate) enum TeamCommand {
     Who(Local),
     /// Local coordinator admin: revoke a member and access to team slices.
     Remove(onboarding::Remove),
+    /// Rotate the machine signing key through the coordinator; old slices close immediately.
+    Rekey(Local),
     /// Coordinator admin: pin a source machine, origin, project, space and TLS endpoint.
     Peer(query::PeerArgs),
     /// Search only complete verified replicas of explicitly selected machines.
@@ -131,7 +133,7 @@ pub(crate) fn manifest_document(state: &Path) -> ShareResult<Value> {
         out.push(json!({"manifest":m,"ready":ready,"last_slice":slice}));
     }
     Ok(
-        json!({"status":"ok","manifests":out,"classes":CLASSES,"fields":CLASSES.iter().map(|c|((*c).to_owned(),team::fields(c))).collect::<std::collections::BTreeMap<_,_>>(),"integrity":"tls+blake3-unsigned","schedule":"manual_or_user_timer"}),
+        json!({"status":"ok","manifests":out,"classes":CLASSES,"fields":CLASSES.iter().map(|c|((*c).to_owned(),team::fields(c))).collect::<std::collections::BTreeMap<_,_>>(),"integrity":"tls+blake3+ed25519","schedule":"manual_or_user_timer","signing_public_key":team::keys::MachineKey::load(state).ok().map(|key|key.public_key())}),
     )
 }
 pub(crate) fn toggle_at(
@@ -163,7 +165,8 @@ fn execute(config: &RuntimeConfig, cmd: TeamCommand) -> ShareResult<Value> {
         TeamCommand::Invite(_)
         | TeamCommand::Accept(_)
         | TeamCommand::Who(_)
-        | TeamCommand::Remove(_) => Err(team::bad()),
+        | TeamCommand::Remove(_)
+        | TeamCommand::Rekey(_) => Err(team::bad()),
         TeamCommand::Peer(args) => query::configure(args),
         TeamCommand::Ask(args) => query::ask(config, args),
         TeamCommand::Manifest(local) => manifest_document(&dir(&local)),
@@ -256,6 +259,7 @@ pub(crate) fn run(config: &RuntimeConfig, command: TeamCommand) -> Result<(), Bo
         TeamCommand::Accept(args) => return crate::print_json(&onboarding::accept(config, args)?),
         TeamCommand::Who(args) => return crate::print_json(&onboarding::who(args)?),
         TeamCommand::Remove(args) => return crate::print_json(&onboarding::remove(args)?),
+        TeamCommand::Rekey(args) => return crate::print_json(&onboarding::rekey(args)?),
         other => other,
     };
     if let TeamCommand::Schedule { command } = command {

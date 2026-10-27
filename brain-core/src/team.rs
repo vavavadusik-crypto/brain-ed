@@ -573,18 +573,54 @@ pub struct Slice {
 impl Slice {
     pub fn seal(&mut self) -> ShareResult<()> {
         self.snapshot_id.clear();
-        self.snapshot_id = digest(self)?;
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        self.snapshot_id = digest(&unsigned)?;
+        Ok(())
+    }
+    /// The key comes from the coordinator directory or explicit local pin, never the slice.
+    pub fn verify_pinned(&self, public_key: &str) -> ShareResult<()> {
+        if self.integrity != security::SIGNED {
+            return Err(bad());
+        }
+        let signature = self.signature.as_deref().ok_or_else(bad)?;
+        let (claimed, signature) = signature.split_once(':').ok_or_else(bad)?;
+        if claimed != public_key {
+            return Err(bad());
+        }
+        keys::verify(
+            public_key,
+            format!("brain-team-slice-signature/1:{}", self.snapshot_id).as_bytes(),
+            signature,
+        )
+    }
+    pub fn sign(&mut self, key: &keys::MachineKey) -> ShareResult<()> {
+        self.integrity = security::SIGNED.into();
+        self.signature = None;
+        self.seal()?;
+        self.signature = Some(format!(
+            "{}:{}",
+            key.public_key(),
+            key.sign(format!("brain-team-slice-signature/1:{}", self.snapshot_id).as_bytes())
+        ));
         Ok(())
     }
     pub fn validate(&self, facts: &[Fact]) -> ShareResult<()> {
+        if self.integrity == security::SIGNED {
+            let (public, _) = self
+                .signature
+                .as_deref()
+                .and_then(|s| s.split_once(':'))
+                .ok_or_else(bad)?;
+            self.verify_pinned(public)?;
+        }
         let mut sealed = self.clone();
         sealed.seal()?;
         if self.schema != SLICE_SCHEMA
             || self.manifest_revision == 0
             || !hex(&self.snapshot_id)
             || sealed.snapshot_id != self.snapshot_id
-            || self.integrity != "tls+blake3-unsigned"
-            || self.signature.is_some()
+            || self.integrity != security::SIGNED
             || ![
                 &self.origin,
                 &self.machine_id,
@@ -760,7 +796,7 @@ mod tests {
             integrity: "tls+blake3-unsigned".into(),
             signature: None,
         };
-        slice.seal().unwrap();
+        slice.sign(&keys::MachineKey::generate().unwrap()).unwrap();
         slice.validate(&facts).unwrap();
         let mut tampered = facts.clone();
         tampered[0].valid_from += 1;
@@ -772,3 +808,6 @@ mod tests {
 
 pub(crate) mod store;
 pub use store::{Audit, Manifest, Recipient, Replica};
+
+pub mod keys;
+pub mod security;

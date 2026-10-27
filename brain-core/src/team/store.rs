@@ -76,7 +76,7 @@ impl Manifest {
                     .is_none_or(|(c, f)| !fields(c).contains(&f))
             })
             || self.annotation_policy != "automatic-masked"
-            || self.integrity != "tls+blake3-unsigned"
+            || !["tls+blake3-unsigned", security::SIGNED].contains(&self.integrity.as_str())
             || self.snapshot_retention_days != 90
             || self.audit_retention_days != 365
             || self.stale_after_seconds != DAY
@@ -155,6 +155,8 @@ impl ShareStore {
     }
     /// Trusted local configuration only. Reconfiguration always disables publication.
     pub fn team_configure(&mut self, mut manifest: Manifest) -> ShareResult<Manifest> {
+        keys::MachineKey::ensure(self.path().parent().ok_or_else(bad)?)?;
+        manifest.integrity = security::SIGNED.into();
         manifest.enabled = false;
         manifest.origin = self.install_id().into();
         let tx = self
@@ -348,7 +350,14 @@ impl ShareStore {
             }
         }
         let slice = manifest.ok_or_else(bad)?;
-        slice.validate(&prepared)?;
+        slice
+            .validate(&prepared)
+            .map_err(|_| crate::sharing::ShareError::InvalidData("team_signature_failed".into()))?;
+        slice
+            .verify_pinned(
+                &keys::MachineKey::load(self.path().parent().ok_or_else(bad)?)?.public_key(),
+            )
+            .map_err(|_| crate::sharing::ShareError::InvalidData("team_signature_failed".into()))?;
         if slice.seq_first != first
             || slice.seq_last != last
             || slice != self.team_active_slice(space)?.ok_or_else(bad)?
@@ -380,6 +389,7 @@ impl ShareStore {
         now: i64,
     ) -> ShareResult<Value> {
         let m = self.team_manifest(space)?.ok_or_else(bad)?;
+        let signing_key = keys::MachineKey::load(self.path().parent().ok_or_else(bad)?)?;
         if !m.enabled || facts.len() > MAX_ENTITIES {
             return Err(bad());
         }
@@ -437,7 +447,7 @@ impl ShareStore {
             tx.execute("INSERT INTO team_observations VALUES(?1,?2,?3) ON CONFLICT(space,entity_id) DO UPDATE SET document=excluded.document",params![space,f.entity_id,serde_json::to_string(f).map_err(|_|bad())?])?;
         }
         facts.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
-        let fingerprint = digest(&(m.revision, &facts, rejected))?;
+        let fingerprint = digest(&(m.revision, &facts, rejected, signing_key.public_key()))?;
         let old: Option<(String, String)> = tx
             .query_row(
                 "SELECT fingerprint,document FROM team_generations WHERE space=?1",
@@ -497,7 +507,7 @@ impl ShareStore {
             integrity: m.integrity.clone(),
             signature: None,
         };
-        slice.seal()?;
+        slice.sign(&signing_key)?;
         slice.validate(&facts)?;
         let mut seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0) FROM events WHERE origin=?1 AND space=?2",
@@ -609,8 +619,15 @@ impl ShareStore {
             || !["share_pull", "share_query", "team_ask", "team_pull"]
                 .contains(&audit.operation.as_str())
             || !["ok", "denied", "error", "cancelled"].contains(&audit.outcome.as_str())
-            || !["ok", "unavailable", "refused", "invalid", "pending"]
-                .contains(&audit.reason.as_str())
+            || ![
+                "ok",
+                "unavailable",
+                "refused",
+                "invalid",
+                "pending",
+                "signature_failed",
+            ]
+            .contains(&audit.reason.as_str())
         {
             return Err(bad());
         }
@@ -682,8 +699,16 @@ impl ShareStore {
         s.map(|s| serde_json::from_str(&s).map_err(|_| bad()))
             .transpose()
     }
+    fn team_verify_replica(&self, machine: &str, replica: &Replica) -> ShareResult<()> {
+        let peer = self.team_peer(machine)?.ok_or_else(bad)?;
+        replica
+            .slice
+            .verify_pinned(peer["public_key"].as_str().ok_or_else(bad)?)?;
+        Ok(())
+    }
     pub fn team_save_replica(&self, machine: &str, replica: &Replica) -> ShareResult<()> {
         replica.validate()?;
+        self.team_verify_replica(machine, replica)?;
         if let Some(old) = self.team_replica(machine)?
             && (old.slice.origin != replica.slice.origin
                 || old.slice.space != replica.slice.space
@@ -738,6 +763,7 @@ impl ShareStore {
         text.map(|s| {
             let r: Replica = serde_json::from_str(&s).map_err(|_| bad())?;
             r.validate()?;
+            self.team_verify_replica(machine, &r)?;
             if r.slice.origin != current.origin
                 || r.slice.space != current.space
                 || r.slice.project_id != current.project_id
@@ -760,6 +786,7 @@ impl ShareStore {
         s.map(|s| {
             let r: Replica = serde_json::from_str(&s).map_err(|_| bad())?;
             r.validate()?;
+            self.team_verify_replica(machine, &r)?;
             Ok(r)
         })
         .transpose()
@@ -770,7 +797,7 @@ impl ShareStore {
 mod tests {
     use super::*;
     fn setup() -> (ShareStore, std::path::PathBuf, Manifest) {
-        let path = crate::test_support::temp_path("team-policy");
+        let path = crate::test_support::temp_path("team-policy").join("share.sqlite");
         let mut s = ShareStore::open(&path).unwrap();
         let m = Manifest {
             schema: "brain-team-manifest/1".into(),
@@ -1020,7 +1047,11 @@ mod history_tests {
             integrity: "tls+blake3-unsigned".into(),
             signature: None,
         };
-        slice.seal().unwrap();
+        let key = keys::MachineKey::generate().unwrap();
+        store
+            .team_save_peer("7", &json!({"public_key":key.public_key()}))
+            .unwrap();
+        slice.sign(&key).unwrap();
         let old = Replica {
             slice,
             facts: vec![f.clone()],
@@ -1042,7 +1073,7 @@ mod history_tests {
             revision: 2,
             digest: digest(&f).unwrap(),
         }];
-        current.slice.seal().unwrap();
+        current.slice.sign(&key).unwrap();
         current.received_at = now;
         store.team_save_replica("7", &current).unwrap();
         assert!(store.team_save_replica("7", &old).is_err());
@@ -1062,7 +1093,7 @@ mod history_tests {
                 .is_none()
         );
         current.slice.manifest_revision = 2;
-        current.slice.seal().unwrap();
+        current.slice.sign(&key).unwrap();
         store.team_save_replica("7", &current).unwrap();
         assert!(
             store
@@ -1079,5 +1110,130 @@ mod history_tests {
         assert!(store.team_replica("7").unwrap().is_none());
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    fn setup() -> (ShareStore, Replica, keys::MachineKey, std::path::PathBuf) {
+        let state = crate::test_support::temp_path("signed-replica");
+        std::fs::create_dir_all(&state).unwrap();
+        let store = ShareStore::open(state.join("share.sqlite")).unwrap();
+        let key = keys::MachineKey::generate().unwrap();
+        let facts = vec![super::super::tests::fact()];
+        let f = &facts[0];
+        let mut slice = Slice {
+            schema: SLICE_SCHEMA.into(),
+            manifest_revision: 1,
+            origin: f.origin.clone(),
+            machine_id: f.machine_id.clone(),
+            space: f.space.clone(),
+            project_id: f.project_id.clone(),
+            snapshot_id: String::new(),
+            generated_at: 30,
+            seq_first: 1,
+            seq_last: 2,
+            collected_from: 29,
+            source_watermarks: Watermarks {
+                distill: Some(20),
+                work: None,
+                git: None,
+            },
+            coverage: "bounded".into(),
+            rejected: 0,
+            entity_digests: vec![EntityDigest {
+                entity_id: f.entity_id.clone(),
+                revision: 1,
+                digest: digest(f).unwrap(),
+            }],
+            integrity: security::SIGNED.into(),
+            signature: None,
+        };
+        slice.sign(&key).unwrap();
+        let replica = Replica {
+            slice,
+            facts,
+            received_from_peer: "7".into(),
+            received_at: 31,
+        };
+        store
+            .team_save_peer("7", &json!({"public_key":key.public_key()}))
+            .unwrap();
+        store.team_save_replica("7", &replica).unwrap();
+        (store, replica, key, state)
+    }
+    #[test]
+    fn attack_replica_tamper_with_recomputed_digests_is_rejected() {
+        let (store, mut replica, _, state) = setup();
+        replica.facts[0].valid_from += 1;
+        replica.slice.entity_digests[0].digest = digest(&replica.facts[0]).unwrap();
+        replica.slice.seal().unwrap(); // attacker can recompute BLAKE3, not the signature
+        store
+            .conn
+            .execute(
+                "UPDATE team_replicas SET document=?1",
+                [serde_json::to_string(&replica).unwrap()],
+            )
+            .unwrap();
+        assert!(store.team_replica("7").is_err());
+        drop(store);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+    #[test]
+    fn attack_foreign_key_signature_cannot_replace_pinned_machine() {
+        let (store, mut replica, _, state) = setup();
+        replica
+            .slice
+            .sign(&keys::MachineKey::generate().unwrap())
+            .unwrap();
+        replica.validate().unwrap(); // authentic signature, wrong machine key
+        assert!(store.team_save_replica("7", &replica).is_err());
+        drop(store);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+    #[test]
+    fn attack_old_snapshot_after_rekey_is_rejected_including_history() {
+        let (store, replica, _, state) = setup();
+        let new_key = keys::MachineKey::generate().unwrap();
+        store
+            .team_save_peer("7", &json!({"public_key":new_key.public_key()}))
+            .unwrap();
+        assert!(store.team_save_replica("7", &replica).is_err());
+        // Simulate replay injected straight into both replica tables after rotation.
+        store
+            .conn
+            .execute(
+                "INSERT INTO team_replicas VALUES('7',31,?1)",
+                [serde_json::to_string(&replica).unwrap()],
+            )
+            .unwrap();
+        assert!(store.team_replica("7").is_err());
+        store
+            .conn
+            .execute(
+                "INSERT INTO team_replica_history VALUES('7',?1,30,1,?2)",
+                params![
+                    replica.slice.snapshot_id,
+                    serde_json::to_string(&replica).unwrap()
+                ],
+            )
+            .unwrap();
+        let mut current = replica.slice.clone();
+        current.sign(&new_key).unwrap();
+        assert!(store.team_replica_as_of("7", &current, 31).is_err());
+        drop(store);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+    #[test]
+    fn missing_signature_never_downgrades_to_unsigned() {
+        let (store, mut replica, _, state) = setup();
+        replica.slice.signature = None;
+        assert!(replica.validate().is_err());
+        replica.slice.integrity = "tls+blake3-unsigned".into();
+        replica.slice.seal().unwrap();
+        assert!(store.team_save_replica("7", &replica).is_err());
+        drop(store);
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

@@ -10,6 +10,8 @@ default = []
 model2vec = ["dep:hf-hub", "dep:model2vec-rs"]
 
 [dependencies]
+# Ed25519 backend already locked transitively through rustls (Apache-2.0 AND ISC).
+ring = "0.17.14"
 blake3 = "1.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["ureq"] }

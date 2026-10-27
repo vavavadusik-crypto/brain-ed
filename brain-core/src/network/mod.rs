@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod relay;
 pub mod server;
 pub mod team;
+mod team_security;
 pub mod tls;
 
 pub use auth::{AuthStore, Authenticated, BearerToken, Principal, TokenId};

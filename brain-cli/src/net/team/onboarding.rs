@@ -21,6 +21,9 @@ pub(crate) struct Invite {
     /// Project id, used as an explicit team.PROJECT shared-space boundary.
     #[arg(long, default_value = "default")]
     project: String,
+    /// Manager read scope, comma-separated project ids (up to 16).
+    #[arg(long, value_delimiter = ',')]
+    projects: Vec<String>,
     /// Invitation lifetime: seconds or suffix s, m, h, d (60s..90d).
     #[arg(long, default_value = "7d")]
     expires: String,
@@ -149,6 +152,12 @@ pub(super) fn invite(args: Invite) -> Result<Value> {
         return Err("invite is local coordinator admin only".into());
     }
     let ttl = duration(&args.expires)?;
+    let projects = if args.projects.is_empty() {
+        vec![args.project.clone()]
+    } else {
+        args.projects.clone()
+    };
+    let project = projects.first().ok_or("project required")?.clone();
     let dial = args.dial.map(Ok).unwrap_or_else(|| runtime_dial(&state))?;
     // Invitation data may contain LAN addresses; accept still requires its own dial opt-in.
     brain_core::network::parse_dial_target_with(&dial, true, true)
@@ -165,9 +174,9 @@ pub(super) fn invite(args: Invite) -> Result<Value> {
         return Err("invitation output already exists".into());
     }
     let auth = AuthStore::open(&state)?;
-    let token = auth.team_invite(&args.name, &args.role, &args.project, ttl)?;
+    let token = auth.team_invite_projects(&args.name, &args.role, &projects, ttl)?;
     auth.team_route_policy(&args.name, args.allow_lan_source, args.allow_cgnat_source)?;
-    let document = json!({"schema":"brain-team-invite/1","role":args.role,"project":args.project,
+    let document = json!({"schema":"brain-team-invite/1","role":args.role,"project":project,"projects":projects,"authority":auth.team_authority()?,
         "connection":{"version":1,"server_name":server_name,"dial":[dial],"ca_pem":ca,
             "credential":token.as_str(),"machine":args.name,"agent_id":"team","expires_at":super::super::unix_now()+ttl}});
     if new_secret(&out, &serde_json::to_vec_pretty(&document)?).is_err() {
@@ -175,7 +184,7 @@ pub(super) fn invite(args: Invite) -> Result<Value> {
         return Err("cannot write invitation; account revoked".into());
     }
     Ok(
-        json!({"status":"ok","name":args.name,"role":args.role,"project":args.project,"invitation":out,"expires_at":document["connection"]["expires_at"]}),
+        json!({"status":"ok","name":args.name,"role":args.role,"project":project,"projects":projects,"invitation":out,"expires_at":document["connection"]["expires_at"]}),
     )
 }
 fn connect(client: &Path) -> Result<ConnectArgs> {
@@ -216,6 +225,11 @@ pub(super) fn accept(config: &RuntimeConfig, args: Accept) -> Result<Value> {
     }
     let state = dir(&args.local);
     crate::private_fs::ensure_private_home(&state)?;
+    let machine_key = team::keys::MachineKey::ensure(&state)?;
+    let authority = document["authority"]
+        .as_str()
+        .ok_or("coordinator public key missing")?;
+    team::keys::validate_public(authority)?;
     let client_dir = state.join("client");
     if client_dir.symlink_metadata().is_ok()
         || state.join("membership.json").symlink_metadata().is_ok()
@@ -310,7 +324,7 @@ pub(super) fn accept(config: &RuntimeConfig, args: Accept) -> Result<Value> {
                 );
             }
         }
-        let mut request = json!({"space":space,"expected_role":role,"expected_name":name});
+        let mut request = json!({"space":space,"expected_role":role,"expected_name":name,"public_key":machine_key.public_key()});
         if let Some(source) = source {
             request["source"] = source;
         }
@@ -333,6 +347,7 @@ pub(super) fn accept(config: &RuntimeConfig, args: Accept) -> Result<Value> {
             &state.join("membership.json"),
             &serde_json::to_vec(&json!({"name":name,"role":role,"project":project,"space":space}))?,
         )?;
+        new_secret(&state.join("team-authority.pub"), authority.as_bytes())?;
         if role == "worker" {
             new_secret(
                 &state.join("source-route.json"),
@@ -387,7 +402,7 @@ pub(super) fn sync(state: &Path) -> Result<Value> {
             .as_str()
             .filter(|s| team::id(s))
             .ok_or("invalid team machine")?;
-        store.team_save_peer(name,&json!({"schema":"brain-team-peer/1","machine":name,"origin":p["origin"],"project":p["project"],"space":p["space"],"connect":connection,"via_coordinator":true}))?;
+        store.team_save_peer(name,&json!({"schema":"brain-team-peer/1","machine":name,"origin":p["origin"],"project":p["project"],"space":p["space"],"connect":connection,"via_coordinator":true,"public_key":p["public_key"]}))?;
     }
     Ok(directory["team"].clone())
 }
@@ -446,4 +461,37 @@ pub(super) fn register_source(state: &Path) -> ShareResult<()> {
         call(&connect(&state.join("client"))?,"team_register",json!({"space":member["space"],"source":source}))?;
         Ok(())
     })().map_err(|_|team::bad())
+}
+
+/// Pending key survives an uncertain TLS response, so the exact journaled transition can retry.
+pub(super) fn rekey(local: Local) -> Result<Value> {
+    let state = dir(&local);
+    let member = private_json(&state.join("membership.json"))?;
+    let old = team::keys::MachineKey::load(&state)?;
+    let pending = state.join("team-ed25519.pending");
+    if pending.symlink_metadata().is_err() {
+        team::keys::MachineKey::generate()?.write_new(&pending)?;
+    }
+    let new = team::keys::MachineKey::load_pending(&state)?;
+    let bytes = serde_json::to_vec(&json!([
+        "brain-team-rekey/1",
+        member["name"],
+        old.public_key(),
+        new.public_key()
+    ]))?;
+    call(
+        &connect(&state.join("client"))?,
+        "team_rekey",
+        json!({"space":member["space"],"old_key":old.public_key(),"public_key":new.public_key(),"proof":old.sign(&bytes)}),
+    )?;
+    team::keys::MachineKey::promote_pending(&state)?;
+    if state.join(SHARE_STORE_FILE).exists() {
+        let mut store = ShareStore::open(state.join(SHARE_STORE_FILE))?;
+        for m in store.team_manifests()? {
+            store.team_toggle(&m.space, None, m.enabled, super::super::unix_now())?;
+        }
+    }
+    Ok(
+        json!({"status":"ok","rotation":"journaled","next":"team publish; previous slices are rejected"}),
+    )
 }

@@ -89,7 +89,8 @@ else:
     if args[:2]==['team','configure']:
         state['machine']=option('--machine')
     if args[:2]==['team','manifest']:
-        out={'manifests':[{'manifest':{'origin':'origin-'+state['machine']}}]}
+        out={'manifests':[{'manifest':{'origin':'origin-'+state['machine']}}],
+             'signing_public_key':'a'*64}
     if args[:2]==['team','disable']: state['disabled']=True
     if args[:2]==['team','publish']:
         state['published']=True
@@ -155,6 +156,9 @@ class StandTeam(unittest.TestCase):
         self.assertIn('--allow-cgnat-dial', commands)
         self.assertIn('--allow-lan-dial', commands)
         self.assertIn('--ip 100.64.0.4', commands)
+        peers = [args[-1] for role, args in events if role == 'ssh' and 'team peer' in args[-1]]
+        self.assertEqual(len(peers), 2)
+        self.assertTrue(all('--public-key ' + 'a' * 64 in command for command in peers))
         for role, args in events:
             if role in ('ssh', 'scp'):
                 self.assertIn('-oBatchMode=yes', args)

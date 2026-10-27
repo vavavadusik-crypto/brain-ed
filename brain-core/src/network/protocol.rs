@@ -99,6 +99,12 @@ impl NetError {
                 json!({"error": "invalid_request", "message": message})
             }
             Self::Unauthorized => json!({"error": "unauthorized"}),
+            Self::Forbidden(message) if message.contains("snapshot signature failed") => {
+                json!({"error":"forbidden","message":"подпись не прошла / snapshot signature failed"})
+            }
+            Self::Forbidden(message) if message.starts_with("rights token") => {
+                json!({"error":"forbidden","message":"rights token expired, invalid or project not granted / токен просрочен или проект не разрешён"})
+            }
             Self::Forbidden(_) => json!({"error": "forbidden"}),
             Self::UnknownTool => json!({"error": "unknown_tool"}),
             Self::TooLarge(message) => json!({"error": "too_large", "message": message}),
@@ -155,6 +161,7 @@ pub fn allowed_tools() -> Vec<&'static str> {
         "share_query",
         "team_accept",
         "team_register",
+        "team_rekey",
         "team_directory",
         "team_pull",
     ]
@@ -173,6 +180,7 @@ pub fn is_write_tool(tool: &str) -> bool {
             | "share_pull"
             | "share_query"
             | "team_accept"
+            | "team_rekey"
             | "team_directory"
             | "team_pull"
     )
@@ -351,10 +359,27 @@ impl CoordRequest {
         let args = &self.arguments;
         deny_identity_fields(args)?;
         match self.tool.as_str() {
+            "team_rekey" => {
+                deny_unknown(args, &["space", "public_key", "old_key", "proof"])?;
+                strict_string(args.get("space"), "space", 64)?;
+                strict_string(args.get("public_key"), "public_key", 64)?;
+                strict_string(args.get("old_key"), "old_key", 64)?;
+                strict_string(args.get("proof"), "proof", 128)?;
+            }
             "team_accept" => {
-                deny_unknown(args, &["space", "source", "expected_role", "expected_name"])?;
+                deny_unknown(
+                    args,
+                    &[
+                        "space",
+                        "source",
+                        "expected_role",
+                        "expected_name",
+                        "public_key",
+                    ],
+                )?;
                 strict_string(args.get("expected_role"), "expected_role", 16)?;
                 strict_string(args.get("expected_name"), "expected_name", 64)?;
+                strict_string(args.get("public_key"), "public_key", 64)?;
                 strict_string(args.get("space"), "space", 64)?;
             }
             "team_register" => {
@@ -589,7 +614,7 @@ impl CoordRequest {
             // and enabled by the host (checked by the share store). Nothing
             // here can name an origin, agent, machine or grant.
             "share_pull" => {
-                deny_unknown(args, &["space", "after_seq", "limit"])?;
+                deny_unknown(args, &["space", "after_seq", "limit", "rights"])?;
                 strict_string(args.get("space"), "space", 64)?;
                 let after = strict_i64(
                     args.get("after_seq").unwrap_or(&Value::from(0)),
@@ -601,7 +626,7 @@ impl CoordRequest {
                 share_limit(args)?;
             }
             "share_query" => {
-                deny_unknown(args, &["space", "limit"])?;
+                deny_unknown(args, &["space", "limit", "rights"])?;
                 strict_string(args.get("space"), "space", 64)?;
                 share_limit(args)?;
             }
