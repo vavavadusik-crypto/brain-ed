@@ -9,6 +9,7 @@ mod memory;
 mod model;
 pub mod network;
 pub mod operations;
+pub mod platform;
 pub mod profile;
 pub mod salience;
 mod search;

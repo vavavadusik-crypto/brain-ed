@@ -19,9 +19,6 @@ const DESKTOP_COPY_OWNER: &str = "desktop-shortcut-owner";
 /// a few KiB; client configuration files (and so their backups) can be large.
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_CLIENT_FILE_BYTES: u64 = 64 * 1024 * 1024;
-/// `O_NOFOLLOW` where its value is known without a new dependency.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NOFOLLOW: i32 = 0o400000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentClient {
@@ -1051,10 +1048,10 @@ fn read_no_follow(path: &Path, limit: u64, private: bool) -> io::Result<Option<V
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_NOFOLLOW);
+        options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
     }
     let file = options.open(path)?;
     #[cfg(unix)]

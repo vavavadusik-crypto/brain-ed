@@ -34,7 +34,7 @@ const APPLICATION_ID: i64 = 0x4252_4E41; // "BRNA"
 /// Auth schema version this code writes. Newer files are refused.
 /// v2: principals gained the credential-bound `agent_id`.
 /// v3: explicit per-principal `memory_grants`; older principals get none.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 /// How long a new credential stays valid unless issued otherwise.
 pub const DEFAULT_CREDENTIAL_TTL_SECS: i64 = 90 * 86_400;
 /// Shortest credential lifetime.
@@ -78,9 +78,31 @@ CREATE TABLE memory_grants (
 ) STRICT;
 ";
 
-const TABLES: [&str; 4] = ["meta", "principals", "credentials", "memory_grants"];
+pub(super) const TEAM_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS team_members (
+ principal_id INTEGER PRIMARY KEY REFERENCES principals(id),
+ project TEXT NOT NULL, space TEXT NOT NULL, accepted_at INTEGER,
+ source TEXT, last_slice_at INTEGER
+) STRICT;
+CREATE TABLE IF NOT EXISTS team_route_policy (principal_id INTEGER PRIMARY KEY REFERENCES principals(id), value TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS team_invitations (
+ token_id TEXT PRIMARY KEY REFERENCES credentials(token_id),
+ principal_id INTEGER NOT NULL REFERENCES principals(id),
+ consumed_at INTEGER
+) STRICT;
+";
 
-fn now_unix() -> i64 {
+const TABLES: [&str; 7] = [
+    "meta",
+    "principals",
+    "credentials",
+    "memory_grants",
+    "team_members",
+    "team_invitations",
+    "team_route_policy",
+];
+
+pub(super) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -248,7 +270,8 @@ impl Authenticated {
 
 /// Store of principals and credentials over `auth.sqlite`.
 pub struct AuthStore {
-    connection: Connection,
+    pub(super) connection: Connection,
+    pub(super) path: PathBuf,
 }
 
 impl AuthStore {
@@ -274,7 +297,10 @@ impl AuthStore {
         }
         let connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
-        let store = Self { connection };
+        let store = Self {
+            connection,
+            path: path.clone(),
+        };
         store.initialise()?;
         for suffix in ["-wal", "-shm"] {
             let side = PathBuf::from(format!("{}{suffix}", path.display()));
@@ -299,6 +325,7 @@ impl AuthStore {
             if tables == 0 {
                 tx.execute_batch(SCHEMA)?;
                 tx.execute_batch(MEMORY_GRANTS)?;
+                tx.execute_batch(TEAM_SCHEMA)?;
                 tx.pragma_update(None, "application_id", APPLICATION_ID)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
@@ -334,6 +361,7 @@ impl AuthStore {
                 [],
             )?;
             tx.execute_batch(MEMORY_GRANTS)?;
+            tx.execute_batch(TEAM_SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             return Ok(());
@@ -342,10 +370,17 @@ impl AuthStore {
         // table, so every old token stays a work token and reads no memory.
         if version == 2 {
             tx.execute_batch(MEMORY_GRANTS)?;
+            tx.execute_batch(TEAM_SCHEMA)?;
             tx.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('migrated_from_v2', 1)",
                 [],
             )?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if version == 3 {
+            tx.execute_batch(TEAM_SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             return Ok(());
@@ -406,6 +441,7 @@ impl AuthStore {
                 "label must be at most 200 printable characters",
             ));
         }
+        let role = if role == "manager" { "reader" } else { role };
         if !["worker", "reader"].contains(&role) {
             return Err(NetError::invalid("role must be worker or reader"));
         }

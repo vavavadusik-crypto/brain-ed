@@ -228,20 +228,31 @@ fn open_stdin_nonblocking() -> Option<Box<dyn Read>> {
     StreamSocket::from_stdin().map(|socket| Box::new(socket) as Box<dyn Read>)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn open_stdin_nonblocking() -> Option<Box<dyn Read>> {
-    // Unverified platforms: no deadline-bounded read is available, so no
-    // input is read at all.
+    use std::os::fd::AsFd;
+    // fdescfs shares flags with the parent. Do not toggle O_NONBLOCK.
+    let file = File::from(io::stdin().as_fd().try_clone_to_owned().ok()?);
+    if file.metadata().ok()?.is_file() {
+        return Some(Box::new(file));
+    }
+    StreamSocket::from_stdin().map(|socket| Box::new(socket) as Box<dyn Read>)
+    // Blocking pipes/ttys are deliberately skipped: poll followed by read can
+    // block if another reader wins the race. No background reader may outlive a hook.
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_stdin_nonblocking() -> Option<Box<dyn Read>> {
     None
 }
 
 /// A duplicate (`F_DUPFD_CLOEXEC`) of a stdin that is a `SOCK_STREAM` socket.
 /// It shares the open file description, which is only ever read through
 /// `recv(.., MSG_DONTWAIT)`: the flag is per call, never stored.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StreamSocket(std::os::fd::OwnedFd);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl StreamSocket {
     fn from_stdin() -> Option<Self> {
         use std::os::fd::AsFd;
@@ -277,7 +288,7 @@ impl StreamSocket {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Read for StreamSocket {
     #[allow(unsafe_code)]
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -366,6 +377,13 @@ pub(crate) fn journal_refusal(brain_home: &Path) -> Option<String> {
 }
 
 #[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn group_is_private(_gid: u32, _uid: u32) -> bool {
+    // Directory Services membership is not enumerable from /etc/group.
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn group_is_private(gid: u32, uid: u32) -> bool {
     let (Ok(group), Ok(passwd)) = (
         fs::read_to_string("/etc/group"),
@@ -379,6 +397,7 @@ fn group_is_private(gid: u32, uid: u32) -> bool {
 /// A group is private to `uid` when its only possible member is that user: the
 /// member list names nobody else and no other account has it as primary group.
 /// Unknown or unreadable data counts as shared.
+#[cfg(any(target_os = "linux", test))]
 fn group_is_private_in(gid: u32, uid: u32, group: &str, passwd: &str) -> bool {
     let accounts: Vec<(&str, u32, u32)> = passwd
         .lines()
@@ -738,6 +757,15 @@ fn derive_prompt_intent(prompt: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_flat_group_database_never_grants_write_trust() {
+        assert!(!super::group_is_private(
+            20,
+            brain_core::platform::current_uid().unwrap()
+        ));
+    }
+
     #[test]
     fn a_user_private_group_is_private_and_any_other_member_makes_it_shared() {
         let passwd = "root:x:0:0::/root:/bin/sh\nme:x:1000:1000::/home/me:/bin/bash\n\

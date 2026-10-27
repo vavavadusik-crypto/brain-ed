@@ -50,3 +50,11 @@ not execute downloaded content. `BRAIN_RELEASE_BASE_URL` can select an HTTPS
 mirror. The checksum and payload have the same trust origin: this checks
 integrity, not an independent publisher signature. For source/desktop installs,
 use the retained `packaging/install-source.sh`.
+
+## macOS preview artifacts
+
+`packaging/build-macos.sh` builds native ARM64 or Intel Mach-O assets and
+SHA256SUMS on the matching runner, without Developer ID signing/notarization.
+The release workflow only uploads build artifacts; it does not publish a release.
+Combine all platform checksum manifests when publishing. See
+[macOS installation and limitations](macos.md); native CI evidence is pending.

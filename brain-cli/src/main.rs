@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod scheduler;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -570,7 +573,7 @@ enum ArchiveCommand {
     /// Pause the collector; runs exit without reading any source.
     Disable,
 
-    /// Install or remove the systemd user timer that runs `collect` every 2 minutes.
+    /// Install or remove the user timer (systemd/launchd) that runs `collect` every 2 minutes.
     Timer {
         #[arg(value_parser = ["install", "remove"])]
         action: String,
@@ -798,7 +801,7 @@ enum DistillCommand {
         #[arg(long, requires = "scheduled")]
         quiet_hours: Option<String>,
     },
-    /// Manage the opt-in systemd user timer.
+    /// Manage the opt-in user timer (systemd/launchd).
     Schedule {
         #[command(subcommand)]
         command: distill_schedule::ScheduleCommand,
@@ -846,7 +849,7 @@ enum BackupCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Install or remove the daily backup timer (systemd user).
+    /// Install or remove the daily backup timer (systemd/launchd user).
     Timer {
         #[arg(value_parser = ["install", "remove"])]
         action: String,
@@ -1001,31 +1004,50 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             BackupCommand::Timer { action } => {
                 let install = action == "install";
                 let binary = stable_brain_binary()?;
-                let systemctl = |args: &[&str]| {
-                    std::process::Command::new("systemctl")
-                        .arg("--user")
-                        .args(args)
-                        .stdin(std::process::Stdio::null())
-                        .status()
-                        .is_ok_and(|status| status.success())
+                #[cfg(target_os = "macos")]
+                let mac_result = {
+                    let args = vec![
+                        binary.to_str().ok_or("binary is not UTF-8")?.into(),
+                        "backup".into(),
+                        "create".into(),
+                    ];
+                    crate::scheduler::manage(
+                        &user_home(),
+                        crate::scheduler::BACKUP,
+                        install.then_some((args.as_slice(), 86400)),
+                    )?
                 };
-                let (files, switched, reloaded) = if install {
-                    let files = backup::write_timer_units(&user_home(), &binary, true)?;
-                    let reloaded = systemctl(&["daemon-reload"]);
-                    (
-                        files,
-                        systemctl(&["enable", "--now", backup::TIMER_UNIT]),
-                        reloaded,
-                    )
-                } else {
-                    let switched = systemctl(&["disable", "--now", backup::TIMER_UNIT]);
-                    let files = backup::write_timer_units(&user_home(), &binary, false)?;
-                    (files, switched, systemctl(&["daemon-reload"]))
+                #[cfg(target_os = "linux")]
+                let (files, switched, reloaded) = {
+                    let systemctl = |args: &[&str]| {
+                        std::process::Command::new("systemctl")
+                            .arg("--user")
+                            .args(args)
+                            .stdin(std::process::Stdio::null())
+                            .status()
+                            .is_ok_and(|status| status.success())
+                    };
+                    if install {
+                        let files = backup::write_timer_units(&user_home(), &binary, true)?;
+                        let reloaded = systemctl(&["daemon-reload"]);
+                        (
+                            files,
+                            systemctl(&["enable", "--now", backup::TIMER_UNIT]),
+                            reloaded,
+                        )
+                    } else {
+                        let switched = systemctl(&["disable", "--now", backup::TIMER_UNIT]);
+                        let files = backup::write_timer_units(&user_home(), &binary, false)?;
+                        (files, switched, systemctl(&["daemon-reload"]))
+                    }
                 };
                 let stored = settings::load(&brain_home());
                 let mut stored = stored;
                 stored.backup_timer_enabled = install;
                 settings::save(&brain_home(), &stored)?;
+                #[cfg(target_os = "macos")]
+                print_json(&mac_result)?;
+                #[cfg(target_os = "linux")]
                 print_json(&json!({
                     "status": "ok",
                     "action": action,
@@ -1381,35 +1403,52 @@ fn command_archive(command: ArchiveCommand) -> Result<(), Box<dyn Error>> {
         ArchiveCommand::Timer { action } => {
             let install = action == "install";
             let binary = stable_brain_binary()?;
-            let systemctl = |args: &[&str]| {
-                std::process::Command::new("systemctl")
-                    .arg("--user")
-                    .args(args)
-                    .stdin(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success())
-            };
-            let (files, switched, reloaded) = if install {
-                let files = archive::write_timer_units(&user_home(), &binary, true)?;
-                let reloaded = systemctl(&["daemon-reload"]);
-                (
-                    files,
-                    systemctl(&["enable", "--now", archive::TIMER_UNIT]),
-                    reloaded,
-                )
-            } else {
-                // Stop and disable while the unit still exists, then remove its files.
-                let switched = systemctl(&["disable", "--now", archive::TIMER_UNIT]);
-                let files = archive::write_timer_units(&user_home(), &binary, false)?;
-                (files, switched, systemctl(&["daemon-reload"]))
-            };
-            print_json(&json!({
-                "status": if reloaded && switched { "ok" } else { "files_written_systemctl_failed" },
-                "action": action,
-                "unit_files": files,
-                "systemctl_daemon_reload": reloaded,
-                "systemctl_enable_or_disable": switched,
-            }))
+            #[cfg(target_os = "macos")]
+            {
+                let args = vec![
+                    binary.to_str().ok_or("binary is not UTF-8")?.into(),
+                    "archive".into(),
+                    "collect".into(),
+                    "--quiet".into(),
+                ];
+                print_json(&crate::scheduler::manage(
+                    &user_home(),
+                    crate::scheduler::ARCHIVE,
+                    install.then_some((args.as_slice(), 120)),
+                )?)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let systemctl = |args: &[&str]| {
+                    std::process::Command::new("systemctl")
+                        .arg("--user")
+                        .args(args)
+                        .stdin(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                };
+                let (files, switched, reloaded) = if install {
+                    let files = archive::write_timer_units(&user_home(), &binary, true)?;
+                    let reloaded = systemctl(&["daemon-reload"]);
+                    (
+                        files,
+                        systemctl(&["enable", "--now", archive::TIMER_UNIT]),
+                        reloaded,
+                    )
+                } else {
+                    // Stop and disable while the unit still exists, then remove its files.
+                    let switched = systemctl(&["disable", "--now", archive::TIMER_UNIT]);
+                    let files = archive::write_timer_units(&user_home(), &binary, false)?;
+                    (files, switched, systemctl(&["daemon-reload"]))
+                };
+                print_json(&json!({
+                    "status": if reloaded && switched { "ok" } else { "files_written_systemctl_failed" },
+                    "action": action,
+                    "unit_files": files,
+                    "systemctl_daemon_reload": reloaded,
+                    "systemctl_enable_or_disable": switched,
+                }))
+            }
         }
     }
 }

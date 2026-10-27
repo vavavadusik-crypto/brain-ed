@@ -1197,8 +1197,23 @@ fn subscription_timeout_kills_descendant_group() {
             .contains("timed out")
     );
     let pid = fs::read_to_string(f.0.join("child.pid")).unwrap();
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-    assert!(stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z"));
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        assert!(stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("/bin/ps")
+            .args(["-p", pid.trim(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "descendant still running"
+        );
+    }
 }
 #[test]
 fn subscription_response_size_is_bounded() {
@@ -1507,6 +1522,7 @@ impl Fixture {
     }
 }
 
+#[cfg(target_os = "linux")] // systemd contract; see macos_platform_process for launchd
 #[test]
 fn schedule_enable_disable_uses_private_units_and_fake_systemctl() {
     let f = Fixture::new();
@@ -1567,6 +1583,7 @@ fn schedule_enable_disable_uses_private_units_and_fake_systemctl() {
     assert!(!f.0.join(".brain/brain.sqlite").exists());
 }
 
+#[cfg(target_os = "linux")] // systemd contract; see macos_platform_process for launchd
 #[test]
 fn schedule_failure_and_invalid_configuration_are_reported() {
     let f = Fixture::new();
@@ -1724,6 +1741,7 @@ fn batches_respect_fifty_sessions_real_escaped_bytes_and_large_session_isolation
     }));
 }
 
+#[cfg(target_os = "linux")] // systemd contract; see macos_platform_process for launchd
 #[test]
 fn schedule_pins_relative_database_to_the_enabling_directory() {
     let f = Fixture::new();

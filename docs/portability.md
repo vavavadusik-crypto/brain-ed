@@ -1,9 +1,41 @@
 # Portability map: macOS and Windows
 
-Status: analysis only (G6). No code was changed for this document. Every claim
-carries a `file:line` citation against branch `g-portability`; lines were read,
-not inferred. Items that could not be verified from the code alone are listed
-in [§7 Open questions](#7-open-questions), not guessed.
+Status: M1 macOS implementation prepared for first native CI (2026-10-27).
+Linux is still the only verified platform. The original G6 inventory below is
+historical: its line citations describe `g-portability`, not the current tree.
+Use the M1 table for implemented behavior and [macOS guide](macos.md) for limits.
+Windows remains analysis only.
+
+## M1 implementation status
+
+| Surface | Implemented | Evidence / remaining boundary |
+|---|---|---|
+| Effective owner (L1-L3, map, coordination, TLS, archive) | Shared `brain_core::platform::current_uid`, libc `geteuid`; no HOME-derived authority | Common owner tests; native Darwin tests queued |
+| Secure opens (S1-S3) | Target libc flags, including former hardcoded x86-only sites; Darwin `F_GETPATH` for Markdown imports | Common symlink/regular-file tests and macOS constant/directory test |
+| Whole-home restore (K1/K2) | Linux leases unchanged; Darwin `renamex_np(RENAME_SWAP)` + nonblocking advisory flock | macOS directory swap/failure/conflicting-flock tests; common restore regression. Stop **all** Brain/SQLite clients: flock cannot exclude ordinary SQLite opens |
+| Four user timers (D1-D5) | Archive, backup, distill, team publication use LaunchAgents under `~/Library/LaunchAgents`; bootstrap/bootout/print | Private escaped plist, literal argv, HOME/BRAIN_HOME pinned; `plutil` + fake launchctl native tests. GUI login domain required; no system daemon |
+| Hooks (L7/L8) | Darwin regular-file stdin and SOCK_STREAM `MSG_DONTWAIT` | Blocking pipes/TTY skipped to preserve parent descriptor flags and bounded completion; native tests cover all three |
+| TLS inherited descriptors (L9) | Darwin `F_DUPFD_CLOEXEC`, regular files only, later owner/mode/size validation retained | Native tests for valid, invalid and socket descriptors; no shared O_NONBLOCK changes |
+| Group trust (/etc/group) | Linux flat-file logic retained; Darwin refuses group-write trust | Directory Services cannot be inferred from flat files; native refusal tests |
+| Executable copy / diagnostics (L4-L6, L12-L13) | Darwin secure-open current_exe + Mach-O validation; existing reexec fallback retained | Replacement generation cannot be pinned like Linux `/proc/self/exe`; restart before integration updates. Stale UI auto-stop unavailable; coordinator serving is unknown |
+| Distribution (B6/B7) | Darwin arm64/x86_64 installer, native release assets + SHA256SUMS, pinned CI actions | Unsigned/unnotarized (Rust/Apple linker may ad-hoc sign ARM64); first CI has not run. Linux musl pipeline retained |
+| Python/JS (T1-T3/W2-W4) | Shared suites run natively; Linux bundle, LD_PRELOAD fault injection and systemd contract tests explicitly skipped with reasons | Native Rust tests replace Darwin-specific contracts; browser smoke remains a Linux local check |
+| Data / desktop paths (P1-P5, G1-G4) | Data stays `~/.brain`, CLI client configuration conventions retained | `.app` packaging and Finder shortcuts not implemented; XDG desktop launcher command remains Linux-specific |
+
+Native CI uses **macos-15 (arm64)** and **macos-15-intel (x86_64)**.
+The requested macos-13 label was [retired on 2025-12-04](https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/);
+macos-14 [retires on 2026-11-02](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/).
+These replacements preserve architecture coverage. Native host triples are
+asserted in CI so a runner-label change cannot silently produce the wrong asset.
+
+Symbols checked in the **local locked libc 0.2.189 Apple sources**:
+`renamex_np`, `RENAME_SWAP`, `F_GETPATH`, `F_DUPFD_CLOEXEC`, `O_NOFOLLOW`,
+`O_DIRECTORY`, `O_CLOEXEC`, `O_NONBLOCK`, `MSG_DONTWAIT`, `geteuid`,
+`openat`, `mkdirat`, `localtime_r`. No handwritten Darwin flag values or
+external FFI declarations are needed. Contrary to original question q1,
+Darwin **does have O_DIRECTORY** in libc; native tests exercise it.
+No Apple target/SDK was downloaded locally. Only CI can verify the ABI,
+sqlite-vec/Apple clang, APFS exchange and native loader behavior.
 
 - Date: 2026-10-26
 - Scope: brain-core, brain-cli, tools/, packaging/, install.sh, tests/, vendor/sqlite-vec,
@@ -158,7 +190,7 @@ sharing.rs (`:2040`), network/client.rs (`:218`), network/tls.rs (`:348`).
 
 | ID | Place | What it does | macOS | Windows | Effort | Risk |
 |----|-------|--------------|-------|---------|--------|------|
-| S1 | all of the above (helper to be extracted) | Refuse to follow a final-component symlink; refuse to block on a FIFO; keep fd out of children; verify the inode did not change between check and use | `O_NOFOLLOW` exists on Darwin; `O_DIRECTORY` does not (plain `open` of a dir works — verify, §7 q1); `O_CLOEXEC` exists | `OpenOptionsExt::custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)` opens the reparse point itself (analog of O_NOFOLLOW for the final component); `FILE_FLAG_FIRST_PIPE_INSTANCE`/overlapped handles replace O_NONBLOCK semantics; no CLOEXEC concept (handle inheritance is explicit); dev/ino analog: `std::os::windows::fs::MetadataExt::{volume_serial_number, file_index}` on the opened handle | L (one helper + mechanical call-site conversion) | Medium — O_NOFOLLOW/O_NONBLOCK nuances differ per filesystem; a wrong flag silently disables symlink refusal. Add per-platform tests |
+| S1 | all of the above (helper to be extracted) | Refuse to follow a final-component symlink; refuse to block on a FIFO; keep fd out of children; verify the inode did not change between check and use | `O_NOFOLLOW` exists on Darwin; `O_DIRECTORY` also exists (confirmed from locked libc in M1; native test queued); `O_CLOEXEC` exists | `OpenOptionsExt::custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)` opens the reparse point itself (analog of O_NOFOLLOW for the final component); `FILE_FLAG_FIRST_PIPE_INSTANCE`/overlapped handles replace O_NONBLOCK semantics; no CLOEXEC concept (handle inheritance is explicit); dev/ino analog: `std::os::windows::fs::MetadataExt::{volume_serial_number, file_index}` on the opened handle | L (one helper + mechanical call-site conversion) | Medium — O_NOFOLLOW/O_NONBLOCK nuances differ per filesystem; a wrong flag silently disables symlink refusal. Add per-platform tests |
 | S2 | `brain-cli/src/client_registry.rs:34-36`, `brain-cli/src/installer.rs:24` | Hand-rolled flag constants `O_NOFOLLOW=0o400000`, `O_NONBLOCK=0o4000`, guarded `#[cfg(all(target_os="linux", any(x86, x86_64)))]` | **Trap**: on Darwin `O_NOFOLLOW` is 0o400 (0x100), not 0o400000. The guard makes the code compile but the protection vanish. Use `libc::O_NOFOLLOW` (libc is already a dependency) | Same constants are meaningless on Windows; use the FILE_FLAG_* form | S | High if missed (silent loss of symlink refusal) — trivial to avoid |
 | S3 | `brain-cli/src/bundle.rs:240-268` (`join`) | Reads the bundle with `O_NOFOLLOW`, maps `ELOOP` to a clear refusal | Same flag exists | REPARSE_POINT flag + `GetFileInformationByHandleEx` check | S (with S1 helper) | Low |
 
@@ -347,9 +379,10 @@ decision macOS de-risks first.
 
 ## 7. Open questions
 
-1. **Darwin flags (blocks S1/S2/S3):** confirm `O_NOFOLLOW` (0o400) and the
-   absence of `O_DIRECTORY` on current Darwin; `openat`/`mkdirat` availability
-   is assumed. Verify by a compile test, not documentation.
+1. **Darwin flags (M1 source check done, native CI pending):** locked libc
+   contains `O_NOFOLLOW` (0o400), `O_DIRECTORY`, `openat` and `mkdirat` for
+   Darwin. The original assumption that O_DIRECTORY was absent was wrong.
+   Native directory-open and symlink-refusal tests are queued in macOS CI.
 2. **`RENAME_SWAP` semantics (blocks K2):** does `renamex_np(RENAME_SWAP)` on
    APFS guarantee the same single-syscall atomic exchange as
    `renameat2(RENAME_EXCHANGE)` on ext4/xfs, including for directories? If

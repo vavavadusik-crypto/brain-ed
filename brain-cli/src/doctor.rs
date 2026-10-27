@@ -156,13 +156,25 @@ pub(crate) fn document_with(
     /// symlink, and the last run where an existing status file carries it. No
     /// systemctl is invoked: the doctor answers only what this process can see.
     fn timers_document(home: &Path, brain_home: &Path) -> Value {
+        #[cfg(target_os = "linux")]
         let units = home.join(".config/systemd/user");
+        #[cfg(target_os = "linux")]
         let wants = units.join("timers.target.wants");
+        #[cfg(target_os = "linux")]
         let unit_pair = |timer: &str, service: &str| {
             json!({
                 "unit_files_installed": units.join(timer).is_file() && units.join(service).is_file(),
                 "enabled_at_boot": fs::symlink_metadata(wants.join(timer)).is_ok(),
             })
+        };
+        #[cfg(target_os = "macos")]
+        let unit_pair = |timer: &str, _service: &str| {
+            let label = match timer {
+                "brain-archive-collect.timer" => "org.brain-ed.archive",
+                "brain-backup.timer" => "org.brain-ed.backup",
+                _ => "org.brain-ed.distill",
+            };
+            json!({"unit_files_installed":home.join("Library/LaunchAgents").join(format!("{label}.plist")).is_file(),"enabled_at_boot":null,"scheduler":"launchd"})
         };
         let distill_last = fs::read(brain_home.join("distill-schedule-status.json"))
             .ok()
@@ -180,11 +192,11 @@ pub(crate) fn document_with(
                     .max()
             });
         json!({
-            "archive": unit_pair(crate::archive::TIMER_UNIT, crate::archive::SERVICE_UNIT),
+            "archive": unit_pair("brain-archive-collect.timer", "brain-archive-collect.service"),
             "archive_last_run": "see `brain archive status` (observed.last_run; kept in the archive database)",
-            "backup": unit_pair(crate::backup::TIMER_UNIT, crate::backup::SERVICE_UNIT),
+            "backup": unit_pair("brain-backup.timer", "brain-backup.service"),
             "backup_latest_snapshot": latest_snapshot,
-            "distill": unit_pair(crate::distill_schedule::TIMER, crate::distill_schedule::SERVICE),
+            "distill": unit_pair("brain-distill.timer", "brain-distill.service"),
             "distill_last_run": distill_last,
         })
     }
@@ -453,6 +465,7 @@ mod tests {
 
     /// G10: the doctor reports timer file facts, the distill status file,
     /// LLM providers without invoking anything, and disk space.
+    #[cfg(target_os = "linux")] // systemd file facts; macOS has native plist facts
     #[test]
     fn doctor_reports_timers_providers_and_disk() {
         let home = crate::test_support::temp_path("brain-doctor-g10");

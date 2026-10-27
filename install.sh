@@ -5,7 +5,7 @@ fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'HELP'
 Usage: ./install.sh [--version VERSION] [--dry-run] [--uninstall]
-Linux x86_64 / aarch64 (including Android/Termux). No sudo or Rust required.
+Linux (including Android/Termux) and macOS x86_64 / arm64. No sudo or Rust required.
 Installs only ~/.local/bin/brain. No models, launchers, agent edits or services.
 --version VERSION  release version (default: 0.2.0; optional leading v)
 --dry-run          print plan; no network, temporary files, writes or payload execution
@@ -29,7 +29,11 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail 'invalid release version'
 [[ ${HOME:-} = /* ]] || fail 'HOME must be absolute'
-[[ $(uname -s) == Linux ]] || fail 'supported OS: Linux (including Android/Termux)'
+case "$(uname -s)" in
+    Linux) platform=unknown-linux-musl ;;
+    Darwin) platform=apple-darwin ;;
+    *) fail 'supported OS: Linux (including Android/Termux), macOS' ;;
+esac
 case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
@@ -41,7 +45,7 @@ if [[ $uninstall == 1 ]]; then
     [[ $dry_run == 1 ]] || rm -f -- "$binary"
     exit 0
 fi
-asset="brain-$version-$arch-unknown-linux-musl"
+asset="brain-$version-$arch-$platform"
 base="${BRAIN_RELEASE_BASE_URL:-https://github.com/vavavadusik-crypto/brain-ed/releases/download/v$version}"
 [[ "$base" == https://* && "$base" != *$'\n'* && "$base" != *$'\r'* ]] || fail 'release URL must use HTTPS'
 printf 'Download %s/%s and SHA256SUMS\nVerify SHA-256, then install %s\n' "${base%/}" "$asset" "$binary"
@@ -69,7 +73,7 @@ expected="$(awk -v name="$asset" '$2 == name {print $1}' "$work/SHA256SUMS")"
 [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || fail 'missing, duplicate or malformed checksum'
 actual="$(checksum "$work/$asset")"
 actual="${actual%% *}"
-[[ "${actual,,}" == "${expected,,}" ]] || fail 'SHA-256 mismatch; installed binary unchanged'
+[[ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]] || fail 'SHA-256 mismatch; installed binary unchanged'
 mkdir -p -- "$(dirname "$binary")"
 staged="$(mktemp "$HOME/.local/bin/.brain-install.XXXXXX")"
 cp -- "$work/$asset" "$staged"

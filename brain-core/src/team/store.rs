@@ -606,7 +606,8 @@ impl ShareStore {
                 .chain(&audit.project_id)
                 .chain(&audit.space)
                 .any(|s| !id(s))
-            || !["share_pull", "share_query", "team_ask"].contains(&audit.operation.as_str())
+            || !["share_pull", "share_query", "team_ask", "team_pull"]
+                .contains(&audit.operation.as_str())
             || !["ok", "denied", "error", "cancelled"].contains(&audit.outcome.as_str())
             || !["ok", "unavailable", "refused", "invalid", "pending"]
                 .contains(&audit.reason.as_str())

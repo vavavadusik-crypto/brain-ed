@@ -44,6 +44,13 @@ pub enum NetError {
     NotFound(String),
 }
 
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "network request failed (HTTP {})", self.status())
+    }
+}
+impl std::error::Error for NetError {}
+
 impl NetError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::InvalidRequest(message.into())
@@ -146,6 +153,10 @@ pub fn allowed_tools() -> Vec<&'static str> {
         "work_whoami",
         "share_pull",
         "share_query",
+        "team_accept",
+        "team_register",
+        "team_directory",
+        "team_pull",
     ]
 }
 
@@ -161,6 +172,9 @@ pub fn is_write_tool(tool: &str) -> bool {
             | "work_whoami"
             | "share_pull"
             | "share_query"
+            | "team_accept"
+            | "team_directory"
+            | "team_pull"
     )
 }
 
@@ -170,7 +184,7 @@ pub fn is_write_tool(tool: &str) -> bool {
 pub fn tools_for_role(role: &str) -> Vec<&'static str> {
     match role {
         "worker" => allowed_tools(),
-        "reader" => allowed_tools()
+        "reader" | "manager" => allowed_tools()
             .into_iter()
             .filter(|tool| !is_write_tool(tool))
             .collect(),
@@ -337,6 +351,32 @@ impl CoordRequest {
         let args = &self.arguments;
         deny_identity_fields(args)?;
         match self.tool.as_str() {
+            "team_accept" => {
+                deny_unknown(args, &["space", "source", "expected_role", "expected_name"])?;
+                strict_string(args.get("expected_role"), "expected_role", 16)?;
+                strict_string(args.get("expected_name"), "expected_name", 64)?;
+                strict_string(args.get("space"), "space", 64)?;
+            }
+            "team_register" => {
+                deny_unknown(args, &["space", "source"])?;
+                strict_string(args.get("space"), "space", 64)?;
+            }
+            "team_directory" => {
+                deny_unknown(args, &[])?;
+            }
+            "team_pull" => {
+                deny_unknown(args, &["space", "source_name", "after_seq", "limit"])?;
+                strict_string(args.get("space"), "space", 64)?;
+                strict_string(args.get("source_name"), "source_name", 64)?;
+                if strict_i64(
+                    args.get("after_seq").unwrap_or(&Value::from(0)),
+                    "after_seq",
+                )? < 0
+                {
+                    return Err(NetError::invalid("negative cursor"));
+                }
+                share_limit(args)?;
+            }
             "work_board" => {
                 deny_unknown(
                     args,

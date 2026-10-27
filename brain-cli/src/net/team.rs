@@ -10,12 +10,21 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 mod intent;
 pub(crate) mod mcp;
+mod onboarding;
 mod project;
 mod query;
 mod schedule;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum TeamCommand {
+    /// Local coordinator admin: issue one single-use role/project invitation (0600).
+    Invite(onboarding::Invite),
+    /// Register from an invitation; publication stays OFF without explicit consent.
+    Accept(onboarding::Accept),
+    /// Safe team roster: names, roles and observed freshness, no endpoints or secrets.
+    Who(Local),
+    /// Local coordinator admin: revoke a member and access to team slices.
+    Remove(onboarding::Remove),
     /// Coordinator admin: pin a source machine, origin, project, space and TLS endpoint.
     Peer(query::PeerArgs),
     /// Search only complete verified replicas of explicitly selected machines.
@@ -131,6 +140,9 @@ pub(crate) fn toggle_at(
     class: Option<&str>,
     enabled: bool,
 ) -> ShareResult<Value> {
+    if enabled && onboarding::role(state).as_deref() == Some("manager") {
+        return Err(team::bad());
+    }
     let mut store = ShareStore::open(state.join(SHARE_STORE_FILE))?;
     let m = store.team_toggle(space, class, enabled, super::unix_now())?;
     Ok(json!({"status":"ok","manifest":m,"ready":false,"next":"publish"}))
@@ -148,12 +160,19 @@ pub(crate) fn toggle_field_at(
 }
 fn execute(config: &RuntimeConfig, cmd: TeamCommand) -> ShareResult<Value> {
     match cmd {
+        TeamCommand::Invite(_)
+        | TeamCommand::Accept(_)
+        | TeamCommand::Who(_)
+        | TeamCommand::Remove(_) => Err(team::bad()),
         TeamCommand::Peer(args) => query::configure(args),
         TeamCommand::Ask(args) => query::ask(config, args),
         TeamCommand::Manifest(local) => manifest_document(&dir(&local)),
         TeamCommand::Peers(local) => query::peers_document(&dir(&local)),
         TeamCommand::Configure(args) => {
             let state = dir(&args.local);
+            if onboarding::role(&state).as_deref() == Some("manager") {
+                return Err(team::bad());
+            }
             let space = args
                 .local
                 .team_space
@@ -205,12 +224,16 @@ fn execute(config: &RuntimeConfig, cmd: TeamCommand) -> ShareResult<Value> {
         TeamCommand::Schedule { .. } => Err(team::bad()),
         TeamCommand::Publish(args) => {
             let local = args.local;
+            if onboarding::role(&dir(&local)).as_deref() == Some("manager") {
+                return Err(team::bad());
+            }
             let mut store = ShareStore::open(dir(&local).join(SHARE_STORE_FILE))?;
             let space = selected(&store, &local)?;
             let m = store.team_manifest(&space)?.ok_or_else(team::bad)?;
             if !m.enabled {
                 return Err(team::bad());
             }
+            onboarding::register_source(&dir(&local))?;
             let start = super::unix_now();
             let (facts, watermarks, rejected) = project::collect(config, &m, start)?;
             store.team_publish(
@@ -228,6 +251,13 @@ fn unreachable_toggle(_: Toggle) -> ShareResult<Value> {
     Err(team::bad())
 }
 pub(crate) fn run(config: &RuntimeConfig, command: TeamCommand) -> Result<(), Box<dyn Error>> {
+    let command = match command {
+        TeamCommand::Invite(args) => return crate::print_json(&onboarding::invite(args)?),
+        TeamCommand::Accept(args) => return crate::print_json(&onboarding::accept(config, args)?),
+        TeamCommand::Who(args) => return crate::print_json(&onboarding::who(args)?),
+        TeamCommand::Remove(args) => return crate::print_json(&onboarding::remove(args)?),
+        other => other,
+    };
     if let TeamCommand::Schedule { command } = command {
         return crate::print_json(&schedule::command(config, command)?);
     }

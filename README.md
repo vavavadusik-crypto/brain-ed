@@ -87,7 +87,7 @@ listed by the preview before anything is written.
   `net join` connects machines over TLS (LAN, VPN or a company relay) with `0600` credentials;
   `brain team …` publishes opt-in typed facts per space and answers queries
   across machines. Ten-minute walkthrough with verified output:
-  [docs/team-mode.md](docs/team-mode.md); one-command synthetic demo:
+  [docs/team-mode.md](docs/team-mode.md); [roles and one-minute registration](docs/team-roles.md); one-command synthetic demo:
   `tools/team-demo.sh` (see [docs/team-mode-facts.md](docs/team-mode-facts.md)).
 - **Settings window.** `brain ui` serves a loopback-only settings page (search
   profile, memory knobs, agent connect/disconnect with a diff and explicit

@@ -69,8 +69,19 @@ const MAX_HELPER_OUTPUT: u64 = 1 << 20;
 const SINCE_DAYS_RANGE: (u64, u64) = (1, 3_650);
 /// Clients the collector has an adapter for; the only names `clients` may hold.
 const COLLECTOR_CLIENTS: [&str; 3] = ["claude", "codex", "hermes"];
+#[cfg(target_os = "linux")]
 const PYTHONS: [&str; 2] = ["/usr/bin/python3", "/usr/local/bin/python3"];
+#[cfg(target_os = "macos")]
+const PYTHONS: [&str; 3] = [
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+];
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const TIMER_UNIT: &str = "brain-archive-collect.timer";
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const SERVICE_UNIT: &str = "brain-archive-collect.service";
 
 /// Where the archive and its collector live under one Brain home.
@@ -153,9 +164,7 @@ pub(crate) struct Archive {
 }
 
 fn current_uid() -> Result<u32, ArchiveError> {
-    // /proc/self belongs to the effective user of this process.
-    fs::metadata("/proc/self")
-        .map(|metadata| metadata.uid())
+    brain_core::platform::current_uid()
         .map_err(|_| ArchiveError::Unsafe("cannot determine the current user; refusing".into()))
 }
 
@@ -724,11 +733,17 @@ fn config_document(paths: &Paths) -> Value {
 }
 
 fn timer_document(home: &Path) -> Value {
-    let units = home.join(".config/systemd/user");
-    let installed = units.join(TIMER_UNIT).is_file() && units.join(SERVICE_UNIT).is_file();
-    let enabled = fs::symlink_metadata(units.join("timers.target.wants").join(TIMER_UNIT)).is_ok();
-    json!({"unit_files_installed": installed, "enabled_at_boot": enabled,
+    #[cfg(target_os = "macos")]
+    return json!({"unit_files_installed":home.join("Library/LaunchAgents/org.brain-ed.archive.plist").is_file(),"enabled_at_boot":null,"scheduler":"launchd","note":"plist existence does not prove the agent is loaded"});
+    #[cfg(target_os = "linux")]
+    {
+        let units = home.join(".config/systemd/user");
+        let installed = units.join(TIMER_UNIT).is_file() && units.join(SERVICE_UNIT).is_file();
+        let enabled =
+            fs::symlink_metadata(units.join("timers.target.wants").join(TIMER_UNIT)).is_ok();
+        json!({"unit_files_installed": installed, "enabled_at_boot": enabled,
            "note": "installed/enabled are file facts; whether it actually ran shows in observed.last_run"})
+    }
 }
 
 // ------------------------------------------------------------------ search
@@ -1913,7 +1928,7 @@ pub(crate) fn collect(brain_home: &Path, home: &Path) -> Result<Value, Box<dyn E
         .iter()
         .map(Path::new)
         .find(|path| path.is_file())
-        .ok_or("python3 not found at /usr/bin/python3 or /usr/local/bin/python3; the collector needs it")?;
+        .ok_or("python3 not found in the platform standard locations; the archive collector needs an existing Python 3 interpreter")?;
     let mut child = Command::new(python)
         .arg("-I")
         .arg("-B")
@@ -1990,6 +2005,8 @@ pub(crate) fn collect(brain_home: &Path, home: &Path) -> Result<Value, Box<dyn E
 /// The binary path goes into `ExecStart=` verbatim, so anything systemd would
 /// interpret there — quotes, escapes, `%` specifiers, `$` variables, control
 /// characters — is refused rather than escaped.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Error>> {
     let text = binary.to_str().ok_or("binary path is not UTF-8")?;
     if !text.starts_with('/') {
@@ -2011,6 +2028,8 @@ pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Err
 }
 
 /// Quote one literal ExecStart argument, refusing systemd expansion and escapes.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn systemd_argument(text: &str) -> Result<String, Box<dyn Error>> {
     if text.is_empty()
         || text
@@ -2026,6 +2045,8 @@ pub(crate) fn systemd_argument(text: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// Writes (or removes) the unit files; enabling is left to systemctl.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn write_timer_units(
     home: &Path,
     binary: &Path,
@@ -2040,6 +2061,8 @@ pub(crate) fn write_timer_units(
 }
 
 /// Shared private, atomic unit writer for archive and distillation timers.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn write_named_timer_units(
     home: &Path,
     service_name: &str,

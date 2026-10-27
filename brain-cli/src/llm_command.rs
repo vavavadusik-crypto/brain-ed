@@ -168,6 +168,13 @@ fn without_nulls(value: Value) -> Value {
 /// supplementary members, and no account in `/etc/passwd` other than `uid`
 /// has it as its primary group. Groups known only to NSS (LDAP, sssd) or
 /// unreadable files count as shared, so group write is refused.
+#[cfg(target_os = "macos")]
+fn group_is_private(_gid: u32, _uid: u32) -> bool {
+    // Directory Services membership is not enumerable from /etc/group.
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn group_is_private(gid: u32, uid: u32) -> bool {
     let (Ok(groups), Ok(passwd)) = (
         fs::read_to_string("/etc/group"),
@@ -178,6 +185,7 @@ fn group_is_private(gid: u32, uid: u32) -> bool {
     group_is_private_in(&groups, &passwd, gid, uid)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn group_is_private_in(groups: &str, passwd: &str, gid: u32, uid: u32) -> bool {
     let listed_without_members = groups.lines().any(|line| {
         let fields: Vec<&str> = line.split(':').collect();
@@ -425,6 +433,15 @@ pub(crate) fn run(
 
 #[cfg(test)]
 mod private_group_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_flat_group_database_never_grants_write_trust() {
+        assert!(!super::group_is_private(
+            20,
+            brain_core::platform::current_uid().unwrap()
+        ));
+    }
+
     use super::group_is_private_in;
 
     const PASSWD: &str = "root:x:0:0::/root:/bin/sh\nme:x:1000:1000::/home/me:/bin/sh\n";

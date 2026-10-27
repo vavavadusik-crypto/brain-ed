@@ -30,10 +30,6 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// Generous on purpose: future registered homes add manifest entries.
 const MAX_MANIFEST_ENTRIES: usize = 4096;
 const LOCK_FILE: &str = "client-homes.lock";
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NONBLOCK: i32 = 0o4000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NOFOLLOW: i32 = 0o400000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -392,10 +388,10 @@ fn read_private(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_NOFOLLOW);
+        options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
     }
     let file = options.open(path)?;
     #[cfg(unix)]
@@ -609,10 +605,10 @@ fn same_inode(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
 fn open_existing_lock(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_NOFOLLOW | O_NONBLOCK);
+        options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
     }
     options.open(path)
 }
@@ -634,8 +630,8 @@ pub(crate) fn acquire_lock(brain_home: &Path) -> Result<RegistryLock, Failure> {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
-            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-            options.custom_flags(O_NOFOLLOW);
+            #[cfg(unix)]
+            options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
         }
         match options.open(&path) {
             Ok(file) => file,

@@ -2,17 +2,18 @@
 use crate::{RuntimeConfig, archive, distill, now_unix_seconds, settings};
 use clap::Subcommand;
 use serde_json::{Value, json};
-use std::{
-    error::Error,
-    process::{Command, Stdio},
-};
+use std::error::Error;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
 pub(crate) const SERVICE: &str = "brain-distill.service";
+#[cfg(target_os = "linux")]
 pub(crate) const TIMER: &str = "brain-distill.timer";
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ScheduleCommand {
-    /// Install or refresh the systemd timer that runs distillation.
+    /// Install or refresh the user timer (systemd/launchd) that runs distillation.
     Enable {
         /// LLM provider name the timer distills with.
         #[arg(long)]
@@ -33,6 +34,7 @@ pub(crate) enum ScheduleCommand {
     Status,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn systemctl(args: &[&str]) -> bool {
     Command::new("systemctl")
         .arg("--user")
@@ -141,12 +143,16 @@ pub(crate) fn command(
     command: ScheduleCommand,
 ) -> Result<Value, Box<dyn Error>> {
     let home = crate::user_home();
+    #[cfg(target_os = "linux")]
     let dir = home.join(".config/systemd/user");
-    let (files, switched, reloaded) = match command {
+    match command {
         ScheduleCommand::Status => {
             let last = std::fs::read(crate::brain_home().join("distill-schedule-status.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::status(&home, crate::scheduler::DISTILL, last);
+            #[cfg(target_os = "linux")]
             return Ok(
                 json!({"status":"ok", "unit_files_installed":dir.join(SERVICE).is_file() && dir.join(TIMER).is_file(),
                 "enabled":systemctl(&["is-enabled", TIMER]),"active":systemctl(&["is-active", TIMER]),"last_run":last}),
@@ -175,9 +181,10 @@ pub(crate) fn command(
                 return Err("no LLM provider configured with this name (configure one first: `brain llm add <name> …`; list the known ones with `brain llm list`)".into());
             }
             let binary = crate::stable_brain_binary()?;
+            #[cfg(target_os = "linux")]
             archive::timer_units(&binary)?;
             let database = std::path::absolute(&config.database)?;
-            let mut args = vec![
+            let mut args: Vec<String> = vec![
                 binary
                     .to_str()
                     .ok_or("binary path is not UTF-8")?
@@ -203,28 +210,65 @@ pub(crate) fn command(
             if let Some(q) = quiet_hours {
                 args.extend(["--quiet-hours".into(), q]);
             }
-            let exec = args
-                .iter()
-                .map(|a| archive::systemd_argument(a))
-                .collect::<Result<Vec<_>, _>>()?
-                .join(" ");
-            let service = format!(
-                "[Unit]\nDescription=Brain ED: bounded scheduled distillation\n\n[Service]\nType=oneshot\nExecStart={exec}\nNice=10\nIOSchedulingClass=idle\nTimeoutStartSec=infinity\n"
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::manage(
+                &home,
+                crate::scheduler::DISTILL,
+                Some((
+                    &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    crate::scheduler::seconds(&every)?,
+                )),
             );
-            let timer = format!(
-                "[Unit]\nDescription=Brain ED: scheduled distillation\n\n[Timer]\nOnBootSec={every}\nOnUnitInactiveSec={every}\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n"
-            );
-            let files =
-                archive::write_named_timer_units(&home, SERVICE, TIMER, Some((service, timer)))?;
-            let reloaded = systemctl(&["daemon-reload"]);
-            (files, systemctl(&["enable", "--now", TIMER]), reloaded)
+            #[cfg(target_os = "linux")]
+            {
+                let exec = args
+                    .iter()
+                    .map(|a| archive::systemd_argument(a))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(" ");
+                let service = format!(
+                    "[Unit]\nDescription=Brain ED: bounded scheduled distillation\n\n[Service]\nType=oneshot\nExecStart={exec}\nNice=10\nIOSchedulingClass=idle\nTimeoutStartSec=infinity\n"
+                );
+                let timer = format!(
+                    "[Unit]\nDescription=Brain ED: scheduled distillation\n\n[Timer]\nOnBootSec={every}\nOnUnitInactiveSec={every}\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n"
+                );
+                let files = archive::write_named_timer_units(
+                    &home,
+                    SERVICE,
+                    TIMER,
+                    Some((service, timer)),
+                )?;
+                let reloaded = systemctl(&["daemon-reload"]);
+                crate::distill_schedule::timer_result(
+                    files,
+                    systemctl(&["enable", "--now", TIMER]),
+                    reloaded,
+                )
+            }
         }
         ScheduleCommand::Disable => {
-            let switched = systemctl(&["disable", "--now", TIMER]);
-            let files = archive::write_named_timer_units(&home, SERVICE, TIMER, None)?;
-            (files, switched, systemctl(&["daemon-reload"]))
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::manage(&home, crate::scheduler::DISTILL, None);
+            #[cfg(target_os = "linux")]
+            {
+                let switched = systemctl(&["disable", "--now", TIMER]);
+                let files = archive::write_named_timer_units(&home, SERVICE, TIMER, None)?;
+                crate::distill_schedule::timer_result(
+                    files,
+                    switched,
+                    systemctl(&["daemon-reload"]),
+                )
+            }
         }
-    };
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn timer_result(
+    files: Vec<std::path::PathBuf>,
+    switched: bool,
+    reloaded: bool,
+) -> Result<Value, Box<dyn Error>> {
     Ok(
         json!({"status":if switched && reloaded {"ok"} else {"files_written_systemctl_failed"},
         "unit_files":files,"systemctl_daemon_reload":reloaded,"systemctl_enable_or_disable":switched}),

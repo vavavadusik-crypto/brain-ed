@@ -508,7 +508,7 @@ fn respond<W: Write>(stream: &mut W, status: u16, body: &Value) {
 fn route(inner: &Inner, request: &HttpRequest) -> CallOutcome {
     let parsed = serde_json::from_slice::<Value>(&request.body).unwrap_or(Value::Null);
     let operation = parsed["tool"].as_str().unwrap_or("");
-    if !["share_pull", "share_query"].contains(&operation) {
+    if !["share_pull", "share_query", "team_pull"].contains(&operation) {
         return route_unlogged(inner, request);
     }
     let received = unix_now();
@@ -739,6 +739,17 @@ fn route_unlogged(inner: &Inner, request: &HttpRequest) -> CallOutcome {
             };
         }
     };
+    if state
+        .auth
+        .team_is_invitation(&authenticated)
+        .unwrap_or(true)
+        && parsed.tool != "team_accept"
+    {
+        return CallOutcome {
+            status: 403,
+            body: NetError::forbidden("pending invitation").body(),
+        };
+    }
     if let Err(error) = authorize(&authenticated, &parsed) {
         return CallOutcome {
             status: error.status(),
@@ -766,8 +777,18 @@ fn authorize(authenticated: &Authenticated, request: &CoordRequest) -> Result<()
         if !principal.allows_space(space) {
             return Err(NetError::forbidden("space not granted"));
         }
-    } else if request.tool != "work_whoami" {
+    } else if !["work_whoami", "team_directory"].contains(&request.tool.as_str()) {
         return Err(NetError::invalid("space is required"));
+    }
+    if request.tool.starts_with("share_")
+        && request.space().is_some_and(|space| {
+            !authenticated
+                .memory_read_spaces()
+                .iter()
+                .any(|grant| grant == space)
+        })
+    {
+        return Err(NetError::forbidden("memory read grant required"));
     }
     if request.is_write() && !principal.may_write() {
         return Err(NetError::forbidden("readers may not write"));
@@ -796,6 +817,18 @@ fn dispatch(
             },
         });
         return CallOutcome { status: 200, body };
+    }
+    if request.tool.starts_with("team_") {
+        return match state.auth.team_call(authenticated, request, now) {
+            Ok(value) => CallOutcome {
+                status: 200,
+                body: json!({"protocol":PROTOCOL_VERSION,"server_time":now,"result":value}),
+            },
+            Err(error) => CallOutcome {
+                status: error.status(),
+                body: error.body(),
+            },
+        };
     }
     if request.tool.starts_with("share_") {
         return dispatch_share(&state.share, authenticated, request, now);

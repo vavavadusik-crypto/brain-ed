@@ -1,9 +1,8 @@
 //! Bounded user-timer publication; local policy is checked again on every run.
 use super::{Local, Publish, TeamCommand, dir, selected};
-use crate::{
-    RuntimeConfig, archive,
-    distill_schedule::{interval, systemctl},
-};
+#[cfg(target_os = "linux")]
+use crate::distill_schedule::systemctl;
+use crate::{RuntimeConfig, archive, distill_schedule::interval};
 use brain_core::{
     network::SHARE_STORE_FILE,
     sharing::{ShareResult, ShareStore},
@@ -13,14 +12,16 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 use std::error::Error;
 
+#[cfg(target_os = "linux")]
 const SERVICE: &str = "brain-team-publish.service";
+#[cfg(target_os = "linux")]
 const TIMER: &str = "brain-team-publish.timer";
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ScheduleCommand {
     /// Install a user timer that republishes this machine's slice (only while publication is on).
     Enable {
-        /// How often to publish a fresh slice (systemd interval, e.g. 15m, 1h).
+        /// How often to publish a fresh slice (e.g. 15m, 1h).
         #[arg(long, default_value = "15m")]
         every: String,
         #[command(flatten)]
@@ -76,12 +77,16 @@ pub(crate) fn command(
     command: ScheduleCommand,
 ) -> Result<Value, Box<dyn Error>> {
     let home = crate::user_home();
+    #[cfg(target_os = "linux")]
     let units = home.join(".config/systemd/user");
-    let (files, switched, reloaded) = match command {
+    match command {
         ScheduleCommand::Status => {
             let last = std::fs::read(crate::brain_home().join("team-schedule-status.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::status(&home, crate::scheduler::TEAM, last);
+            #[cfg(target_os = "linux")]
             return Ok(
                 json!({"status":"ok","unit_files_installed":units.join(SERVICE).is_file() && units.join(TIMER).is_file(),
                 "enabled":systemctl(&["is-enabled",TIMER]),"active":systemctl(&["is-active",TIMER]),"last_run":last}),
@@ -96,6 +101,7 @@ pub(crate) fn command(
             let store = ShareStore::open_readonly(state.join(SHARE_STORE_FILE))?;
             let space = selected(&store, &local)?;
             let binary = crate::stable_brain_binary()?;
+            #[cfg(target_os = "linux")]
             archive::timer_units(&binary)?;
             let database = std::path::absolute(&config.database)?;
             let args = [
@@ -113,35 +119,60 @@ pub(crate) fn command(
                 "--team-space",
                 &space,
             ];
-            let exec = args
-                .iter()
-                .map(|s| archive::systemd_argument(s))
-                .collect::<Result<Vec<_>, _>>()?
-                .join(" ");
-            let brain_home = std::path::absolute(crate::brain_home())?;
-            let user_home = std::path::absolute(&home)?;
-            let env_home = archive::systemd_argument(&format!("HOME={}", user_home.display()))?;
-            let env_brain =
-                archive::systemd_argument(&format!("BRAIN_HOME={}", brain_home.display()))?;
-            let service = format!(
-                "[Unit]\nDescription=Brain ED: bounded team publication\n\n[Service]\nType=oneshot\nEnvironment={env_home} {env_brain}\nExecStart={exec}\nNice=10\nIOSchedulingClass=idle\nTimeoutStartSec=90\n"
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::manage(
+                &home,
+                crate::scheduler::TEAM,
+                Some((
+                    &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    crate::scheduler::seconds(&every)?,
+                )),
             );
-            let timer = format!(
-                "[Unit]\nDescription=Brain ED: scheduled team publication\n\n[Timer]\nOnBootSec={every}\nOnUnitInactiveSec={every}\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n"
-            );
-            let files =
-                archive::write_named_timer_units(&home, SERVICE, TIMER, Some((service, timer)))?;
-            let reloaded = systemctl(&["daemon-reload"]);
-            (files, systemctl(&["enable", "--now", TIMER]), reloaded)
+            #[cfg(target_os = "linux")]
+            {
+                let exec = args
+                    .iter()
+                    .map(|s| archive::systemd_argument(s))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(" ");
+                let brain_home = std::path::absolute(crate::brain_home())?;
+                let user_home = std::path::absolute(&home)?;
+                let env_home = archive::systemd_argument(&format!("HOME={}", user_home.display()))?;
+                let env_brain =
+                    archive::systemd_argument(&format!("BRAIN_HOME={}", brain_home.display()))?;
+                let service = format!(
+                    "[Unit]\nDescription=Brain ED: bounded team publication\n\n[Service]\nType=oneshot\nEnvironment={env_home} {env_brain}\nExecStart={exec}\nNice=10\nIOSchedulingClass=idle\nTimeoutStartSec=90\n"
+                );
+                let timer = format!(
+                    "[Unit]\nDescription=Brain ED: scheduled team publication\n\n[Timer]\nOnBootSec={every}\nOnUnitInactiveSec={every}\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n"
+                );
+                let files = archive::write_named_timer_units(
+                    &home,
+                    SERVICE,
+                    TIMER,
+                    Some((service, timer)),
+                )?;
+                let reloaded = systemctl(&["daemon-reload"]);
+                crate::distill_schedule::timer_result(
+                    files,
+                    systemctl(&["enable", "--now", TIMER]),
+                    reloaded,
+                )
+            }
         }
         ScheduleCommand::Disable => {
-            let switched = systemctl(&["disable", "--now", TIMER]);
-            let files = archive::write_named_timer_units(&home, SERVICE, TIMER, None)?;
-            (files, switched, systemctl(&["daemon-reload"]))
+            #[cfg(target_os = "macos")]
+            return crate::scheduler::manage(&home, crate::scheduler::TEAM, None);
+            #[cfg(target_os = "linux")]
+            {
+                let switched = systemctl(&["disable", "--now", TIMER]);
+                let files = archive::write_named_timer_units(&home, SERVICE, TIMER, None)?;
+                crate::distill_schedule::timer_result(
+                    files,
+                    switched,
+                    systemctl(&["daemon-reload"]),
+                )
+            }
         }
-    };
-    Ok(
-        json!({"status":if switched && reloaded {"ok"} else {"files_written_systemctl_failed"},
-        "unit_files":files,"systemctl_daemon_reload":reloaded,"systemctl_enable_or_disable":switched}),
-    )
+    }
 }

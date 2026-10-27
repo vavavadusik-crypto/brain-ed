@@ -183,8 +183,8 @@ pub(crate) struct EnrollArgs {
     /// Agent id bound to the credential, [A-Za-z0-9._:@-]{1,64}.
     #[arg(long)]
     agent_id: String,
-    /// worker (read and write) or reader (read only).
-    #[arg(long, value_parser = ["worker", "reader"])]
+    /// worker (read and write), manager (read only), or legacy reader.
+    #[arg(long, value_parser = ["worker", "manager", "reader"])]
     role: String,
     /// Space this principal may use (repeatable, at least one).
     #[arg(long = "grant-space", required = true)]
@@ -910,6 +910,13 @@ fn window_observation_path(brain_home: &Path) -> PathBuf {
         .join(format!("{key}.json"))
 }
 
+#[cfg(target_os = "macos")]
+fn process_start(_pid: u32) -> Option<String> {
+    // No verified process-generation identity: stale observations are not trusted.
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn process_start(pid: u32) -> Option<String> {
     // /proc stat field 22; comm can contain spaces and parentheses.
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -954,6 +961,7 @@ pub(crate) fn window_state_document(brain_home: &Path) -> Value {
     let bind = observation
         .as_ref()
         .and_then(|value| value["bind"].as_str());
+    #[cfg(target_os = "linux")]
     let serving = observation.as_ref().and_then(|value| {
         let pid = u32::try_from(value["pid"].as_u64()?).ok()?;
         Some(
@@ -962,6 +970,8 @@ pub(crate) fn window_state_document(brain_home: &Path) -> Value {
                 .is_some_and(|started| Some(started) == value["started"].as_str()),
         )
     });
+    #[cfg(target_os = "macos")]
+    let serving: Option<bool> = None;
     json!({
         "team": team::manifest_document(&state_dir).unwrap_or_else(|_|json!({"error":"team_manifest_unavailable"})),
         "auth_store": state_dir.join("auth.sqlite").is_file(),
@@ -1471,6 +1481,12 @@ fn request_for(space: &str, operation: RemoteOp) -> Result<Request, (Exit, Value
 
 #[cfg(test)]
 mod panel_tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_process_generation_is_explicitly_unknown() {
+        assert!(super::process_start(std::process::id()).is_none());
+    }
+
     use super::*;
     #[test]
     fn coordinator_observation_tracks_actual_process_and_custom_state_without_writes() {
@@ -1487,14 +1503,20 @@ mod panel_tests {
             .unwrap();
         let before = std::fs::read(&path).unwrap();
         let doc = window_state_document(&home);
+        #[cfg(target_os = "linux")]
         assert_eq!(doc["serving"], true);
+        #[cfg(target_os = "macos")]
+        assert_eq!(doc["serving"], Value::Null);
         assert_eq!(doc["bind"], "127.0.0.1:32145");
         assert_eq!(doc["principals"], 0);
         assert_eq!(doc["coordination_database"], true);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let stale = json!({"pid":std::process::id(), "started":"wrong-start", "bind":"127.0.0.1:32145", "state_dir":state});
         crate::private_fs::write_private(&path, &serde_json::to_vec(&stale).unwrap()).unwrap();
+        #[cfg(target_os = "linux")]
         assert_eq!(window_state_document(&home)["serving"], false);
+        #[cfg(target_os = "macos")]
+        assert_eq!(window_state_document(&home)["serving"], Value::Null);
         std::fs::remove_file(path).unwrap();
         assert_eq!(window_state_document(&home)["serving"], Value::Null);
         drop(store);

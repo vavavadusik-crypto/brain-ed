@@ -1418,8 +1418,7 @@ mod markdown {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
-        use std::os::fd::AsRawFd;
-        let opened = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let opened = brain_core::platform::opened_path(&file)?;
         if !opened.starts_with(root) || opened != path || secret_path(&opened) {
             report.skip(path, "source_changed_during_scan");
             return Ok(None);

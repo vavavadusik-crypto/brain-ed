@@ -537,7 +537,7 @@ fn check_private_leaf(path: &Path) -> CoordResult<()> {
         return refuse("is not a regular file");
     }
     // Same owner source as the work map: the uid that owns this process.
-    let uid = fs::metadata("/proc/self")?.uid();
+    let uid = crate::platform::current_uid()?;
     if meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return refuse("must be owned by this user and private (mode 600)");
     }

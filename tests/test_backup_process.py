@@ -5,6 +5,7 @@ The preload shim injects process death at the transaction boundary, not a
 Rust-only test seam. No database rows or command output are printed.
 """
 from contextlib import closing
+import sys
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ import unittest
 BIN = os.environ.get("BRAIN_PROBE_BIN", str(Path(__file__).resolve().parents[1] / "target/debug/brain"))
 
 
+@unittest.skipUnless(sys.platform == "linux", "Linux LD_PRELOAD/renameat2 fault injection; Darwin swap is tested in Rust")
 class BackupProcess(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

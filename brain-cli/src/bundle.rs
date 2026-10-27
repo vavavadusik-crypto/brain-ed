@@ -115,6 +115,9 @@ pub(crate) fn init(
             std::fs::rename(path, &retired)?;
         }
     }
+    // A newly created state directory will hold team gateway secrets as well
+    // as TLS material; do not inherit a permissive process umask.
+    crate::private_fs::create_private_dir_all(state_dir)?;
     std::fs::create_dir_all(&tls_dir)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tls_dir, std::fs::Permissions::from_mode(0o700))?;

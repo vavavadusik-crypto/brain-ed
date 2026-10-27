@@ -6,6 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 fn configured() -> bool {
+    if super::onboarding::role(&dir(&Local::default())).as_deref() == Some("manager") {
+        return true;
+    }
     let path = dir(&Local::default()).join(SHARE_STORE_FILE);
     if !path.exists() {
         return false;

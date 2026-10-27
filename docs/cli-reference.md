@@ -619,7 +619,7 @@ Commands:
   list     List snapshot directories
   prune    Keep only the newest N snapshot directories
   restore  Replace the live files with a snapshot's contents
-  timer    Install or remove the daily backup timer (systemd user)
+  timer    Install or remove the daily backup timer (systemd/launchd user)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -718,7 +718,7 @@ Options:
 
 ### `brain backup timer`
 
-Install or remove the daily backup timer (systemd user)
+Install or remove the daily backup timer (systemd/launchd user)
 
 ```console
 Usage: brain backup timer [OPTIONS] <ACTION>
@@ -937,7 +937,7 @@ Usage: brain distill [OPTIONS] <COMMAND>
 ```text
 Commands:
   run       Extract and persist facts from visible archive sessions
-  schedule  Manage the opt-in systemd user timer
+  schedule  Manage the opt-in user timer (systemd/launchd)
   status    Show distillation progress and active fact counts
   help      Print this message or the help of the given subcommand(s)
 
@@ -999,7 +999,7 @@ Options:
 
 ### `brain distill schedule`
 
-Manage the opt-in systemd user timer
+Manage the opt-in user timer (systemd/launchd)
 
 ```console
 Usage: brain distill schedule [OPTIONS] <COMMAND>
@@ -1007,7 +1007,7 @@ Usage: brain distill schedule [OPTIONS] <COMMAND>
 
 ```text
 Commands:
-  enable   Install or refresh the systemd timer that runs distillation
+  enable   Install or refresh the user timer (systemd/launchd) that runs distillation
   disable  Stop the distillation timer (installed files are removed)
   status   Show whether the timer is installed and when it last ran
   help     Print this message or the help of the given subcommand(s)
@@ -1024,7 +1024,7 @@ Options:
 
 ### `brain distill schedule enable`
 
-Install or refresh the systemd timer that runs distillation
+Install or refresh the user timer (systemd/launchd) that runs distillation
 
 ```console
 Usage: brain distill schedule enable [OPTIONS] --provider <PROVIDER>
@@ -1381,7 +1381,7 @@ Commands:
   collect   Run the bounded collector once (what the timer runs)
   enable    Let the collector run
   disable   Pause the collector; runs exit without reading any source
-  timer     Install or remove the systemd user timer that runs `collect` every 2 minutes
+  timer     Install or remove the user timer (systemd/launchd) that runs `collect` every 2 minutes
   backfill  Explicitly admit older, out-of-window history a few files at a time
   help      Print this message or the help of the given subcommand(s)
 
@@ -1554,7 +1554,7 @@ Options:
 
 ### `brain archive timer`
 
-Install or remove the systemd user timer that runs `collect` every 2 minutes
+Install or remove the user timer (systemd/launchd) that runs `collect` every 2 minutes
 
 ```console
 Usage: brain archive timer [OPTIONS] <ACTION>
@@ -2168,6 +2168,10 @@ Usage: brain team [OPTIONS] <COMMAND>
 
 ```text
 Commands:
+  invite     Local coordinator admin: issue one single-use role/project invitation (0600)
+  accept     Register from an invitation; publication stays OFF without explicit consent
+  who        Safe team roster: names, roles and observed freshness, no endpoints or secrets
+  remove     Local coordinator admin: revoke a member and access to team slices
   peer       Coordinator admin: pin a source machine, origin, project, space and TLS endpoint
   ask        Search only complete verified replicas of explicitly selected machines
   manifest   Read-only local manifest: what, to whom and when. Missing policy means off
@@ -2187,6 +2191,113 @@ Options:
       --share-state-dir <DIR>  Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
       --offline                Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
   -h, --help                   Print help
+```
+
+### `brain team invite`
+
+Local coordinator admin: issue one single-use role/project invitation (0600)
+
+```console
+Usage: brain team invite [OPTIONS] --role <ROLE> --name <NAME>
+```
+
+```text
+Options:
+      --database <PATH>            SQLite database path (default: ~/.brain/brain.sqlite)
+      --state-dir <STATE_DIR>      Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
+      --space <SPACE>              Memory namespace [default: default]
+      --team-space <TEAM_SPACE>    Isolated team space, e.g. team.project.readers
+      --agent <AGENT>              Agent identity used for attribution and memory ownership [default: brain-cli]
+      --role <ROLE>                Team role: worker publishes its slice; manager reads selected machines [possible values: worker, manager]
+      --models-dir <DIR>           Model cache directory (default: ~/.brain/models)
+      --name <NAME>                Unique machine name, 3..64 lowercase letters, digits and hyphens
+      --project <PROJECT>          Project id, used as an explicit team.PROJECT shared-space boundary [default: default]
+      --share-state-dir <DIR>      Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
+      --expires <EXPIRES>          Invitation lifetime: seconds or suffix s, m, h, d (60s..90d) [default: 7d]
+      --offline                    Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+      --out <OUT>                  New invitation file, 0600. Default: NAME.invite.json in current directory
+      --dial <DIAL>                Coordinator address; default: this Brain home's running net serve
+      --server-name <SERVER_NAME>  Coordinator certificate SAN; default: first name from net init
+      --allow-lan-source           Permit this worker to register a private LAN source endpoint
+      --allow-cgnat-source         Permit this worker to register a CGNAT source endpoint
+  -h, --help                       Print help
+```
+
+### `brain team accept`
+
+Register from an invitation; publication stays OFF without explicit consent
+
+```console
+Usage: brain team accept [OPTIONS] <FILE>
+```
+
+```text
+Arguments:
+  <FILE>
+
+Options:
+      --database <PATH>              SQLite database path (default: ~/.brain/brain.sqlite)
+      --state-dir <STATE_DIR>        Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
+      --space <SPACE>                Memory namespace [default: default]
+      --team-space <TEAM_SPACE>      Isolated team space, e.g. team.project.readers
+      --agent <AGENT>                Agent identity used for attribution and memory ownership [default: brain-cli]
+      --publish                      Explicitly approve collection, enable the local slice and publish now
+      --models-dir <DIR>             Model cache directory (default: ~/.brain/models)
+      --root <ROOT>                  Worker project root (default: current directory); never sent to coordinator
+      --share-state-dir <DIR>        Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
+      --source-space <SOURCE_SPACE>  Local source space to project; no archive access is granted [default: default]
+      --offline                      Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+      --source-dial <SOURCE_DIAL>    Worker's already running net serve endpoint; default: local runtime observation
+      --allow-lan-dial               Explicitly allow dialing the coordinator on a private LAN address
+      --allow-cgnat-dial             Explicitly allow dialing the coordinator on a CGNAT address
+      --allow-lan-source             Approve publishing a private LAN source endpoint (also requires admin opt-in)
+      --allow-cgnat-source           Approve publishing a CGNAT source endpoint (also requires admin opt-in)
+  -h, --help                         Print help
+```
+
+### `brain team who`
+
+Safe team roster: names, roles and observed freshness, no endpoints or secrets
+
+```console
+Usage: brain team who [OPTIONS]
+```
+
+```text
+Options:
+      --database <PATH>          SQLite database path (default: ~/.brain/brain.sqlite)
+      --state-dir <STATE_DIR>    Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
+      --space <SPACE>            Memory namespace [default: default]
+      --team-space <TEAM_SPACE>  Isolated team space, e.g. team.project.readers
+      --agent <AGENT>            Agent identity used for attribution and memory ownership [default: brain-cli]
+      --models-dir <DIR>         Model cache directory (default: ~/.brain/models)
+      --share-state-dir <DIR>    Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
+      --offline                  Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+  -h, --help                     Print help
+```
+
+### `brain team remove`
+
+Local coordinator admin: revoke a member and access to team slices
+
+```console
+Usage: brain team remove [OPTIONS] <NAME>
+```
+
+```text
+Arguments:
+  <NAME>
+
+Options:
+      --database <PATH>          SQLite database path (default: ~/.brain/brain.sqlite)
+      --state-dir <STATE_DIR>    Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
+      --space <SPACE>            Memory namespace [default: default]
+      --team-space <TEAM_SPACE>  Isolated team space, e.g. team.project.readers
+      --agent <AGENT>            Agent identity used for attribution and memory ownership [default: brain-cli]
+      --models-dir <DIR>         Model cache directory (default: ~/.brain/models)
+      --share-state-dir <DIR>    Host-only: the `brain net` state directory whose shared facts map packets may read (absolute path). Unset, no shared fact is read; no MCP argument can set or change it
+      --offline                  Forbid even explicit model installation; ordinary commands never auto-download [env: BRAIN_OFFLINE=]
+  -h, --help                     Print help
 ```
 
 ### `brain team peer`
@@ -2426,7 +2537,7 @@ Usage: brain team schedule enable [OPTIONS]
 ```text
 Options:
       --database <PATH>          SQLite database path (default: ~/.brain/brain.sqlite)
-      --every <EVERY>            How often to publish a fresh slice (systemd interval, e.g. 15m, 1h) [default: 15m]
+      --every <EVERY>            How often to publish a fresh slice (e.g. 15m, 1h) [default: 15m]
       --space <SPACE>            Memory namespace [default: default]
       --state-dir <STATE_DIR>    Defaults to ~/.brain/net. Explicit --state-dir is recommended for isolated use
       --agent <AGENT>            Agent identity used for attribution and memory ownership [default: brain-cli]
@@ -2788,9 +2899,9 @@ Options:
           Agent id bound to the credential, [A-Za-z0-9._:@-]{1,64}
 
       --role <ROLE>
-          worker (read and write) or reader (read only)
+          worker (read and write), manager (read only), or legacy reader
 
-          [possible values: worker, reader]
+          [possible values: worker, manager, reader]
 
       --grant-space <GRANT_SPACE>
           Space this principal may use (repeatable, at least one)

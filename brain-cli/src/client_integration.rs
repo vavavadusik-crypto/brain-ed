@@ -34,10 +34,6 @@ const BEGIN: &str = "# BRAIN_REGISTERED_MCP_BEGIN";
 const END: &str = "# BRAIN_REGISTERED_MCP_END";
 const LEGACY_BEGIN: &str = "# BRAIN_FOR_AI_BEGIN";
 const LEGACY_END: &str = "# BRAIN_FOR_AI_END";
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NONBLOCK: i32 = 0o4000;
 
 fn fail(why: &str) -> Failure {
     why.to_string().into()
@@ -82,8 +78,8 @@ pub(crate) struct Context<'a> {
 /// The executable bytes the integration binary is copied from.
 pub(crate) enum Source {
     /// The image this process is running, read through one handle on the
-    /// kernel's `/proc/self/exe` (Linux only; elsewhere a refusal). A path name
-    /// such as `current_exe()` is never trusted: it can name newer bytes.
+    /// kernel's `/proc/self/exe` on Linux. Darwin uses current_exe with a
+    /// secure open; it may name a newer generation after a binary replacement.
     RunningImage,
     /// Tests: an owned synthetic ELF file.
     #[cfg(test)]
@@ -94,7 +90,17 @@ fn open_source(source: &Source) -> io::Result<fs::File> {
     match source {
         #[cfg(target_os = "linux")]
         Source::RunningImage => fs::File::open("/proc/self/exe"),
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        Source::RunningImage => {
+            // Darwin has no /proc image handle. Open current_exe without following
+            // a final symlink. Unlike Linux this cannot pin a replaced generation.
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(brain_core::platform::SECURE_OPEN_FLAGS)
+                .open(std::env::current_exe()?)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         Source::RunningImage => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the running image cannot be read on this platform",
@@ -263,10 +269,10 @@ fn read_owned(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, &'static str> 
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(O_NOFOLLOW | O_NONBLOCK);
+        options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
     }
     let file = options.open(path).map_err(|_| "cannot be opened safely")?;
     let opened = file.metadata().map_err(|_| "cannot be inspected")?;
@@ -335,8 +341,8 @@ fn write_atomic(
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(mode);
-        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-        options.custom_flags(O_NOFOLLOW);
+        #[cfg(unix)]
+        options.custom_flags(brain_core::platform::SECURE_OPEN_FLAGS);
     }
     #[cfg(not(unix))]
     let _ = mode;
@@ -528,7 +534,7 @@ fn binary_path(paths: &Paths) -> Result<String, Failure> {
         .ok_or_else(|| refuse(UNSAFE_HOME))
 }
 
-/// The running executable: a regular x86-64 ELF executable within the size
+/// The running executable: a regular ELF (Linux) or Mach-O (Darwin) within the size
 /// bound, hashed from exactly the bytes that may later be copied.
 fn read_source(source: &Source) -> Result<(Vec<u8>, String), Failure> {
     let invalid = || refuse("the running Brain executable cannot be copied safely");
@@ -542,18 +548,34 @@ fn read_source(source: &Source) -> Result<(Vec<u8>, String), Failure> {
     file.take(MAX_BINARY_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| invalid())?;
-    let elf = bytes.len() >= 64
+    #[cfg(not(target_os = "macos"))]
+    let executable = bytes.len() >= 64
         && bytes.len() as u64 <= MAX_BINARY_BYTES
         && bytes.starts_with(b"\x7fELF")
         && bytes[4] == 2
         && bytes[5] == 1
         && matches!(u16::from_le_bytes([bytes[16], bytes[17]]), 2 | 3)
         && u16::from_le_bytes([bytes[18], bytes[19]]) == 0x3e;
-    if !elf {
+    #[cfg(target_os = "macos")]
+    let executable = bytes.len() as u64 <= MAX_BINARY_BYTES && macho_executable(&bytes);
+    if !executable {
         return Err(invalid());
     }
     let sha = sha256(&bytes);
     Ok((bytes, sha))
+}
+
+/// Thin little-endian 64-bit Mach-O executable, ARM64 or Intel. Keep the
+/// format check pure so malformed/truncated headers are tested on Linux too.
+#[cfg(any(target_os = "macos", test))]
+fn macho_executable(bytes: &[u8]) -> bool {
+    bytes.len() >= 32
+        && bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        && matches!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x01000007 | 0x0100000c
+        )
+        && u32::from_le_bytes(bytes[12..16].try_into().unwrap()) == 2
 }
 
 /// The integration binary's hash, if it exists as a private owned
@@ -1030,6 +1052,46 @@ pub(crate) fn status(brain_home: &Path, label: &str, identity: Identity) -> &'st
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn macho_format_checks_both_cpus_filetype_endianness_and_truncation() {
+        for cpu in [0x01000007u32, 0x0100000c] {
+            let mut header = vec![0u8; 32];
+            header[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+            header[4..8].copy_from_slice(&cpu.to_le_bytes());
+            header[12..16].copy_from_slice(&2u32.to_le_bytes());
+            assert!(super::macho_executable(&header));
+            for n in 0..32 {
+                assert!(!super::macho_executable(&header[..n]));
+            }
+            header[12] = 6; // MH_DYLIB must not be copied as an executable.
+            assert!(!super::macho_executable(&header));
+            header[12] = 2;
+            header[4] = 99;
+            assert!(!super::macho_executable(&header));
+            header[..4].reverse();
+            assert!(!super::macho_executable(&header));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_running_image_is_macho_and_size_cap_is_enforced() {
+        let mut file = super::open_source(&super::Source::RunningImage).unwrap();
+        let mut magic = [0u8; 4];
+        std::io::Read::read_exact(&mut file, &mut magic).unwrap();
+        assert_eq!(magic, [0xcf, 0xfa, 0xed, 0xfe]);
+        let result = super::read_source(&super::Source::RunningImage);
+        if file.metadata().unwrap().len() > super::MAX_BINARY_BYTES {
+            assert!(
+                result.is_err(),
+                "oversized native debug image must be refused"
+            );
+        } else {
+            let (bytes, digest) = result.unwrap();
+            assert_eq!(digest, super::sha256(&bytes));
+        }
+    }
+
     use super::*;
     use crate::client_registry::{ClientKind, ClientsCommand};
     use std::os::unix::fs::PermissionsExt;
@@ -1061,6 +1123,12 @@ mod tests {
         bytes[5] = 1;
         bytes[16] = 3;
         bytes[18] = 0x3e;
+        #[cfg(target_os = "macos")]
+        {
+            bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+            bytes[4..8].copy_from_slice(&0x0100000cu32.to_le_bytes());
+            bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+        }
         bytes[100] = seed;
         bytes
     }

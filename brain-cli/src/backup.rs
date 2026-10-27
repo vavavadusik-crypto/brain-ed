@@ -412,7 +412,7 @@ fn stage_tree(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
         } else if kind.is_symlink() {
             std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
         } else {
-            return Err("stop Brain services before restore (special file in Brain home): `systemctl --user stop brain-archive-collect.timer brain-backup.timer` and any running `brain ui`/`brain net serve`".into());
+            return Err("stop all Brain services, scheduled jobs and SQLite clients before restore (special file in Brain home), including running `brain ui`/`brain net serve`".into());
         }
     }
     if source
@@ -569,6 +569,10 @@ mod atomic_home {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "backup_macos.rs"]
+mod atomic_home;
+
 /// Restore the WHOLE home via one Linux directory exchange. Preparation errors
 /// leave the live home unchanged. Process death before/after the exchange
 /// leaves respectively the complete old/new state; there is no rename gap or
@@ -631,11 +635,11 @@ pub(crate) fn restore(
     }
     if !yes {
         return Ok(json!({ "status": "dry-run", "would_restore": plan,
-            "note": "stop all Brain/SQLite holders; add --yes for an atomic Linux directory exchange" }));
+            "note": "stop all Brain/SQLite holders; add --yes for an atomic directory exchange (macOS: advisory locks only)" }));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err("atomic restore is supported on Linux only (file leases are a Linux feature; restore this snapshot on the Linux machine that took it)".into());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // Serialize backup operations without creating a lock file. Retain the
         // descriptor across the exchange (it continues to name the old home).
@@ -703,8 +707,12 @@ pub(crate) fn restore(
         let durable = std::fs::File::open(parent)
             .and_then(|f| f.sync_all())
             .is_ok();
+        #[cfg(target_os = "linux")]
+        let exclusion = "linux_file_leases";
+        #[cfg(target_os = "macos")]
+        let exclusion = "advisory_flock_only_stop_all_clients";
         Ok(
-            json!({ "status": "ok", "restored": plan, "safety_snapshot": safety["snapshot"],
+            json!({ "status": "ok", "exclusion":exclusion, "restored": plan, "safety_snapshot": safety["snapshot"],
             "previous_home": staged, "parent_synced": durable,
             "note": "all files switched in one atomic directory exchange; original snapshot preserved; previous_home retains displaced files (unrelated files share inodes)" }),
         )
@@ -712,6 +720,8 @@ pub(crate) fn restore(
 }
 
 /// systemd user units for the daily backup timer (the archive timer's shape).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Error>> {
     let text = binary.to_str().ok_or("binary path is not UTF-8")?;
     if !text.starts_with('/')
@@ -734,10 +744,16 @@ pub(crate) fn timer_units(binary: &Path) -> Result<(String, String), Box<dyn Err
     Ok((service, timer))
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const TIMER_UNIT: &str = "brain-backup.timer";
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const SERVICE_UNIT: &str = "brain-backup.service";
 
 /// Writes (or removes) the unit files; enabling is left to systemctl.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn write_timer_units(
     home: &Path,
     binary: &Path,
@@ -891,14 +907,7 @@ mod tests {
         let brain_home = root.join(".brain");
         seed_brain(&brain_home);
         let mut stored = settings::load(&brain_home);
-        let custom_dir = format!(
-            "/tmp/brain-backup-custom-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        );
+        let custom_dir = root.join("custom-backups").to_str().unwrap().to_owned();
         apply_memory_setting(&mut stored, "backup_dir", &custom_dir).unwrap();
         apply_memory_setting(&mut stored, "backup_keep", "2").unwrap();
         settings::save(&brain_home, &stored).unwrap();
@@ -944,7 +953,6 @@ mod tests {
         let error = apply_memory_setting(&mut stored, "backup_dir", "relative/path")
             .expect_err("relative path");
         assert!(error.contains("absolute path"), "{error}");
-        let _ = std::fs::remove_dir_all("/tmp/brain-backup-custom");
         let _ = std::fs::remove_dir_all(&root);
     }
 

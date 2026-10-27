@@ -94,6 +94,7 @@ def snapshot(top):
 
 
 @unittest.skipUnless(BRAIN_BIN and os.path.isfile(BRAIN_BIN), "BRAIN_BIN must point at a built brain binary")
+@unittest.skipUnless(sys.platform == "linux", "Linux ELF bundle and Linux installer contracts")
 class Bundle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix=TMP_PREFIX)
@@ -902,6 +903,7 @@ def load_tool():
     return module
 
 
+@unittest.skipUnless(sys.platform == "linux", "Linux ELF bundle and Linux installer contracts")
 class HeldOutputDirectory(unittest.TestCase):
     """write_no_clobber checks the directory it actually holds, including one
     created or loosened by someone else after the preflight."""

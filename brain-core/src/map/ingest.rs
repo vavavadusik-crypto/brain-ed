@@ -155,7 +155,7 @@ struct Source {
 }
 
 fn current_uid() -> Result<u32, MapError> {
-    Ok(fs::metadata("/proc/self")?.uid())
+    Ok(crate::platform::current_uid()?)
 }
 
 fn check_owned(path: &Path, what: &str, dir: bool) -> Result<fs::Metadata, MapError> {

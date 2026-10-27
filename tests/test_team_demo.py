@@ -1,4 +1,5 @@
 """Synthetic CLI regressions. Set BRAIN_PROBE_BIN or BRAIN_BIN to a built brain."""
+import sys
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ class TeamDemo(unittest.TestCase):
         p = subprocess.run([str(REPO / "tools/team-demo.sh"), "--machines", "2"],
                            env=env, capture_output=True, text=True, timeout=115)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        for text in ("Готова worker-1", "Готова worker-2", "enroll → join", "класс task",
+        for text in ("Готова worker-1", "Готова worker-2", "invite → accept --publish", "класс task",
                      "класс error", "reopened", "класс decision", "failed", "класс plan",
                      "машина worker-1", "машина worker-2", "факт исчез", "нет ответа",
                      "временные HOME удалены", "Демо завершено",
@@ -67,6 +68,7 @@ class TeamDemo(unittest.TestCase):
 
 
 @unittest.skipUnless(BRAIN, "set BRAIN_PROBE_BIN or BRAIN_BIN")
+@unittest.skipUnless(sys.platform == "linux", "systemd unit contract; Darwin LaunchAgents have a separate suite")
 class TeamSchedule(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="brain-team-timer-")

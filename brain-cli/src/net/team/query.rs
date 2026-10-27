@@ -37,6 +37,8 @@ struct Peer {
     project: String,
     space: String,
     connect: ConnectArgs,
+    #[serde(default)]
+    via_coordinator: bool,
 }
 impl Peer {
     fn validate(&self) -> ShareResult<()> {
@@ -90,6 +92,7 @@ pub(super) fn configure(args: PeerArgs) -> ShareResult<Value> {
         project: args.project,
         space,
         connect: args.connect,
+        via_coordinator: false,
     };
     peer.validate()?;
     // Validate before persisting endpoint references. No coordinator request;
@@ -149,8 +152,19 @@ fn refresh(
         args.insert("space".into(), json!(peer.space));
         args.insert("after_seq".into(), json!(after));
         args.insert("limit".into(), json!(10));
-        let body = match tls.call("share_pull", "", args, Some(request_id.into())) {
+        let tool = if peer.via_coordinator {
+            args.insert("source_name".into(), json!(peer.machine));
+            "team_pull"
+        } else {
+            "share_pull"
+        };
+        let body = match tls.call(tool, "", args, Some(request_id.into())) {
             TlsCallResult::Ok(body) => body,
+            TlsCallResult::Refused(brain_core::network::NetError::Unavailable(_))
+                if peer.via_coordinator =>
+            {
+                return Err("offline");
+            }
             TlsCallResult::Refused(_) => return Err("denied"),
             TlsCallResult::Unreachable(_) => return Err("offline"),
             TlsCallResult::Tls(TlsError::Unreachable(_)) => return Err("offline"),
@@ -410,6 +424,7 @@ pub(super) fn ask(config: &crate::RuntimeConfig, args: AskArgs) -> ShareResult<V
         let _ = config;
         None
     };
+    super::onboarding::refresh_if_joined(&dir(&args.local))?;
     let store = ShareStore::open(dir(&args.local).join(SHARE_STORE_FILE))?;
     let request_id = super::super::fresh_request_id().map_err(|_| team::bad())?;
     // A crash/cancel after this durable start leaves a pending record, never

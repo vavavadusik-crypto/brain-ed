@@ -24,8 +24,8 @@ class InstallerTests(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=f'{self.bin}:/usr/bin:/bin',
                         PAYLOAD=str(self.payload), SUMS=str(self.manifest),
-                        TRACE=str(self.base / 'trace'), MACHINE='x86_64')
-        self.script('uname', 'case "$1" in -s) echo Linux;; -m) echo "$MACHINE";; esac')
+                        TRACE=str(self.base / 'trace'), MACHINE='x86_64', KERNEL='Linux')
+        self.script('uname', 'case "$1" in -s) echo "$KERNEL";; -m) echo "$MACHINE";; esac')
         self.script('curl', '''printf '%s\\n' "$*" >> "$TRACE"
 while [ "$#" -gt 0 ]; do
   case "$1" in --output) out="$2"; shift;; https://*) url="$1";; esac
@@ -39,9 +39,9 @@ case "$url" in */SHA256SUMS) cp "$SUMS" "$out";; *) cp "$PAYLOAD" "$out";; esac'
         path.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
         path.chmod(0o755)
 
-    def sums(self, arch='x86_64', digest=None):
+    def sums(self, arch='x86_64', digest=None, platform='unknown-linux-musl'):
         digest = digest or hashlib.sha256(self.payload.read_bytes()).hexdigest()
-        self.manifest.write_text(f'{digest}  brain-0.2.0-{arch}-unknown-linux-musl\n')
+        self.manifest.write_text(f'{digest}  brain-0.2.0-{arch}-{platform}\n')
 
     def run_installer(self, *args, ok=True):
         result = subprocess.run(['bash', str(ROOT / 'install.sh'), *args],
@@ -82,6 +82,19 @@ case "$url" in */SHA256SUMS) cp "$SUMS" "$out";; *) cp "$PAYLOAD" "$out";; esac'
         self.sums(arch='aarch64')
         self.run_installer()
         self.assertIn('aarch64-unknown-linux-musl', (self.base / 'trace').read_text())
+
+    def test_macos_both_architectures_and_side_effect_free_dry_run(self):
+        for machine, arch in [('arm64', 'aarch64'), ('x86_64', 'x86_64')]:
+            with self.subTest(machine=machine):
+                self.env.update(KERNEL='Darwin', MACHINE=machine)
+                self.sums(arch=arch, platform='apple-darwin')
+                before = sorted(str(p) for p in self.base.rglob('*'))
+                plan = self.run_installer('--dry-run')
+                self.assertEqual(before, sorted(str(p) for p in self.base.rglob('*')))
+                self.assertIn(f'{arch}-apple-darwin', plan.stdout)
+                self.run_installer()
+                self.assertIn(f'{arch}-apple-darwin', (self.base / 'trace').read_text())
+                self.assertEqual((self.home / '.local/bin/brain').read_bytes(), self.payload.read_bytes())
 
     def test_bad_manifest_and_options(self):
         original = self.manifest.read_text()

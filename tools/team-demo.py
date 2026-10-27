@@ -166,6 +166,16 @@ class Demo:
         boss.mkdir()
         self.run(boss, "net", "init", "--name", "localhost")
         _, coord_dial = self.serve(boss)
+        admin = boss
+        if not self.via_relay:
+            admin = self.base / "admin"
+            admin.mkdir()
+            self.run(admin, "net", "init", "--name", "localhost")
+            _, coord_dial = self.serve(admin)
+            invitation = self.base / "leader.invite.json"
+            self.run(admin, "team", "invite", "--role", "manager", "--name", "leader",
+                     "--project", "checkout", "--out", invitation)
+            self.run(boss, "team", "accept", invitation)
         machines, homes, sources = [], [], []
         print("Brain ED — синтетическое демо команды (только 127.0.0.1; без моделей и внешних API)", flush=True)
         for n in range(1, count + 1):
@@ -175,36 +185,47 @@ class Demo:
             machines.append(name)
             homes.append(home)
             bundle = self.base / f"{name}.bundle"
-            self.run(boss, "net", "enroll", "--machine", name, "--agent-id", "demo", "--role", "worker",
-                     "--grant-space", "demo", "--credential-out", self.base / f"{name}.credential",
-                     "--bundle-out", bundle, "--dial", coord_dial)
-            self.run(home, "net", "join", bundle, "--consume")
-            for attempt in range(30):
-                try:
-                    self.run(home, "net", "status")
-                    break
-                except RuntimeError:
-                    if attempt == 29:
-                        raise
-                    time.sleep(0.1)
-            root = self.seed(home, n)
-            self.run(home, "net", "init", "--name", "localhost")
-            self.run(home, "team", "configure", "--machine", name, "--project", "checkout", "--root", root,
-                     "--team-space", "team.checkout", "--recipient", "leader:lead")
-            self.run(home, "team", "enable")
-            self.run(home, "team", "publish")
-            source, dial = self.serve(home)
-            sources.append(source)
-            reader = boss / f"{name}.reader"
-            self.run(home, "net", "enroll", "--machine", "leader", "--agent-id", "lead", "--role", "reader",
-                     "--grant-space", "team.checkout", "--credential-out", reader)
-            self.run(home, "net", "share", "grant", "--machine", "leader", "--agent-id", "lead", "--space", "team.checkout")
-            origin = self.run(home, "team", "manifest")["manifests"][0]["manifest"]["origin"]
-            peer_route = self.routes[home]["connect"] if self.via_relay else ["--dial", dial]
-            self.run(boss, "team", "peer", "--machine", name, "--origin", origin, "--project", "checkout",
-                     "--team-space", "team.checkout", *peer_route, "--server-name", "localhost",
-                     "--ca", home / ".brain/net/tls/ca.pem", "--credential", reader)
-            print(f"Готова {name}: enroll → join → enable → publish; error lifecycle confirmed → fixed → reopened", flush=True)
+            if self.via_relay:
+                self.run(boss, "net", "enroll", "--machine", name, "--agent-id", "demo", "--role", "worker",
+                         "--grant-space", "demo", "--credential-out", self.base / f"{name}.credential",
+                         "--bundle-out", bundle, "--dial", coord_dial)
+                self.run(home, "net", "join", bundle, "--consume")
+                for attempt in range(30):
+                    try:
+                        self.run(home, "net", "status")
+                        break
+                    except RuntimeError:
+                        if attempt == 29:
+                            raise
+                        time.sleep(0.1)
+                root = self.seed(home, n)
+                self.run(home, "net", "init", "--name", "localhost")
+                self.run(home, "team", "configure", "--machine", name, "--project", "checkout", "--root", root,
+                         "--team-space", "team.checkout", "--recipient", "leader:lead")
+                self.run(home, "team", "enable")
+                self.run(home, "team", "publish")
+                source, dial = self.serve(home)
+                sources.append(source)
+                reader = boss / f"{name}.reader"
+                self.run(home, "net", "enroll", "--machine", "leader", "--agent-id", "lead", "--role", "reader",
+                         "--grant-space", "team.checkout", "--credential-out", reader)
+                self.run(home, "net", "share", "grant", "--machine", "leader", "--agent-id", "lead", "--space", "team.checkout")
+                origin = self.run(home, "team", "manifest")["manifests"][0]["manifest"]["origin"]
+                peer_route = self.routes[home]["connect"] if self.via_relay else ["--dial", dial]
+                self.run(boss, "team", "peer", "--machine", name, "--origin", origin, "--project", "checkout",
+                         "--team-space", "team.checkout", *peer_route, "--server-name", "localhost",
+                         "--ca", home / ".brain/net/tls/ca.pem", "--credential", reader)
+                print(f"Готова {name}: enroll → join → enable → publish; error lifecycle confirmed → fixed → reopened", flush=True)
+            else:
+                root = self.seed(home, n)
+                self.run(home, "net", "init", "--name", "localhost")
+                source, _ = self.serve(home)
+                sources.append(source)
+                self.run(admin, "team", "invite", "--role", "worker", "--name", name,
+                         "--project", "checkout", "--out", bundle)
+                self.run(home, "team", "accept", bundle, "--root", root, "--publish")
+                bundle.unlink()  # Contains only a now-revoked one-time token.
+                print(f"Готова {name}: invite → accept --publish; error lifecycle confirmed → fixed → reopened", flush=True)
         answers = [self.ask(boss, machines, title, query) for title, query in [
             ("Чем заняты машины?", "Чем заняты машины?"),
             ("Какие ошибки сейчас открыты?", "Какие ошибки сейчас открыты?"),

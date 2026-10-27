@@ -208,7 +208,7 @@ impl std::fmt::Debug for MapStore {
 }
 
 fn current_uid() -> Result<u32, MapError> {
-    Ok(fs::metadata("/proc/self")?.uid())
+    Ok(crate::platform::current_uid()?)
 }
 
 /// Refuses a file or directory not owned by us or open to group/other.

@@ -4,6 +4,7 @@
 //! wire. Synthetic data in temp HOMEs only.
 
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,15 +36,24 @@ impl Fixture {
 
     fn hook(&self, client: &str, cwd: &Path) -> (String, Duration) {
         let started = Instant::now();
+        let payload = json!({"cwd": cwd.to_string_lossy()});
+        #[cfg(target_os = "linux")]
+        let input = Stdio::piped();
+        #[cfg(target_os = "macos")]
+        let input = {
+            let path = self.path().join("hook-payload.json");
+            fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+            Stdio::from(fs::File::open(path).unwrap())
+        };
         let mut child = Command::new(env!("CARGO_BIN_EXE_brain"))
             .env("HOME", self.path())
             .env("BRAIN_OFFLINE", "true")
             .args(["hook", "--event", "SessionStart", "--client", client])
-            .stdin(Stdio::piped())
+            .stdin(input)
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn hook");
-        let payload = json!({"cwd": cwd.to_string_lossy()});
+        #[cfg(target_os = "linux")]
         child
             .stdin
             .as_mut()

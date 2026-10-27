@@ -90,16 +90,10 @@ pub(crate) fn ensure_private_home(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// This process's user id without `unsafe`: the owner of `/proc/self` on
-/// Linux, else the owner of `$HOME`. `None` means "unknown", and callers
-/// then neither tighten nor trust anything.
+/// Effective process owner; never infer authority from HOME.
 #[cfg(unix)]
 pub(crate) fn current_uid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata("/proc/self")
-        .ok()
-        .or_else(|| fs::metadata(std::env::var_os("HOME")?).ok())
-        .map(|metadata| metadata.uid())
+    brain_core::platform::current_uid().ok()
 }
 
 /// Writes `bytes` to a new owner-only file beside `path`, then renames it into

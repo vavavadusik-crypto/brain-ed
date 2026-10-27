@@ -309,29 +309,14 @@ fn checked_deadline(deadline: Duration) -> Result<Duration, TlsError> {
     }
 }
 
-/// This process's real uid via Linux `/proc/self/status` (std-only, no
-/// unsafe). Explicit platform scope: Linux only.
-#[cfg(target_os = "linux")]
 pub(crate) fn current_uid() -> Option<u32> {
-    let text = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = text.lines().find(|line| line.starts_with("Uid:"))?;
-    line.split_whitespace().nth(1)?.parse().ok()
+    crate::platform::current_uid().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn current_uid() -> Option<u32> {
-    None
-}
-
-/// Opens an inherited descriptor without `unsafe`: `/proc/self/fd/N` is
-/// reopened (a magic link, so `O_NOFOLLOW` cannot apply), `O_NONBLOCK`
-/// keeps a pipe/FIFO from hanging the open, `O_CLOEXEC` keeps it out of
-/// children. The caller validates the OPENED descriptor, so a pipe, a
-/// socket, a foreign or group/world-readable file is still refused.
-/// Explicit platform scope: Linux `/proc`.
-///
-/// # Errors
-/// `InvalidInput` for `fd < 3`, otherwise the open error.
+/// Open an inherited descriptor >=3. Linux reopens through /proc with its own
+/// O_NONBLOCK flags; Darwin duplicates with F_DUPFD_CLOEXEC and accepts regular
+/// files only. The caller revalidates owner, mode and size on the open handle.
+/// Darwin never changes flags shared with the parent.
 pub fn open_inherited_fd(fd: i32) -> io::Result<std::fs::File> {
     if fd < 3 {
         return Err(io::Error::new(
@@ -339,10 +324,35 @@ pub fn open_inherited_fd(fd: i32) -> io::Result<std::fs::File> {
             "descriptor must be >= 3",
         ));
     }
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(format!("/proc/self/fd/{fd}"))
+    #[cfg(target_os = "linux")]
+    {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{fd}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // fdescfs duplicates the open description. Never set O_NONBLOCK on it:
+        // reject non-regular duplicates before any read, then validate owner/mode/size.
+        use std::os::fd::FromRawFd;
+        // SAFETY: fcntl accepts arbitrary integers and reports invalid fds.
+        #[allow(unsafe_code)]
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new owned descriptor.
+        #[allow(unsafe_code)]
+        let file = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited TLS descriptor must be a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 
 /// Secure-opens one material file and validates the OPENED descriptor.
@@ -471,8 +481,12 @@ pub fn server_config(config: &TlsServerConfig) -> Result<RustlsServerConfig, Tls
 /// [`TlsError::InvalidConfig`] when the CA file is missing/unusable.
 pub fn client_config(config: &TlsClientConfig) -> Result<ClientConfig, TlsError> {
     let ca_bytes = open_material(&config.ca_file, false)?;
+    client_config_pem(&ca_bytes)
+}
+
+fn client_config_pem(ca_bytes: &[u8]) -> Result<ClientConfig, TlsError> {
     let mut roots = RootCertStore::empty();
-    for cert in parse_certs(&ca_bytes)? {
+    for cert in parse_certs(ca_bytes)? {
         roots
             .add(cert)
             .map_err(|_| TlsError::InvalidConfig("CA file holds an unusable certificate".into()))?;
@@ -900,6 +914,24 @@ impl TlsCoordClient {
         })
     }
 
+    /// A host-local team source, enrolled over pinned TLS. Never logs its secret.
+    pub(crate) fn team_source(source: &super::team::Source) -> Result<Self, NetError> {
+        let dial = parse_dial_target_with(&source.dial, source.allow_lan, source.allow_cgnat)
+            .map_err(tls_to_net)?;
+        let token = super::BearerToken::parse(&source.credential)?;
+        let config = client_config_pem(source.ca_pem.as_bytes()).map_err(tls_to_net)?;
+        Ok(Self {
+            config: Arc::new(config),
+            server_name: ServerName::try_from(source.server_name.clone())
+                .map_err(|_| NetError::invalid("invalid source server name"))?,
+            host: source.server_name.clone(),
+            dial,
+            deadline: Duration::from_millis(3000),
+            token: token.as_str().into(),
+            dialer: Arc::new(TcpDialer),
+        })
+    }
+
     /// The numeric address this client dials.
     #[must_use]
     pub fn dial_target(&self) -> SocketAddr {
@@ -1019,6 +1051,27 @@ fn connect_before(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_inherited_fd_is_regular_and_bad_descriptors_are_refused() {
+        use std::os::fd::AsRawFd;
+        let dir = crate::test_support::temp_path("darwin-tls-fd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        assert!(
+            super::open_inherited_fd(file.as_raw_fd())
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .is_file()
+        );
+        assert!(super::open_inherited_fd(-1).is_err());
+        assert!(super::open_inherited_fd(i32::MAX).is_err());
+        let (socket, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(super::open_inherited_fd(socket.as_raw_fd()).is_err());
+    }
 
     /// G12: dial targets follow the policy table — loopback always, LAN only
     /// with the explicit opt-in, CGNAT (100.64/10) only with its own opt-in,
