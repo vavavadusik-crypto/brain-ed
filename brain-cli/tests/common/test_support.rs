@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Cleanups(RefCell<Vec<PathBuf>>);
 
@@ -36,12 +37,20 @@ pub(crate) fn temp_path(tag: &str) -> PathBuf {
 // Canonicalize only the existing test temp root, before appending the fixture.
 // Symlinks created inside a fixture remain visible to product security checks.
 pub(crate) fn temp_path_under(root: &std::path::Path, tag: &str) -> PathBuf {
-    let root = std::fs::canonicalize(root).expect("canonical test temp root");
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    let path = root.join(format!("{tag}-{}-{nanos}", std::process::id()));
+    temp_path_under_at(root, tag, nanos)
+}
+
+// A wall clock can return the same timestamp to concurrent tests (notably on
+// Darwin). The process-wide sequence also keeps their cleanup registries apart.
+pub(crate) fn temp_path_under_at(root: &std::path::Path, tag: &str, nanos: u128) -> PathBuf {
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+    let root = std::fs::canonicalize(root).expect("canonical test temp root");
+    let path = root.join(format!("{tag}-{}-{nanos}-{sequence}", std::process::id()));
     register(path.clone());
     path
 }

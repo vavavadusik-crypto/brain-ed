@@ -922,6 +922,49 @@ fn rejection_counters_cover_transitions() {
 }
 
 #[test]
+fn temporary_fixtures_with_identical_timestamps_have_independent_cleanup() {
+    let f = Fixture::new();
+    let paths = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                let root = &f.0;
+                scope.spawn(move || test_support::temp_path_under_at(root, "same-tick", 123))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    assert_eq!(
+        paths.len(),
+        32,
+        "clock resolution must not cause collisions"
+    );
+
+    let first = test_support::temp_path_under_at(&f.0, "same-tick", 123);
+    fs::create_dir(&first).unwrap();
+    fs::write(first.join("owner"), "first fixture").unwrap();
+    std::thread::scope(|scope| {
+        let root = &f.0;
+        scope
+            .spawn(move || {
+                let second = test_support::temp_path_under_at(root, "same-tick", 123);
+                fs::create_dir(&second).unwrap();
+                fs::write(second.join("owner"), "second fixture").unwrap();
+                second
+            })
+            .join()
+            .map(|second| assert!(!second.exists(), "thread cleanup must run"))
+            .unwrap();
+    });
+    assert_eq!(
+        fs::read_to_string(first.join("owner")).unwrap(),
+        "first fixture"
+    );
+}
+
+#[test]
 fn temporary_fixture_resolves_parent_alias_but_preserves_child_symlinks() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
@@ -1055,6 +1098,9 @@ fn schema_enums_prompt_and_russian_synonyms_agree() {
 const COMMAND_FAKE: &str = r#"import os,sys,json,pathlib,time,subprocess
 home=pathlib.Path(os.environ['HOME'])
 allowed_env={'HOME','PATH','LANG','LC_CTYPE','CLAUDE_CONFIG_DIR','CODEX_HOME'}
+# CoreFoundation can add this key during Darwin Python startup, after env_clear.
+# This is a test-runtime exception, not an addition to the product's allowlist.
+if sys.platform=='darwin': allowed_env.add('__CF_USER_TEXT_ENCODING')
 phase='startup'
 def failure(kind, value, tb):
     # Test-only diagnostics: names/stages only, never env values, prompts or argv.
@@ -1178,6 +1224,48 @@ fn synthetic_cli_python_runs_with_restricted_path_and_reports_only_failure_metad
     assert_eq!(value["phase"], "environment");
     assert_eq!(value["unexpected_env_keys"], json!(["BRAIN_SECRET"]));
     assert!(!diagnostic.contains("must-never-appear-in-diagnostics"));
+}
+
+#[test]
+fn synthetic_cli_darwin_runtime_env_exception_is_exact() {
+    let f = Fixture::new();
+    f.command_provider("claude", "success");
+    // Model the native CI startup key on Linux too, inside this fake process.
+    let script = command_fake().replacen(
+        "allowed_env={",
+        "sys.platform='darwin'\nos.environ['__CF_USER_TEXT_ENCODING']='synthetic-runtime-value'\nallowed_env={",
+        1,
+    );
+    fs::write(f.0.join("bin/claude"), script).unwrap();
+    let cwd = f.0.join("preflight");
+    fs::create_dir(&cwd).unwrap();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    for unexpected in [
+        None,
+        Some("BRAIN_SECRET"),
+        Some("OPENAI_API_KEY"),
+        Some("__CF_OTHER"),
+    ] {
+        let mut c = Command::new(f.0.join("bin/claude"));
+        c.env_clear()
+            .env("HOME", &f.0)
+            .env("PATH", f.0.join("bin"))
+            .current_dir(&cwd)
+            .arg("--fixture-preflight");
+        if let Some(key) = unexpected {
+            c.env(key, "must-never-appear-in-diagnostics");
+        }
+        let output = c.output().unwrap();
+        assert_eq!(output.status.success(), unexpected.is_none());
+        if let Some(key) = unexpected {
+            let diagnostic = fs::read_to_string(f.0.join("fake-failure.json")).unwrap();
+            let value: Value = serde_json::from_str(&diagnostic).unwrap();
+            assert_eq!(value["phase"], "environment");
+            assert_eq!(value["unexpected_env_keys"], json!([key]));
+            assert!(!diagnostic.contains("must-never-appear-in-diagnostics"));
+            assert!(!diagnostic.contains("synthetic-runtime-value"));
+        }
+    }
 }
 
 impl Fixture {
